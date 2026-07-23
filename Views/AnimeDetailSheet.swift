@@ -150,9 +150,12 @@ struct AnimeDetailSheet: View {
                         }
                 }
 
+                DetailSheetWindowControls()
+                    .zIndex(110)
+
                 floatingBackButton
-                    .padding(.top, topBarTopInset + 18)
-                    .padding(.leading, 28)
+                    .padding(.top, max(topBarTopInset, DetailSheetTopBarLayout.actionRowTop))
+                    .padding(.leading, DetailSheetTopBarLayout.actionRowLeading)
                     .zIndex(100)
 
                 floatingInfoOverlay(
@@ -188,6 +191,8 @@ struct AnimeDetailSheet: View {
     private func setupKeyboardMonitor() {
         keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
             guard NSApp.isActive, let window = event.window, window.isKeyWindow else { return event }
+            // 动漫播放器是独立窗口；详情页仍在后台时不能截获它的播放快捷键。
+            guard !(window.windowController is AnimePlayerWindowController) else { return event }
             guard self.isVisible else { return event }
             switch event.keyCode {
             case 49: // 空格键：显示/隐藏信息区域
@@ -404,8 +409,9 @@ struct AnimeDetailSheet: View {
         let opacity = 1 - (squeezeProgress * 0.3)
 
         return VStack(spacing: 0) {
+            // 预留给标题栏红绿灯 + 下方返回/工具行，避免标题区与顶栏控件重叠
             Spacer()
-                .frame(height: max(topBarTopInset + 44, 68))
+                .frame(height: max(topBarTopInset, DetailSheetTopBarLayout.heroContentTop))
 
             VStack(spacing: 18) {
                 if !isHeroContentHidden {
@@ -506,8 +512,9 @@ struct AnimeDetailSheet: View {
                     )
             }
         }
-        .padding(.top, topBarTopInset + 18)
-        .padding(.trailing, 28)
+        // 与左侧返回按钮同一动作行基线（红绿灯单独在上方）
+        .padding(.top, max(topBarTopInset, DetailSheetTopBarLayout.actionRowTop))
+        .padding(.trailing, DetailSheetTopBarLayout.actionRowTrailing)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
         .zIndex(2)
     }

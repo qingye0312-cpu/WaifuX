@@ -2,6 +2,22 @@ import SwiftUI
 import AppKit
 import ApplicationServices
 
+private let settingsSliderTint = Color(hex: "30D158")
+
+private func snappedSliderBinding(
+    _ binding: Binding<Double>,
+    in range: ClosedRange<Double>,
+    step: Double
+) -> Binding<Double> {
+    Binding(
+        get: { binding.wrappedValue },
+        set: { newValue in
+            let snappedValue = ((newValue - range.lowerBound) / step).rounded() * step + range.lowerBound
+            binding.wrappedValue = min(max(snappedValue, range.lowerBound), range.upperBound)
+        }
+    )
+}
+
 // MARK: - 毛玻璃背景视图
 private struct VisualEffectView: NSViewRepresentable {
     let material: NSVisualEffectView.Material
@@ -40,8 +56,10 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
     case general
     case modules
     case download
+    case wallhaven
     case workshop
     case pixiv
+    case konachan
     case scheduler
     case sync
     case about
@@ -53,8 +71,10 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: return t("general")
         case .modules: return t("settings.modules")
         case .download: return t("download")
+        case .wallhaven: return t("wallhaven")
         case .workshop: return t("wallpaperEngine")
         case .pixiv: return "Pixiv"
+        case .konachan: return "Konachan"
         case .scheduler: return t("scheduler")
         case .sync: return t("cloudSync")
         case .about: return t("about")
@@ -66,8 +86,10 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: return "gearshape"
         case .modules: return "square.grid.2x2"
         case .download: return "arrow.down.circle"
+        case .wallhaven: return "w.circle"
         case .workshop: return "gearshape.2" // Steam/Workshop 风格
         case .pixiv: return "p.circle"
+        case .konachan: return "k.circle"
         case .scheduler: return "clock.arrow.circlepath"
         case .sync: return "icloud"
         case .about: return "info.circle"
@@ -136,7 +158,7 @@ struct SettingsView: View {
 
             // === 右侧内容区 ===
             VStack(spacing: 0) {
-                // 标题行（标题 + 关闭按钮）
+                // 标题行（标题 + 拖拽区域，原生红绿灯在左侧）
                 HStack {
                     Text(selectedTab.title)
                         .font(.system(size: 18, weight: .semibold))
@@ -144,19 +166,9 @@ struct SettingsView: View {
 
                     WindowDragHandle()
                         .frame(maxWidth: .infinity, minHeight: 24, maxHeight: 24)
-
-                    Button {
-                        (NSApp.keyWindow ?? NSApp.mainWindow)?.performClose(nil)
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(Color.white.opacity(0.45))
-                            .frame(width: 24, height: 24)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
                 }
-                .padding(.horizontal, 28)
+                .padding(.leading, 20)
+                .padding(.trailing, 28)
                 .padding(.vertical, 16)
 
                 Divider()
@@ -171,10 +183,14 @@ struct SettingsView: View {
                         ModulesSettingsTab(viewModel: viewModel)
                     case .download:
                         DownloadSettingsTab(viewModel: viewModel)
+                    case .wallhaven:
+                        WallhavenSettingsTab(viewModel: viewModel)
                     case .workshop:
                         WorkshopSettingsTab(viewModel: viewModel)
                     case .pixiv:
                         PixivSettingsTab()
+                    case .konachan:
+                        KonachanSettingsTab()
                     case .scheduler:
                         SchedulerSettingsTab(viewModel: viewModel)
                     case .sync:
@@ -188,6 +204,16 @@ struct SettingsView: View {
         }
         .background(Color(hex: "1C1C1E"))
         .id(localization.currentLanguage)
+        .onAppear {
+            let key = "settings.openSchedulerOnNextAppearance"
+            if UserDefaults.standard.bool(forKey: key) {
+                UserDefaults.standard.removeObject(forKey: key)
+                selectedTab = .scheduler
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSchedulerSettings)) { _ in
+            selectedTab = .scheduler
+        }
     }
 
     // MARK: 左侧导航栏
@@ -207,7 +233,7 @@ struct SettingsView: View {
 
             Spacer()
         }
-        .padding(.top, 16)
+        .padding(.top, 42)
         .padding(.horizontal, 10)
         .frame(width: sidebarWidth)
         .background(
@@ -291,13 +317,8 @@ private struct ModulesSettingsTab: View {
 private struct GeneralSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
-    @State private var showClearCacheAlert = false
     @State private var showClearLockScreenAlert = false
     @State private var importProfileURL = ""
-
-    private var apiKeyBinding: Binding<String> {
-        Binding(get: { viewModel.apiKey }, set: { viewModel.apiKey = $0 })
-    }
 
     private var languageBinding: Binding<LocalizationService.Language> {
         Binding(
@@ -376,9 +397,13 @@ private struct GeneralSettingsTab: View {
 
                         Spacer()
 
-                        Slider(value: $viewModel.grainIntensity, in: 0...1, step: 0.05)
-                            .frame(width: 160)
-                            .tint(Color(hex: "30D158"))
+                        Slider(
+                            value: snappedSliderBinding($viewModel.grainIntensity, in: 0...1, step: 0.05),
+                            in: 0...1
+                        )
+                        .tint(settingsSliderTint)
+                        .accessibilityLabel(t("grainIntensity"))
+                        .frame(width: 160)
 
                         Text("\(Int(viewModel.grainIntensity * 100))%")
                             .font(.system(size: 12, weight: .regular, design: .monospaced))
@@ -400,9 +425,17 @@ private struct GeneralSettingsTab: View {
                 MacSettingsRow(
                     title: t("autoRemoveVideoLetterbox"),
                     subtitle: t("autoRemoveVideoLetterboxDesc"),
-                    showDivider: false
+                    showDivider: true
                 ) {
                     MacToggle(isOn: $viewModel.autoRemoveVideoLetterbox)
+                }
+
+                MacSettingsRow(
+                    title: t("portraitBlurFill"),
+                    subtitle: t("portraitBlurFillDesc"),
+                    showDivider: false
+                ) {
+                    MacToggle(isOn: $viewModel.portraitBlurFillEnabled)
                 }
             }
 
@@ -427,6 +460,20 @@ private struct GeneralSettingsTab: View {
                         get: { viewModel.pauseWhenOtherAppForeground },
                         set: { newValue in
                             viewModel.pauseWhenOtherAppForeground = newValue
+                            viewModel.syncAutoPauseSettings()
+                        }
+                    ))
+                }
+
+                MacSettingsRow(
+                    title: t("pauseInactiveDisplays"),
+                    subtitle: t("pauseInactiveDisplaysDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: Binding(
+                        get: { viewModel.pauseInactiveDisplays },
+                        set: { newValue in
+                            viewModel.pauseInactiveDisplays = newValue
                             viewModel.syncAutoPauseSettings()
                         }
                     ))
@@ -485,15 +532,19 @@ private struct GeneralSettingsTab: View {
                                 .foregroundStyle(.secondary)
                                 .frame(minWidth: 36, alignment: .trailing)
                             Slider(
-                                value: $viewModel.windowCoveragePauseThreshold,
+                                value: snappedSliderBinding(
+                                    $viewModel.windowCoveragePauseThreshold,
+                                    in: 30...100,
+                                    step: 5
+                                ),
                                 in: 30...100,
-                                step: 5,
                                 onEditingChanged: { editing in
                                     if !editing { viewModel.syncAutoPauseSettings() }
                                 }
                             )
+                            .tint(settingsSliderTint)
+                            .accessibilityLabel(t("windowCoverageThreshold"))
                             .frame(width: 120)
-                            .tint(Color(hex: "30D158"))
                         }
                     }
 
@@ -525,42 +576,6 @@ private struct GeneralSettingsTab: View {
                     MacToggle(isOn: $viewModel.hdrEnabled)
                 }
 
-            }
-
-            // 动态壁纸补帧设置组
-            MacSettingsSection(header: t("frameInterpolationSection")) {
-                MacSettingsRow(
-                    title: t("frameInterpolation"),
-                    subtitle: t("frameInterpolationDesc"),
-                    showDivider: viewModel.frameInterpolationEnabled
-                ) {
-                    MacToggle(isOn: $viewModel.frameInterpolationEnabled)
-                }
-
-                if viewModel.frameInterpolationEnabled {
-                    MacSettingsRow(
-                        title: t("frameInterpolationAutoEnqueue"),
-                        subtitle: t("frameInterpolationAutoEnqueueDesc"),
-                        showDivider: true
-                    ) {
-                        MacToggle(isOn: $viewModel.frameInterpolationAutoEnqueue)
-                    }
-
-                    MacSettingsRow(
-                        title: t("frameInterpolationTargetFPS"),
-                        subtitle: nil,
-                        showDivider: false
-                    ) {
-                        Picker("", selection: $viewModel.frameInterpolationTargetFPS) {
-                            ForEach(FrameInterpolationTargetFPSResolver.allowedFixedFPSValues, id: \.self) { fps in
-                                Text("\(fps)")
-                                    .tag(Double(fps))
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(width: 180)
-                    }
-                }
             }
 
             MacSettingsSection(header: t("dynamicLockScreen")) {
@@ -657,6 +672,14 @@ private struct GeneralSettingsTab: View {
                 }
 
                 MacSettingsRow(
+                    title: t("preventSystemSleep"),
+                    subtitle: t("preventSystemSleepDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.preventSystemSleep)
+                }
+
+                MacSettingsRow(
                     title: t("hideNotch"),
                     subtitle: t("hideNotchDesc"),
                     showDivider: true
@@ -672,80 +695,6 @@ private struct GeneralSettingsTab: View {
                     MacToggle(isOn: $viewModel.saveToDownloads)
                 }
             }
-
-            // 数据管理组
-            MacSettingsSection(header: t("dataManagement")) {
-                // API Key
-                HStack(spacing: 12) {
-                    Text(t("apiKey"))
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.9))
-
-                    Spacer()
-
-                    TextField(t("api.key.placeholder"), text: apiKeyBinding)
-                        .font(.system(size: 12, weight: .regular))
-                        .textFieldStyle(.plain)
-                        .frame(width: 200)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(Color.white.opacity(0.07))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
-                                )
-                        )
-                        .foregroundStyle(Color.white.opacity(0.85))
-
-                    Link(destination: URL(string: "https://wallhaven.cc/settings/account")!) {
-                        Image(systemName: "arrow.up.right.square")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(Color(hex: "0A84FF").opacity(0.7))
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-
-                Text(t("apiKeyDescription"))
-                    .font(.system(size: 11, weight: .regular))
-                    .foregroundStyle(Color.white.opacity(0.4))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 8)
-
-                Divider().background(Color.white.opacity(0.06)).padding(.leading, 16)
-
-                // 缓存管理
-                HStack(spacing: 12) {
-                    Text(t("clearCache"))
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.9))
-
-                    Spacer()
-
-                    Text(viewModel.cacheSize)
-                        .font(.system(size: 12, weight: .regular))
-                        .foregroundStyle(Color.white.opacity(0.4))
-
-                    Button(t("clear")) {
-                        showClearCacheAlert = true
-                    }
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Color(hex: "FF453A"))
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-            }
-        }
-        .alert(t("clearCache"), isPresented: $showClearCacheAlert) {
-            Button(t("cancel"), role: .cancel) {}
-            Button(t("clear"), role: .destructive) {
-                Task { await viewModel.clearCache() }
-            }
-        } message: {
-            Text(t("clearCacheConfirm"))
         }
         .alert(t("clearLockScreenInstances"), isPresented: $showClearLockScreenAlert) {
             Button(t("cancel"), role: .cancel) {}
@@ -765,6 +714,7 @@ private struct DownloadSettingsTab: View {
     @State private var showMigrationSheet = false
     @State private var isRepairing = false
     @State private var showRepairAlert = false
+    @State private var showClearCacheAlert = false
     @State private var repairResultMessage = ""
     @State private var pathRefreshID = UUID()
 
@@ -841,6 +791,56 @@ private struct DownloadSettingsTab: View {
                     .disabled(isRepairing)
                 }
             }
+
+            // 动态壁纸优化设置组。自动任务均由公共优化队列串行处理。
+            // 手动「优化视频」始终可走循环分析 + 补帧；此处只控制下载后自动优化与目标帧率。
+            MacSettingsSection(header: t("videoOptimizationSection")) {
+                MacSettingsRow(
+                    title: t("videoOptimizationAutoAfterDownload"),
+                    subtitle: t("videoOptimizationAutoAfterDownloadDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.autoOptimizeVideosAfterDownload)
+                }
+
+                MacSettingsRow(
+                    title: t("frameInterpolationTargetFPS"),
+                    subtitle: nil,
+                    showDivider: false
+                ) {
+                    Picker("", selection: $viewModel.frameInterpolationTargetFPS) {
+                        ForEach(FrameInterpolationTargetFPSResolver.allowedFixedFPSValues, id: \.self) { fps in
+                            Text("\(fps)")
+                                .tag(Double(fps))
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 180)
+                }
+            }
+
+            // 缓存管理
+            MacSettingsSection(header: t("dataManagement")) {
+                HStack(spacing: 12) {
+                    Text(t("clearCache"))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.9))
+
+                    Spacer()
+
+                    Text(viewModel.cacheSize)
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(Color.white.opacity(0.4))
+
+                    Button(t("clear")) {
+                        showClearCacheAlert = true
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color(hex: "FF453A"))
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+            }
         }
         .id(pathRefreshID)
         .sheet(isPresented: $showMigrationSheet) {
@@ -853,6 +853,14 @@ private struct DownloadSettingsTab: View {
             }
         } message: {
             Text(t("repairDataConfirm"))
+        }
+        .alert(t("clearCache"), isPresented: $showClearCacheAlert) {
+            Button(t("cancel"), role: .cancel) {}
+            Button(t("clear"), role: .destructive) {
+                Task { await viewModel.clearCache() }
+            }
+        } message: {
+            Text(t("clearCacheConfirm"))
         }
         .alert(repairResultMessage, isPresented: Binding(
             get: { !repairResultMessage.isEmpty && !isRepairing },
@@ -896,235 +904,419 @@ private struct SchedulerSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
 
     private var screens: [NSScreen] {
-        NSScreen.screens
+        // 勿直接用 NSScreen.screens：系统枚举顺序会在睡眠/唤醒后打乱，
+        // 导致「显示器 2/3」标签对调，看起来像自动切换配置串台。
+        NSScreen.screensOrderedForDisplay
+    }
+
+    private var isGlobalDisplaySyncEnabled: Bool {
+        viewModel.schedulerViewModel.isGlobalDisplaySyncEnabled
     }
 
     var body: some View {
         MacSettingsForm {
-            // 每屏配置
-            MacSettingsSection(header: t("scheduleConfig")) {
-                ForEach(Array(screens.enumerated()), id: \.element.wallpaperScreenIdentifier) { (index: Int, screen: NSScreen) in
-                    let screenID = screen.wallpaperScreenIdentifier
-                    let displayConfig = viewModel.schedulerViewModel.displayConfig(for: screen)
+            MacSettingsSection(header: t("globalSchedulerConfig")) {
+                VStack(spacing: 0) {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(t("syncAllDisplaysWallpaper"))
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(Color.white.opacity(0.9))
+                            Text(t("syncAllDisplaysWallpaperDesc"))
+                                .font(.system(size: 11))
+                                .foregroundStyle(Color.white.opacity(0.48))
+                        }
 
-                    VStack(spacing: 0) {
+                        Spacer()
+
+                        MacToggle(isOn: Binding(
+                            get: { isGlobalDisplaySyncEnabled },
+                            set: { viewModel.schedulerViewModel.updateGlobalDisplaySyncEnabled($0) }
+                        ))
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+
+                    if isGlobalDisplaySyncEnabled {
+                        let globalConfig = viewModel.schedulerViewModel.globalDisplayConfig
+
+                        dividerLine
+
                         HStack(spacing: 12) {
-                            Text("\(t("display")) \(index + 1) · \(screen.localizedName)")
+                            Text(t("autoSwitchEnabled"))
                                 .font(.system(size: 13, weight: .medium))
                                 .foregroundStyle(Color.white.opacity(0.9))
 
                             Spacer()
 
                             MacToggle(isOn: Binding(
-                                get: { displayConfig.isEnabled },
-                                set: { viewModel.schedulerViewModel.updateDisplayEnabled($0, for: screenID) }
+                                get: { globalConfig.isEnabled },
+                                set: { viewModel.schedulerViewModel.updateGlobalDisplayEnabled($0) }
                             ))
                         }
                         .padding(.horizontal, 16)
                         .padding(.vertical, 12)
 
-                        if displayConfig.isEnabled {
-                            dividerLine
-
-                            if !screen.isBuiltInDisplay {
-                                HStack(spacing: 12) {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(t("externalDisplay.autoSwitchOnConnect"))
-                                            .font(.system(size: 13, weight: .medium))
-                                            .foregroundStyle(Color.white.opacity(0.9))
-                                        Text(t("externalDisplay.autoSwitchOnConnectDesc"))
-                                            .font(.system(size: 11))
-                                            .foregroundStyle(Color.white.opacity(0.48))
-                                    }
-
-                                    Spacer()
-
-                                    MacToggle(isOn: Binding(
-                                        get: { viewModel.schedulerViewModel.displayConfig(for: screen).autoChangeOnExternalConnect },
-                                        set: { viewModel.schedulerViewModel.updateDisplayAutoChangeOnExternalConnect($0, for: screen) }
-                                    ))
-                                }
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 12)
-
-                                dividerLine
-                            }
-
-                            // 检查当前壁纸是否是 Web 壁纸
-                            let isWebWallpaper: Bool = {
-                                if let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) {
-                                    return WallpaperEngineXBridge.shared.isManaging(screen: screen)
-                                }
-                                return false
-                            }()
-
-                            // 间隔选择
-                            HStack(spacing: 12) {
-                                Text(t("replaceInterval"))
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(Color.white.opacity(0.9))
-
-                                Spacer()
-
-                                Menu {
-                                    ForEach(SchedulerConfig.intervalOptions, id: \.self) { minutes in
-                                        Button(intervalLabel(for: minutes)) {
-                                            viewModel.schedulerViewModel.updateDisplayInterval(minutes, for: screenID)
-                                        }
-                                    }
-                                    Divider()
-                                    Button(intervalLabel(for: SchedulerConfig.intervalOnEndMinutes)) {
-                                        viewModel.schedulerViewModel.updateDisplayInterval(SchedulerConfig.intervalOnEndMinutes, for: screenID)
-                                    }
-                                    Button(intervalLabel(for: SchedulerConfig.intervalOnUnlockMinutes)) {
-                                        viewModel.schedulerViewModel.updateDisplayInterval(SchedulerConfig.intervalOnUnlockMinutes, for: screenID)
-                                    }
-                                } label: {
-                                    Text(intervalLabel(for: displayConfig.intervalMinutes))
-                                        .font(.system(size: 12, weight: .regular))
-                                        .foregroundStyle(Color.white.opacity(0.6))
-                                }
-                                .menuStyle(.borderlessButton)
-                            }
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 12)
-
-                            // "播完即换"模式下的 Web/Scene 壁纸切换间隔滑块
-                            if displayConfig.isOnEndMode {
-                                dividerLine
-
-                                VStack(spacing: 8) {
-                                    HStack(spacing: 12) {
-                                        Text(t("webSceneSwitchInterval"))
-                                            .font(.system(size: 13, weight: .medium))
-                                            .foregroundStyle(Color.white.opacity(0.9))
-
-                                        Spacer()
-
-                                        let seconds = displayConfig.webSceneSwitchSeconds ?? 0
-                                        if seconds == 0 {
-                                            Text(t("intervalOnEnd"))
-                                                .font(.system(size: 12, weight: .regular))
-                                                .foregroundStyle(Color.white.opacity(0.6))
-                                        } else {
-                                            Text(seconds >= 60 ? "\(seconds / 60) \(t("minutes"))" : "\(seconds) \(t("seconds"))")
-                                                .font(.system(size: 12, weight: .regular))
-                                                .foregroundStyle(Color.white.opacity(0.6))
-                                        }
-                                    }
-
-                                    Slider(
-                                        value: Binding(
-                                            get: { Double(displayConfig.webSceneSwitchSeconds ?? 0) },
-                                            set: { newValue in
-                                                let intVal = Int(newValue)
-                                                viewModel.schedulerViewModel.updateDisplayWebSceneSwitchSeconds(intVal == 0 ? nil : intVal, for: screenID)
-                                            }
-                                        ),
-                                        in: 0...3600,
-                                        step: 10
-                                    )
-                                    .accentColor(.blue)
-                                }
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 12)
-                            }
-
-                            dividerLine
-
-                            // 顺序选择
-                            HStack(spacing: 12) {
-                                Text(t("replaceOrder"))
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(Color.white.opacity(0.9))
-
-                                Spacer()
-
-                                Picker("", selection: Binding(
-                                    get: { displayConfig.order },
-                                    set: { viewModel.schedulerViewModel.updateDisplayOrder($0, for: screenID) }
-                                )) {
-                                    Text(t("sequential")).tag(ScheduleOrder.sequential)
-                                    Text(t("random")).tag(ScheduleOrder.random)
-                                }
-                                .pickerStyle(.segmented)
-                                .frame(width: 130, alignment: .trailing)
-                            }
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 12)
-
-                            dividerLine
-
-                            // 内容类型选择
-                            HStack(spacing: 12) {
-                                Text(t("contentTypes"))
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(Color.white.opacity(0.9))
-
-                                Spacer()
-
-                                HStack(spacing: 16) {
-                                    Toggle(isOn: Binding(
-                                        get: { displayConfig.includeWallpapers },
-                                        set: { newValue in
-                                            viewModel.schedulerViewModel.updateDisplayIncludeWallpapers(newValue, for: screenID)
-                                        }
-                                    )) {
-                                        Text(t("wallpapers"))
-                                            .font(.system(size: 12))
-                                            .foregroundStyle(Color.white.opacity(0.8))
-                                    }
-                                    .toggleStyle(.checkbox)
-
-                                    Toggle(isOn: Binding(
-                                        get: { displayConfig.includeMedia },
-                                        set: { newValue in
-                                            viewModel.schedulerViewModel.updateDisplayIncludeMedia(newValue, for: screenID)
-                                        }
-                                    )) {
-                                        Text(t("media"))
-                                            .font(.system(size: 12))
-                                            .foregroundStyle(Color.white.opacity(0.8))
-                                    }
-                                    .toggleStyle(.checkbox)
-                                }
-                            }
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 12)
-
-                            dividerLine
-
-                            // 文件夹选择
-                            FolderPickerRow(
-                                folderIDs: displayConfig.folderIDs,
-                                includeWallpapers: displayConfig.includeWallpapers && !(displayConfig.isOnEndMode && displayConfig.webSceneSwitchSeconds == nil),
-                                includeMedia: displayConfig.includeMedia,
-                                screenID: screenID,
-                                viewModel: viewModel
-                            )
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 12)
+                        if globalConfig.isEnabled {
+                            globalSchedulerControls(config: globalConfig)
                         }
                     }
+                }
+            }
 
-                    if index < screens.count - 1 {
-                        dividerLine
+            if !isGlobalDisplaySyncEnabled {
+                // 每屏配置（独立模式）
+                MacSettingsSection(header: t("scheduleConfig")) {
+                    ForEach(Array(screens.enumerated()), id: \.element.wallpaperScreenIdentifier) { (index: Int, screen: NSScreen) in
+                        // 勿在 body 内调用会写 UserDefaults / 改 @Published 的 migrate；
+                        // 读路径 resolvedDisplayConfig 会按 fingerprint 找回旧配置，
+                        // 写路径 update* 使用当前 wallpaperScreenIdentifier。
+                        let screenID = screen.wallpaperScreenIdentifier
+                        let displayConfig = viewModel.schedulerViewModel.displayConfig(for: screen)
+
+                        VStack(spacing: 0) {
+                            HStack(spacing: 12) {
+                                Text("\(t("display")) \(index + 1) · \(screen.localizedName)")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(Color.white.opacity(0.9))
+
+                                Spacer()
+
+                                MacToggle(isOn: Binding(
+                                    get: { displayConfig.isEnabled },
+                                    set: { viewModel.schedulerViewModel.updateDisplayEnabled($0, for: screenID) }
+                                ))
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
+
+                            if displayConfig.isEnabled {
+                                dividerLine
+
+                                perDisplaySchedulerControls(
+                                    config: displayConfig,
+                                    screenID: screenID
+                                )
+                            }
+                        }
+
+                        if index < screens.count - 1 {
+                            dividerLine
+                        }
                     }
                 }
             }
         }
     }
 
-    // MARK: - 文件夹选择组件
+    @ViewBuilder
+    private func globalSchedulerControls(config: DisplaySchedulerConfig) -> some View {
+        dividerLine
+
+        HStack(spacing: 12) {
+            Text(t("replaceInterval"))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.9))
+
+            Spacer()
+
+            Menu {
+                ForEach(SchedulerConfig.intervalOptions, id: \.self) { minutes in
+                    Button(intervalLabel(for: minutes)) {
+                        viewModel.schedulerViewModel.updateGlobalDisplayInterval(minutes)
+                    }
+                }
+                Divider()
+                Button(intervalLabel(for: SchedulerConfig.intervalOnEndMinutes)) {
+                    viewModel.schedulerViewModel.updateGlobalDisplayInterval(SchedulerConfig.intervalOnEndMinutes)
+                }
+                Button(intervalLabel(for: SchedulerConfig.intervalOnUnlockMinutes)) {
+                    viewModel.schedulerViewModel.updateGlobalDisplayInterval(SchedulerConfig.intervalOnUnlockMinutes)
+                }
+            } label: {
+                Text(intervalLabel(for: config.intervalMinutes))
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(Color.white.opacity(0.6))
+            }
+            .menuStyle(.borderlessButton)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+
+        if config.isOnEndMode {
+            dividerLine
+
+            VStack(spacing: 8) {
+                HStack(spacing: 12) {
+                    Text(t("webSceneSwitchInterval"))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.9))
+
+                    Spacer()
+
+                    let seconds = config.webSceneSwitchSeconds ?? 0
+                    if seconds == 0 {
+                        Text(t("intervalOnEnd"))
+                            .font(.system(size: 12, weight: .regular))
+                            .foregroundStyle(Color.white.opacity(0.6))
+                    } else {
+                        Text(seconds >= 60 ? "\(seconds / 60) \(t("minutes"))" : "\(seconds) \(t("seconds"))")
+                            .font(.system(size: 12, weight: .regular))
+                            .foregroundStyle(Color.white.opacity(0.6))
+                    }
+                }
+
+                Slider(
+                    value: snappedSliderBinding(
+                        Binding(
+                            get: { Double(config.webSceneSwitchSeconds ?? 0) },
+                            set: { newValue in
+                                let intVal = Int(newValue)
+                                viewModel.schedulerViewModel.updateGlobalDisplayWebSceneSwitchSeconds(intVal == 0 ? nil : intVal)
+                            }
+                        ),
+                        in: 0...3600,
+                        step: 10
+                    ),
+                    in: 0...3600
+                )
+                .tint(settingsSliderTint)
+                .accessibilityLabel(t("webSceneSwitchInterval"))
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+
+        dividerLine
+
+        HStack(spacing: 12) {
+            Text(t("replaceOrder"))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.9))
+
+            Spacer()
+
+            Picker("", selection: Binding(
+                get: { config.order },
+                set: { viewModel.schedulerViewModel.updateGlobalDisplayOrder($0) }
+            )) {
+                Text(t("sequential")).tag(ScheduleOrder.sequential)
+                Text(t("random")).tag(ScheduleOrder.random)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 130, alignment: .trailing)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+
+        dividerLine
+
+        HStack(spacing: 12) {
+            Text(t("contentTypes"))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.9))
+
+            Spacer()
+
+            HStack(spacing: 16) {
+                Toggle(isOn: Binding(
+                    get: { config.includeWallpapers },
+                    set: { viewModel.schedulerViewModel.updateGlobalDisplayIncludeWallpapers($0) }
+                )) {
+                    Text(t("wallpapers"))
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.white.opacity(0.8))
+                }
+                .toggleStyle(.checkbox)
+
+                Toggle(isOn: Binding(
+                    get: { config.includeMedia },
+                    set: { viewModel.schedulerViewModel.updateGlobalDisplayIncludeMedia($0) }
+                )) {
+                    Text(t("media"))
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.white.opacity(0.8))
+                }
+                .toggleStyle(.checkbox)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+
+        dividerLine
+
+        GlobalFolderPickerRow(
+            folderIDs: config.folderIDs,
+            includeWallpapers: config.includeWallpapers,
+            includeMedia: config.includeMedia,
+            viewModel: viewModel
+        )
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    @ViewBuilder
+    private func perDisplaySchedulerControls(config: DisplaySchedulerConfig, screenID: String) -> some View {
+        // 间隔选择
+        HStack(spacing: 12) {
+            Text(t("replaceInterval"))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.9))
+
+            Spacer()
+
+            Menu {
+                ForEach(SchedulerConfig.intervalOptions, id: \.self) { minutes in
+                    Button(intervalLabel(for: minutes)) {
+                        viewModel.schedulerViewModel.updateDisplayInterval(minutes, for: screenID)
+                    }
+                }
+                Divider()
+                Button(intervalLabel(for: SchedulerConfig.intervalOnEndMinutes)) {
+                    viewModel.schedulerViewModel.updateDisplayInterval(SchedulerConfig.intervalOnEndMinutes, for: screenID)
+                }
+                Button(intervalLabel(for: SchedulerConfig.intervalOnUnlockMinutes)) {
+                    viewModel.schedulerViewModel.updateDisplayInterval(SchedulerConfig.intervalOnUnlockMinutes, for: screenID)
+                }
+            } label: {
+                Text(intervalLabel(for: config.intervalMinutes))
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(Color.white.opacity(0.6))
+            }
+            .menuStyle(.borderlessButton)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+
+        // "播完即换"模式下的 Web/Scene 壁纸切换间隔滑块
+        if config.isOnEndMode {
+            dividerLine
+
+            VStack(spacing: 8) {
+                HStack(spacing: 12) {
+                    Text(t("webSceneSwitchInterval"))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.9))
+
+                    Spacer()
+
+                    let seconds = config.webSceneSwitchSeconds ?? 0
+                    if seconds == 0 {
+                        Text(t("intervalOnEnd"))
+                            .font(.system(size: 12, weight: .regular))
+                            .foregroundStyle(Color.white.opacity(0.6))
+                    } else {
+                        Text(seconds >= 60 ? "\(seconds / 60) \(t("minutes"))" : "\(seconds) \(t("seconds"))")
+                            .font(.system(size: 12, weight: .regular))
+                            .foregroundStyle(Color.white.opacity(0.6))
+                    }
+                }
+
+                Slider(
+                    value: snappedSliderBinding(
+                        Binding(
+                            get: { Double(config.webSceneSwitchSeconds ?? 0) },
+                            set: { newValue in
+                                let intVal = Int(newValue)
+                                viewModel.schedulerViewModel.updateDisplayWebSceneSwitchSeconds(intVal == 0 ? nil : intVal, for: screenID)
+                            }
+                        ),
+                        in: 0...3600,
+                        step: 10
+                    ),
+                    in: 0...3600
+                )
+                .tint(settingsSliderTint)
+                .accessibilityLabel(t("webSceneSwitchInterval"))
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+
+        dividerLine
+
+        // 顺序选择
+        HStack(spacing: 12) {
+            Text(t("replaceOrder"))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.9))
+
+            Spacer()
+
+            Picker("", selection: Binding(
+                get: { config.order },
+                set: { viewModel.schedulerViewModel.updateDisplayOrder($0, for: screenID) }
+            )) {
+                Text(t("sequential")).tag(ScheduleOrder.sequential)
+                Text(t("random")).tag(ScheduleOrder.random)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 130, alignment: .trailing)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+
+        dividerLine
+
+        // 内容类型选择
+        HStack(spacing: 12) {
+            Text(t("contentTypes"))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.9))
+
+            Spacer()
+
+            HStack(spacing: 16) {
+                Toggle(isOn: Binding(
+                    get: { config.includeWallpapers },
+                    set: { newValue in
+                        viewModel.schedulerViewModel.updateDisplayIncludeWallpapers(newValue, for: screenID)
+                    }
+                )) {
+                    Text(t("wallpapers"))
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.white.opacity(0.8))
+                }
+                .toggleStyle(.checkbox)
+
+                Toggle(isOn: Binding(
+                    get: { config.includeMedia },
+                    set: { newValue in
+                        viewModel.schedulerViewModel.updateDisplayIncludeMedia(newValue, for: screenID)
+                    }
+                )) {
+                    Text(t("media"))
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.white.opacity(0.8))
+                }
+                .toggleStyle(.checkbox)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+
+        dividerLine
+
+        // 文件夹选择
+        FolderPickerRow(
+            folderIDs: config.folderIDs,
+            includeWallpapers: config.includeWallpapers,
+            includeMedia: config.includeMedia,
+            screenID: screenID,
+            viewModel: viewModel
+        )
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    // MARK: - 文件夹选择组件（支持多选）
     private struct FolderPickerRow: View {
         let folderIDs: [String]?
         let includeWallpapers: Bool
         let includeMedia: Bool
         let screenID: String
         @ObservedObject var viewModel: SettingsViewModel
-
-        @State private var wallpaperFolders: [LibraryFolder] = []
-        @State private var mediaFolders: [LibraryFolder] = []
+        @ObservedObject private var folderStore = LibraryFolderStore.shared
 
         var body: some View {
             HStack(spacing: 12) {
@@ -1150,11 +1342,11 @@ private struct SchedulerSettingsTab: View {
                         Divider()
                         ForEach(allFolders) { folder in
                             Button(action: {
-                                viewModel.schedulerViewModel.updateDisplayFolderIDs([folder.id], for: screenID)
+                                toggleFolder(folder.id)
                             }) {
                                 HStack {
-                                    Text(folder.name)
-                                    if folderIDs == [folder.id] {
+                                    Text(folderOptionLabel(for: folder))
+                                    if isSelected(folder.id) {
                                         Image(systemName: "checkmark")
                                     }
                                 }
@@ -1165,37 +1357,216 @@ private struct SchedulerSettingsTab: View {
                     Text(folderIDsLabel)
                         .font(.system(size: 12, weight: .regular))
                         .foregroundStyle(Color.white.opacity(0.6))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
                 .menuStyle(.borderlessButton)
-            }
-            .onAppear {
-                refreshFolders()
-            }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                refreshFolders()
+                .help(folderIDsLabel)
             }
         }
 
         private var allFolders: [LibraryFolder] {
             var combined: [LibraryFolder] = []
-            if includeWallpapers { combined.append(contentsOf: wallpaperFolders) }
-            if includeMedia { combined.append(contentsOf: mediaFolders) }
-            return combined.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            if includeWallpapers { combined.append(contentsOf: folderStore.folders(for: .wallpaper)) }
+            if includeMedia { combined.append(contentsOf: folderStore.folders(for: .media)) }
+            return combined.sorted { lhs, rhs in
+                let nameOrder = lhs.name.localizedStandardCompare(rhs.name)
+                if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+                if lhs.contentType != rhs.contentType {
+                    return lhs.contentType.rawValue < rhs.contentType.rawValue
+                }
+                return lhs.id < rhs.id
+            }
+        }
+
+        private var selectedFolderIDSet: Set<String> {
+            Set(folderIDs ?? [])
+        }
+
+        private func isSelected(_ folderID: String) -> Bool {
+            guard folderIDs != nil else { return false }
+            return selectedFolderIDSet.contains(folderID)
+        }
+
+        /// 多选切换：
+        /// - 当前为「全部」(nil) 时点某个文件夹 → 仅选中该文件夹
+        /// - 已有选中时点已选项 → 取消；取消后空集合回退为「全部」
+        /// - 点未选项 → 加入集合
+        private func toggleFolder(_ folderID: String) {
+            var next: Set<String>
+            if let folderIDs {
+                next = Set(folderIDs)
+            } else {
+                // 从「全部」进入多选：只选中当前点的这一项
+                viewModel.schedulerViewModel.updateDisplayFolderIDs([folderID], for: screenID)
+                return
+            }
+
+            if next.contains(folderID) {
+                next.remove(folderID)
+            } else {
+                next.insert(folderID)
+            }
+
+            if next.isEmpty {
+                viewModel.schedulerViewModel.updateDisplayFolderIDs(nil, for: screenID)
+            } else {
+                // 保持稳定顺序：按文件夹名称排序
+                let ordered = allFolders
+                    .map(\.id)
+                    .filter { next.contains($0) }
+                // 若有已删除文件夹 id 仍在集合里，追加在末尾以免静默丢配置
+                let leftovers = next.subtracting(ordered)
+                viewModel.schedulerViewModel.updateDisplayFolderIDs(
+                    ordered + leftovers.sorted(),
+                    for: screenID
+                )
+            }
         }
 
         private var folderIDsLabel: String {
             guard let folderIDs else { return "全部" }
-            if folderIDs.isEmpty { return "无文件夹" }
+            if folderIDs.isEmpty { return "全部" }
             let names = folderIDs.compactMap { id in
-                allFolders.first(where: { $0.id == id })?.name
+                allFolders.first(where: { $0.id == id }).map(folderOptionLabel)
             }
-            if names.isEmpty { return "无文件夹" }
-            return names.joined(separator: ", ")
+            if names.isEmpty { return "全部" }
+            if names.count == 1 { return names[0] }
+            if names.count <= 3 {
+                return names.joined(separator: ", ")
+            }
+            return "\(names.prefix(2).joined(separator: ", ")) +\(names.count - 2)"
         }
 
-        private func refreshFolders() {
-            wallpaperFolders = LibraryFolderStore.shared.folders(for: .wallpaper)
-            mediaFolders = LibraryFolderStore.shared.folders(for: .media)
+        private func folderOptionLabel(for folder: LibraryFolder) -> String {
+            let contentType = folder.contentType == .wallpaper ? t("wallpapers") : t("media")
+            return "\(contentType) · \(folder.name)"
+        }
+    }
+
+    // MARK: - Global folder picker (multi-select against the shared global policy)
+    private struct GlobalFolderPickerRow: View {
+        let folderIDs: [String]?
+        let includeWallpapers: Bool
+        let includeMedia: Bool
+        @ObservedObject var viewModel: SettingsViewModel
+        @ObservedObject private var folderStore = LibraryFolderStore.shared
+
+        var body: some View {
+            HStack(spacing: 12) {
+                Text(t("folders"))
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.9))
+
+                Spacer()
+
+                Menu {
+                    Button(action: {
+                        viewModel.schedulerViewModel.updateGlobalDisplayFolderIDs(nil)
+                    }) {
+                        HStack {
+                            Text(t("all"))
+                            if folderIDs == nil {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+
+                    if !allFolders.isEmpty {
+                        Divider()
+                        ForEach(allFolders) { folder in
+                            Button(action: {
+                                toggleFolder(folder.id)
+                            }) {
+                                HStack {
+                                    Text(folderOptionLabel(for: folder))
+                                    if isSelected(folder.id) {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Text(folderIDsLabel)
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(Color.white.opacity(0.6))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .menuStyle(.borderlessButton)
+                .help(folderIDsLabel)
+            }
+        }
+
+        private var allFolders: [LibraryFolder] {
+            var combined: [LibraryFolder] = []
+            if includeWallpapers { combined.append(contentsOf: folderStore.folders(for: .wallpaper)) }
+            if includeMedia { combined.append(contentsOf: folderStore.folders(for: .media)) }
+            return combined.sorted { lhs, rhs in
+                let nameOrder = lhs.name.localizedStandardCompare(rhs.name)
+                if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+                if lhs.contentType != rhs.contentType {
+                    return lhs.contentType.rawValue < rhs.contentType.rawValue
+                }
+                return lhs.id < rhs.id
+            }
+        }
+
+        private var selectedFolderIDSet: Set<String> {
+            Set(folderIDs ?? [])
+        }
+
+        private func isSelected(_ folderID: String) -> Bool {
+            guard folderIDs != nil else { return false }
+            return selectedFolderIDSet.contains(folderID)
+        }
+
+        private func toggleFolder(_ folderID: String) {
+            var next: Set<String>
+            if let folderIDs {
+                next = Set(folderIDs)
+            } else {
+                viewModel.schedulerViewModel.updateGlobalDisplayFolderIDs([folderID])
+                return
+            }
+
+            if next.contains(folderID) {
+                next.remove(folderID)
+            } else {
+                next.insert(folderID)
+            }
+
+            if next.isEmpty {
+                viewModel.schedulerViewModel.updateGlobalDisplayFolderIDs(nil)
+            } else {
+                let ordered = allFolders
+                    .map(\.id)
+                    .filter { next.contains($0) }
+                let leftovers = next.subtracting(ordered)
+                viewModel.schedulerViewModel.updateGlobalDisplayFolderIDs(
+                    ordered + leftovers.sorted()
+                )
+            }
+        }
+
+        private var folderIDsLabel: String {
+            guard let folderIDs else { return t("all") }
+            if folderIDs.isEmpty { return t("all") }
+            let names = folderIDs.compactMap { id in
+                allFolders.first(where: { $0.id == id }).map(folderOptionLabel)
+            }
+            if names.isEmpty { return t("all") }
+            if names.count == 1 { return names[0] }
+            if names.count <= 3 {
+                return names.joined(separator: ", ")
+            }
+            return "\(names.prefix(2).joined(separator: ", ")) +\(names.count - 2)"
+        }
+
+        private func folderOptionLabel(for folder: LibraryFolder) -> String {
+            let contentType = folder.contentType == .wallpaper ? t("wallpapers") : t("media")
+            return "\(contentType) · \(folder.name)"
         }
     }
 
@@ -1269,6 +1640,10 @@ private struct AboutSettingsTab: View {
                             NSWorkspace.shared.open(url)
                         }
                     })
+
+                    Divider().background(Color.white.opacity(0.06)).padding(.leading, 16)
+
+                    MacRewardRow(title: t("reward"), imageName: "RewardQRCode")
                 }
 
                 // 重置所有数据
@@ -1432,9 +1807,13 @@ private struct WorkshopSettingsTab: View {
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundStyle(.secondary)
                                     .frame(minWidth: 36, alignment: .trailing)
-                                Slider(value: $viewModel.upscalingPercent, in: 30...100, step: 5)
-                                    .frame(width: 120)
-                                    .tint(Color(hex: "30D158"))
+                                Slider(
+                                    value: snappedSliderBinding($viewModel.upscalingPercent, in: 30...100, step: 5),
+                                    in: 30...100
+                                )
+                                .tint(settingsSliderTint)
+                                .accessibilityLabel(t("workshop.upscalingRatio"))
+                                .frame(width: 120)
                             }
                         }
 
@@ -1456,9 +1835,17 @@ private struct WorkshopSettingsTab: View {
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundStyle(.secondary)
                                     .frame(minWidth: 52, alignment: .trailing)
-                                Slider(value: $viewModel.wallpaperEngineFPS, in: 30...maxSliderFPS, step: 1)
-                                    .frame(width: 120)
-                                    .tint(Color(hex: "30D158"))
+                                Slider(
+                                    value: snappedSliderBinding(
+                                        $viewModel.wallpaperEngineFPS,
+                                        in: 30...maxSliderFPS,
+                                        step: 5
+                                    ),
+                                    in: 30...maxSliderFPS
+                                )
+                                .tint(settingsSliderTint)
+                                .accessibilityLabel(t("workshop.fps"))
+                                .frame(width: 120)
                             }
                         }
                     }
@@ -1492,9 +1879,17 @@ private struct WorkshopSettingsTab: View {
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(.secondary)
                                 .frame(minWidth: 52, alignment: .trailing)
-                            Slider(value: $viewModel.sceneBakeFPS, in: 15...60, step: 5)
-                                .frame(width: 120)
-                                .tint(Color(hex: "30D158"))
+                            Slider(
+                                value: snappedSliderBinding(
+                                    $viewModel.sceneBakeFPS,
+                                    in: 15...maxSliderFPS,
+                                    step: 5
+                                ),
+                                in: 15...maxSliderFPS
+                            )
+                            .tint(settingsSliderTint)
+                            .accessibilityLabel(t("workshop.bakeFps"))
+                            .frame(width: 120)
                         }
                     }
 
@@ -1504,9 +1899,13 @@ private struct WorkshopSettingsTab: View {
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(.secondary)
                                 .frame(minWidth: 36, alignment: .trailing)
-                            Slider(value: $viewModel.sceneBakeDuration, in: 5...60, step: 5)
-                                .frame(width: 120)
-                                .tint(Color(hex: "30D158"))
+                            Slider(
+                                value: snappedSliderBinding($viewModel.sceneBakeDuration, in: 5...60, step: 5),
+                                in: 5...60
+                            )
+                            .tint(settingsSliderTint)
+                            .accessibilityLabel(t("workshop.bakeDuration"))
+                            .frame(width: 120)
                         }
                     }
 
@@ -1681,7 +2080,7 @@ private struct WorkshopSettingsTab: View {
                                         case .loginTimeout:
                                             steamLoginStatusText = "Steam 登录超时，请检查网络或代理设置后重试。"
                                         case .sessionExpired:
-                                            steamLoginStatusText = "Steam 登录已过期，请重新验证。"
+                                            steamLoginStatusText = "Steam 登录已过期，请重新登录。"
                                         case .invalidCredentials:
                                             steamLoginStatusText = "账号、密码或验证码不正确，请检查后重试。"
                                         case .steamLoginFailed(let msg):

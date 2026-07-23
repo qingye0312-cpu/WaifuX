@@ -15,8 +15,31 @@ class WallpaperSchedulerService: ObservableObject {
     private var lastChangeTimes: [String: Date] = [:]
     /// Tracks already-used item IDs per screen in the current random round to avoid duplicates within a full cycle.
     private var usedItemIDs: [String: Set<String>] = [:]
+    /// Per-screen in-flight set for "播完即换" — blocks concurrent applies.
+    private var onEndSwitchInFlightScreens = Set<String>()
+    /// Earliest time another on-end apply is allowed for a screen (post-apply cooldown).
+    private var onEndSwitchCooldownUntilByScreen: [String: Date] = [:]
+    /// Ignore another on-end trigger for the same screen within this window after apply returns.
+    private let onEndSwitchCooldown: TimeInterval = 1.5
+    /// A timed multi-screen batch is one transaction. Later timer ticks must
+    /// not race it while renderer/player setup is still awaiting.
+    private var timedRotationTask: Task<Void, Never>?
+    private var timedRotationGeneration: UInt64 = 0
+    /// Shared-decoder playback has one logical end event even though every
+    /// attached display may observe the underlying AVPlayerItem.
+    private var globalOnEndSwitchCooldownUntil: Date?
+    /// 使关闭全局同步之前启动的全局任务失效，禁止其晚到结果覆盖各屏状态。
+    private var globalRotationGeneration: UInt64 = 0
+    private var displayModeTransitionGeneration: UInt64 = 0
+    private var displayModeTransitionTask: Task<Void, Never>?
 
+    /// One-shot deadline timer: fire at the earliest due switch, then recompute.
     private var dispatchTimer: DispatchSourceTimer?
+    /// Keeps the process out of App Nap while a timed rotation is armed.
+    private var schedulerActivity: NSObjectProtocol?
+    /// After a failed timed apply, retry this screen no earlier than this date
+    /// (avoids waiting a full user interval on transient failures).
+    private var failedApplyRetryAfter: [String: Date] = [:]
     private var pendingCleanupWorkItem: DispatchWorkItem?
     private let userDefaultsKey = "wallpaper_scheduler_config"
     private let usedItemIDsKey = "wallpaper_scheduler_used_item_ids_v1"
@@ -24,8 +47,18 @@ class WallpaperSchedulerService: ObservableObject {
     private let lastChangedItemIDsKey = "wallpaper_scheduler_last_changed_item_ids_v1"
     private let displayFingerprintsKey = "wallpaper_scheduler_display_fingerprints_v1"
     private let logTag = "[WallpaperScheduler]"
+    private let globalSchedulerStateKey = "__global_display_sync__"
+    /// Match existing "interval - 0.5" eligibility slack.
+    private let intervalEligibilitySlack: TimeInterval = 0.5
+    /// Short poll when apply is blocked (manual set in flight, batch running).
+    private let deferredRetryDelay: TimeInterval = 5
+    /// Retry soon after a failed timed apply instead of waiting a full interval.
+    private let failedApplyRetryDelay: TimeInterval = 15
+    private let minimumTimerDelay: TimeInterval = 0.25
+    private let scheduleLeeway: DispatchTimeInterval = .milliseconds(200)
     private var isScreenLocked = false
     private var lastUnlockSwitchTime: Date?
+    private var globalRotationTask: Task<Void, Never>?
 
     /// Persists screenID → fingerprint mapping so that display configs can be
     /// relinked after sleep/wake when CGDirectDisplayID may change on external monitors.
@@ -33,6 +66,14 @@ class WallpaperSchedulerService: ObservableObject {
 
     /// 视频播放完成通知（用于"播完即换"模式）
     static let videoPlaybackEndedNotification = Notification.Name("com.waifux.scheduler.videoPlaybackEnded")
+
+    var isGlobalDisplaySyncEnabled: Bool {
+        config.isGlobalDisplaySyncEnabled
+    }
+
+    var globalDisplayConfig: DisplaySchedulerConfig {
+        config.globalDisplayConfig
+    }
 
     private init() {
         DistributedNotificationCenter.default.addObserver(
@@ -68,7 +109,17 @@ class WallpaperSchedulerService: ObservableObject {
             return
         }
         DispatchQueue.main.async { [weak self] in
-            self?.triggerNextWallpaper(for: screenID)
+            guard let self else { return }
+            if self.displayModeTransitionTask != nil,
+               !self.config.isGlobalDisplaySyncEnabled {
+                print("\(self.logTag) Ignoring playback-end event during global-to-independent transition")
+                return
+            }
+            if self.config.isGlobalDisplaySyncEnabled {
+                self.applyNextGlobalWallpaper(requiredMode: .onEnd)
+            } else {
+                self.triggerNextWallpaper(for: screenID)
+            }
         }
     }
 
@@ -80,19 +131,40 @@ class WallpaperSchedulerService: ObservableObject {
     /// 手动为指定屏幕切换下一张壁纸。即使该屏幕暂时关闭自动切换，也允许使用
     /// 已保存的轮换范围、顺序和文件夹过滤来选取下一张。
     func triggerNextWallpaperNow(for screenID: String) {
+        print("\(logTag) Manual next wallpaper requested for screen \(screenID)")
+        if config.isGlobalDisplaySyncEnabled {
+            applyNextGlobalWallpaper(requiredMode: nil)
+            return
+        }
         applyNextWallpaper(for: screenID, requiredMode: nil)
     }
 
+    func triggerNextGlobalWallpaperNow() {
+        applyNextGlobalWallpaper(requiredMode: nil)
+    }
+
     func triggerRandomWallpaperNow(for screenID: String) {
+        if config.isGlobalDisplaySyncEnabled {
+            applyNextGlobalWallpaper(requiredMode: nil, overrideOrder: .random)
+            return
+        }
         applyNextWallpaper(for: screenID, requiredMode: nil, overrideOrder: .random)
     }
 
     func hasSchedulableItems(for screenID: String) -> Bool {
-        let displayConfig = config.resolvedDisplayConfig(for: screenID)
-        return !getSchedulableItems(for: displayConfig, screenID: screenID).isEmpty
+        let displayConfig = config.isGlobalDisplaySyncEnabled
+            ? config.globalDisplayConfig
+            : config.resolvedDisplayConfig(for: screenID)
+        return !getSchedulableItems(
+            for: displayConfig,
+            screenID: config.isGlobalDisplaySyncEnabled ? nil : screenID
+        ).isEmpty
     }
 
     func resolvedDisplayConfig(for screen: NSScreen) -> DisplaySchedulerConfig {
+        if config.isGlobalDisplaySyncEnabled {
+            return config.globalDisplayConfig
+        }
         let screenID = screen.wallpaperScreenIdentifier
         if let displayConfig = config.displayConfigs[screenID] {
             return displayConfig
@@ -131,21 +203,50 @@ class WallpaperSchedulerService: ObservableObject {
         requiredMode: RequiredSwitchMode?,
         overrideOrder: ScheduleOrder? = nil
     ) {
-        guard !isScreenLocked else { return }
-        guard NSScreen.screens.contains(where: { $0.wallpaperScreenIdentifier == screenID }) else {
+        // 手动“下一张”允许在锁屏标志异常时继续；自动 on-end 仍尊重锁屏状态。
+        // screenIsUnlocked DistributedNotification 偶发丢失时，isScreenLocked 会永久卡死。
+        if isScreenLocked {
+            if requiredMode == nil {
+                print("\(logTag) Manual next requested while isScreenLocked=true; force-clearing stuck lock flag")
+                isScreenLocked = false
+            } else {
+                print("\(logTag) Skip next wallpaper for \(screenID): screen is locked")
+                return
+            }
+        }
+        guard let liveScreen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else {
+            print("\(logTag) Skip next wallpaper: screen \(screenID) not found")
             return
         }
-        let displayConfig = config.resolvedDisplayConfig(for: screenID)
+        let displayConfig = resolvedDisplayConfig(for: liveScreen)
         switch requiredMode {
         case .onEnd:
-            guard displayConfig.isEnabled && displayConfig.isOnEndMode else { return }
+            guard displayConfig.isEnabled && displayConfig.isOnEndMode else {
+                print("\(logTag) Skip on-end next for \(screenID): enabled=\(displayConfig.isEnabled) onEnd=\(displayConfig.isOnEndMode)")
+                return
+            }
+            // 同一屏切换进行中 / 冷却中：吞掉重复 end 事件，避免“连着切两张”。
+            // 冷却命中时必须恢复当前视频，否则 end observer 已 pause+seek 会停在 poster 上。
+            if onEndSwitchInFlightScreens.contains(screenID) {
+                print("\(logTag) Skip on-end next for \(screenID): switch already in flight")
+                return
+            }
+            if let cooldownUntil = onEndSwitchCooldownUntilByScreen[screenID],
+               Date() < cooldownUntil {
+                print("\(logTag) Skip on-end next for \(screenID): within post-switch cooldown; resume current video")
+                recoverCurrentVideoAfterFailedOnEndSwitch(for: screenID, requiredMode: requiredMode)
+                return
+            }
+            onEndSwitchInFlightScreens.insert(screenID)
         case nil:
             break
         }
 
         let items = getSchedulableItems(for: displayConfig, screenID: screenID)
         guard !items.isEmpty else {
-            print("\(logTag) Screen \(screenID): no schedulable items for next-wallpaper request")
+            print("\(logTag) Screen \(screenID): no schedulable items for next-wallpaper request (includeMedia=\(displayConfig.includeMedia) includeWallpapers=\(displayConfig.includeWallpapers) onEnd=\(displayConfig.isOnEndMode))")
+            finishOnEndSwitch(for: screenID, requiredMode: requiredMode, applied: false)
+            recoverCurrentVideoAfterFailedOnEndSwitch(for: screenID, requiredMode: requiredMode)
             return
         }
 
@@ -155,12 +256,18 @@ class WallpaperSchedulerService: ObservableObject {
         let order = overrideOrder ?? displayConfig.order
         guard let item = selectNextItem(from: items, lastID: lastChangedItemID, screenID: screenID, order: order) else {
             print("\(logTag) Screen \(screenID): item selection returned nil for on-end mode")
+            finishOnEndSwitch(for: screenID, requiredMode: requiredMode, applied: false)
+            recoverCurrentVideoAfterFailedOnEndSwitch(for: screenID, requiredMode: requiredMode)
             return
         }
 
         Task { @MainActor in
+            var didApply = false
+            defer { self.finishOnEndSwitch(for: screenID, requiredMode: requiredMode, applied: didApply) }
+            print("\(logTag) Applying next wallpaper '\(item.title)' (\(item.fileURL.lastPathComponent)) to screen \(screenID)")
             let success = await applyItem(item, toScreenID: screenID)
             if success {
+                didApply = true
                 self.lastChangeTimes[screenID] = now
                 self.lastChangedItemIDs[screenID] = item.id
                 self.persistSchedulerState()
@@ -174,6 +281,7 @@ class WallpaperSchedulerService: ObservableObject {
                     remaining.removeAll { $0.id == retryItem.id }
                     let retrySuccess = await applyItem(retryItem, toScreenID: screenID)
                     if retrySuccess {
+                        didApply = true
                         self.lastChangeTimes[screenID] = now
                         self.lastChangedItemIDs[screenID] = retryItem.id
                         self.persistSchedulerState()
@@ -183,16 +291,135 @@ class WallpaperSchedulerService: ObservableObject {
                     print("\(logTag) Retry failed for next wallpaper '\(retryItem.title)', trying next")
                 }
                 print("\(logTag) All next-wallpaper candidates exhausted for screen \(screenID), no wallpaper applied")
+                self.recoverCurrentVideoAfterFailedOnEndSwitch(for: screenID, requiredMode: requiredMode)
             }
         }
+    }
+
+    private func finishOnEndSwitch(
+        for screenID: String,
+        requiredMode: RequiredSwitchMode?,
+        applied: Bool
+    ) {
+        guard case .onEnd? = requiredMode else { return }
+        onEndSwitchInFlightScreens.remove(screenID)
+        // Only arm cooldown after a successful apply. Failed recovery should
+        // allow the next real end event to try again immediately.
+        if applied {
+            onEndSwitchCooldownUntilByScreen[screenID] = Date().addingTimeInterval(onEndSwitchCooldown)
+        } else {
+            onEndSwitchCooldownUntilByScreen.removeValue(forKey: screenID)
+        }
+    }
+
+    /// Global mode selects one candidate and commits it only after the
+    /// coordinator has applied the same source to the full current screen set.
+    private func applyNextGlobalWallpaper(
+        requiredMode: RequiredSwitchMode?,
+        overrideOrder: ScheduleOrder? = nil
+    ) {
+        guard globalRotationTask == nil else {
+            print("\(logTag) Global rotation already in flight; coalescing trigger")
+            return
+        }
+        guard !isScreenLocked || requiredMode == nil else { return }
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return }
+
+        let displayConfig = config.globalDisplayConfig
+        if case .onEnd? = requiredMode,
+           !(displayConfig.isEnabled && displayConfig.isOnEndMode) {
+            return
+        }
+        if case .onEnd? = requiredMode,
+           let cooldownUntil = globalOnEndSwitchCooldownUntil,
+           Date() < cooldownUntil {
+            print("\(logTag) Skip global on-end rotation: within post-switch cooldown")
+            return
+        }
+        let items = getSchedulableItems(for: displayConfig)
+        guard !items.isEmpty else {
+            if case .onEnd? = requiredMode {
+                VideoWallpaperManager.shared.resumeOnEndVideosAfterFailedGlobalSwitch(for: screens)
+            }
+            return
+        }
+
+        let order = overrideOrder ?? displayConfig.order
+        guard let item = selectNextItem(
+            from: items,
+            lastID: lastChangedItemIDs[globalSchedulerStateKey],
+            screenID: globalSchedulerStateKey,
+            order: order
+        ) else {
+            return
+        }
+
+        let generation = globalRotationGeneration
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.globalRotationGeneration == generation {
+                    self.globalRotationTask = nil
+                    // Re-arm one-shot timer after any global batch (timed or on-end
+                    // with web/scene fallback). Event-only modes get nextFire=nil.
+                    if self.isRunning {
+                        self.scheduleNextChange()
+                    }
+                }
+            }
+
+            let success = await self.applyItemGlobally(item, to: screens)
+            guard !Task.isCancelled,
+                  self.globalRotationGeneration == generation,
+                  self.config.isGlobalDisplaySyncEnabled else {
+                print("\(self.logTag) Ignoring superseded global rotation result")
+                return
+            }
+            guard success else {
+                if case .onEnd? = requiredMode {
+                    VideoWallpaperManager.shared.resumeOnEndVideosAfterFailedGlobalSwitch(for: screens)
+                } else {
+                    self.failedApplyRetryAfter[self.globalSchedulerStateKey] =
+                        Date().addingTimeInterval(self.failedApplyRetryDelay)
+                    print("\(self.logTag) Global apply failed, retry in \(Int(self.failedApplyRetryDelay))s")
+                }
+                return
+            }
+
+            self.failedApplyRetryAfter.removeValue(forKey: self.globalSchedulerStateKey)
+            self.lastChangeTimes[self.globalSchedulerStateKey] = Date()
+            self.lastChangedItemIDs[self.globalSchedulerStateKey] = item.id
+            if case .onEnd? = requiredMode {
+                self.globalOnEndSwitchCooldownUntil = Date().addingTimeInterval(self.onEndSwitchCooldown)
+            }
+            self.persistSchedulerState()
+        }
+        globalRotationTask = task
+    }
+
+    /// An on-end rotation has already paused the current video. If no candidate can
+    /// replace it, start that player again instead of leaving its window black.
+    private func recoverCurrentVideoAfterFailedOnEndSwitch(
+        for screenID: String,
+        requiredMode: RequiredSwitchMode?
+    ) {
+        guard case .onEnd? = requiredMode,
+              let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else {
+            return
+        }
+
+        print("\(logTag) Restoring current video after failed on-end switch for screen \(screenID)")
+        VideoWallpaperManager.shared.resumeOnEndVideoAfterFailedSwitch(for: screen)
     }
 
     @objc private func handleScreenLocked() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.isScreenLocked = true
-            self.dispatchTimer?.cancel()
-            self.dispatchTimer = nil
+            self.cancelDispatchTimer()
+            self.endSchedulerActivity()
+            self.cancelTimedRotation()
             print("\(self.logTag) Screen locked, pausing scheduler")
         }
     }
@@ -209,6 +436,14 @@ class WallpaperSchedulerService: ObservableObject {
         }
     }
 
+    /// 自愈：若 unlock 通知丢失导致 isScreenLocked 卡死，调度定时器路径可主动恢复。
+    private func clearStuckScreenLockIfNeeded(source: String) {
+        guard isScreenLocked else { return }
+        // 用户能点到状态栏菜单 / 定时器在跑，说明会话通常已解锁。
+        isScreenLocked = false
+        print("\(logTag) Self-healed stuck isScreenLocked via \(source)")
+    }
+
     @objc private func handleScreenParametersChanged() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -220,6 +455,7 @@ class WallpaperSchedulerService: ObservableObject {
                 self.relinkDisplayConfigsByFingerprint()
                 self.relinkSchedulerStateByFingerprint(using: previousFingerprints)
                 self.cleanupOrphanedScreenState()
+                self.cancelTimedRotation()
                 if self.isRunning {
                     self.scheduleNextChange()
                 }
@@ -230,7 +466,8 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     private func cleanupOrphanedScreenState() {
-        let currentScreenIDs = Set(NSScreen.screens.map { $0.wallpaperScreenIdentifier })
+        var currentScreenIDs = Set(NSScreen.screens.map { $0.wallpaperScreenIdentifier })
+        currentScreenIDs.insert(globalSchedulerStateKey)
 
         // 清理 lastChangedItemIDs
         let orphanedChangedItemIDs = Set(lastChangedItemIDs.keys).subtracting(currentScreenIDs)
@@ -242,6 +479,11 @@ class WallpaperSchedulerService: ObservableObject {
         let orphanedChangeTimes = Set(lastChangeTimes.keys).subtracting(currentScreenIDs)
         for screenID in orphanedChangeTimes {
             lastChangeTimes.removeValue(forKey: screenID)
+        }
+
+        let orphanedRetryKeys = Set(failedApplyRetryAfter.keys).subtracting(currentScreenIDs)
+        for screenID in orphanedRetryKeys {
+            failedApplyRetryAfter.removeValue(forKey: screenID)
         }
 
         // 清理 usedItemIDs
@@ -262,33 +504,83 @@ class WallpaperSchedulerService: ObservableObject {
     /// Re-maps display configs whose screen ID changed (e.g. after sleep/wake when
     /// CGDirectDisplayID may change on external monitors) using the stable fingerprint.
     private func relinkDisplayConfigsByFingerprint() {
-        let currentScreens = NSScreen.screens
-        let currentScreenIDs = Set(currentScreens.map { $0.wallpaperScreenIdentifier })
+        let currentScreens = NSScreen.screensOrderedForDisplay
+        let currentScreenIDs = Set(currentScreens.map(\.wallpaperScreenIdentifier))
 
         // Find orphaned config keys — screen IDs that were in displayConfigs but are no longer present
-        let orphanedIDs = Set(config.displayConfigs.keys).subtracting(currentScreenIDs)
+        var orphanedIDs = Set(config.displayConfigs.keys).subtracting(currentScreenIDs)
         guard !orphanedIDs.isEmpty else { return }
 
-        // Build fingerprint → current screenID map
-        var fingerprintToScreenID: [String: String] = [:]
-        for screen in currentScreens {
-            fingerprintToScreenID[screen.schedulerConfigFingerprint] = screen.wallpaperScreenIdentifier
-            fingerprintToScreenID[screen.wallpaperScreenFingerprint] = screen.wallpaperScreenIdentifier
+        var claimedTargets = Set(config.displayConfigs.keys).intersection(currentScreenIDs)
+        var migratedCount = 0
+
+        // 第一轮：唯一精确/松散匹配（含 position 的新指纹通常走这里）
+        for orphanedID in orphanedIDs.sorted() {
+            guard let orphanedConfig = config.displayConfigs[orphanedID],
+                  let fingerprint = displayFingerprints[orphanedID],
+                  let newScreenID = resolveScreenID(
+                    forFingerprint: fingerprint,
+                    among: currentScreens,
+                    excluding: claimedTargets
+                  ) else {
+                continue
+            }
+
+            applyDisplayConfigMigration(
+                orphanedID: orphanedID,
+                orphanedConfig: orphanedConfig,
+                fingerprint: fingerprint,
+                newScreenID: newScreenID,
+                currentScreens: currentScreens
+            )
+            claimedTargets.insert(newScreenID)
+            orphanedIDs.remove(orphanedID)
+            migratedCount += 1
         }
 
-        var migratedCount = 0
-        for orphanedID in orphanedIDs {
-            guard let fingerprint = displayFingerprints[orphanedID],
-                  let newScreenID = fingerprintToScreenID[fingerprint],
-                  !config.displayConfigs.keys.contains(newScreenID) else { continue }
-
-            if let orphanedConfig = config.displayConfigs[orphanedID] {
-                config.displayConfigs[newScreenID] = orphanedConfig
-                displayFingerprints[newScreenID] = fingerprint
-                migratedCount += 1
+        // 第二轮：旧版无序列号短指纹会同时命中多块同型号屏。
+        // 按「硬件身份」分组后，将 orphan 与空闲屏各自按稳定顺序 1:1 zip，
+        // 避免随机 .first 把显示器 2/3 配置互换。
+        if !orphanedIDs.isEmpty {
+            let freeScreens = currentScreens.filter {
+                !claimedTargets.contains($0.wallpaperScreenIdentifier)
             }
-            displayFingerprints.removeValue(forKey: orphanedID)
-            config.displayConfigs.removeValue(forKey: orphanedID)
+            var freeByHardware: [String: [NSScreen]] = [:]
+            for screen in freeScreens {
+                freeByHardware[hardwareIdentityKey(for: screen), default: []].append(screen)
+            }
+
+            var orphansByHardware: [String: [String]] = [:]
+            for orphanedID in orphanedIDs {
+                guard let fingerprint = displayFingerprints[orphanedID] else { continue }
+                orphansByHardware[hardwareIdentityKey(forFingerprint: fingerprint), default: []].append(orphanedID)
+            }
+
+            for hardwareKey in orphansByHardware.keys.sorted() {
+                guard var orphanGroup = orphansByHardware[hardwareKey],
+                      let freeGroup = freeByHardware[hardwareKey],
+                      !freeGroup.isEmpty else { continue }
+                orphanGroup.sort()
+                // freeGroup 已来自 screensOrderedForDisplay 的稳定顺序
+                let pairCount = min(orphanGroup.count, freeGroup.count)
+                for i in 0..<pairCount {
+                    let orphanedID = orphanGroup[i]
+                    let target = freeGroup[i]
+                    let newScreenID = target.wallpaperScreenIdentifier
+                    guard let orphanedConfig = config.displayConfigs[orphanedID] else { continue }
+                    let fingerprint = displayFingerprints[orphanedID] ?? target.schedulerConfigFingerprint
+                    applyDisplayConfigMigration(
+                        orphanedID: orphanedID,
+                        orphanedConfig: orphanedConfig,
+                        fingerprint: fingerprint,
+                        newScreenID: newScreenID,
+                        currentScreens: currentScreens
+                    )
+                    claimedTargets.insert(newScreenID)
+                    orphanedIDs.remove(orphanedID)
+                    migratedCount += 1
+                }
+            }
         }
 
         if migratedCount > 0 {
@@ -298,19 +590,65 @@ class WallpaperSchedulerService: ObservableObject {
         }
     }
 
+    private func applyDisplayConfigMigration(
+        orphanedID: String,
+        orphanedConfig: DisplaySchedulerConfig,
+        fingerprint: String,
+        newScreenID: String,
+        currentScreens: [NSScreen]
+    ) {
+        config.displayConfigs[newScreenID] = orphanedConfig
+        config.displayConfigs.removeValue(forKey: orphanedID)
+        displayFingerprints.removeValue(forKey: orphanedID)
+        if let screen = currentScreens.first(where: { $0.wallpaperScreenIdentifier == newScreenID }) {
+            displayFingerprints[newScreenID] = screen.schedulerConfigFingerprint
+        } else {
+            displayFingerprints[newScreenID] = fingerprint
+        }
+    }
+
+    /// 用于同型号双屏分组：去掉 position 后缀，并尽量归一化到 vendor/model/name 粒度。
+    private func hardwareIdentityKey(for screen: NSScreen) -> String {
+        hardwareIdentityKey(forFingerprint: screen.externalConnectionFingerprint)
+    }
+
+    private func hardwareIdentityKey(forFingerprint fingerprint: String) -> String {
+        var key = fingerprint
+        if let range = key.range(of: ":position:") {
+            key = String(key[..<range.lowerBound])
+        }
+        // 去掉分辨率段（旧 wallpaper 指纹：…:WxH:builtin）
+        // cg:v:m:noserial:name:2560x1440:external → cg:v:m:noserial:name:external
+        if let regex = try? NSRegularExpression(pattern: #":\d+x\d+(?=:)"#),
+           regex.firstMatch(in: key, range: NSRange(key.startIndex..., in: key)) != nil {
+            key = regex.stringByReplacingMatches(
+                in: key,
+                range: NSRange(key.startIndex..., in: key),
+                withTemplate: ""
+            )
+        }
+        return key
+    }
+
     private func existingConfigScreenID(for screen: NSScreen) -> String? {
         let currentID = screen.wallpaperScreenIdentifier
         if config.displayConfigs[currentID] != nil {
             return currentID
         }
 
-        let fingerprints = Set([
-            screen.schedulerConfigFingerprint,
-            screen.wallpaperScreenFingerprint,
-        ])
-        return displayFingerprints.first { _, fingerprint in
-            fingerprints.contains(fingerprint)
-        }?.key
+        let candidates = screen.schedulerFingerprintCandidates
+        let matches = displayFingerprints.filter { key, fingerprint in
+            config.displayConfigs[key] != nil && candidates.contains(fingerprint)
+        }
+
+        // 精确指纹优先（含位置）；同型号无序列号时旧短指纹可能命中多条，绝不能 .first 随机挑。
+        if let exact = matches.first(where: { $0.value == screen.wallpaperScreenFingerprint })?.key {
+            return exact
+        }
+        if matches.count == 1, let only = matches.keys.first {
+            return only
+        }
+        return nil
     }
 
     private func migrateDisplayConfig(from oldScreenID: String, to screen: NSScreen) {
@@ -332,25 +670,31 @@ class WallpaperSchedulerService: ObservableObject {
 
     /// Re-maps per-screen scheduler state using the saved display fingerprint.
     private func relinkSchedulerStateByFingerprint(using previousFingerprints: [String: String]) {
-        let currentScreens = NSScreen.screens
-        let currentScreenIDs = Set(currentScreens.map { $0.wallpaperScreenIdentifier })
-
-        var fingerprintToScreenID: [String: String] = [:]
-        for screen in currentScreens {
-            fingerprintToScreenID[screen.schedulerConfigFingerprint] = screen.wallpaperScreenIdentifier
-            fingerprintToScreenID[screen.wallpaperScreenFingerprint] = screen.wallpaperScreenIdentifier
-        }
+        let currentScreens = NSScreen.screensOrderedForDisplay
+        let currentScreenIDs = Set(currentScreens.map(\.wallpaperScreenIdentifier))
 
         let orphanedIDs = Set(lastChangedItemIDs.keys)
             .union(lastChangeTimes.keys)
             .union(usedItemIDs.keys)
             .subtracting(currentScreenIDs)
+            .subtracting([globalSchedulerStateKey])
         guard !orphanedIDs.isEmpty else { return }
 
+        // 已有运行时状态的屏先占位，避免两块同型号屏的 orphan 状态互换。
+        var claimedTargets = Set(
+            currentScreenIDs.filter {
+                lastChangedItemIDs[$0] != nil || lastChangeTimes[$0] != nil || usedItemIDs[$0] != nil
+            }
+        )
         var migratedCount = 0
-        for orphanedID in orphanedIDs {
+
+        for orphanedID in orphanedIDs.sorted() {
             guard let fingerprint = previousFingerprints[orphanedID],
-                  let newScreenID = fingerprintToScreenID[fingerprint],
+                  let newScreenID = resolveScreenID(
+                    forFingerprint: fingerprint,
+                    among: currentScreens,
+                    excluding: claimedTargets
+                  ),
                   newScreenID != orphanedID else {
                 continue
             }
@@ -378,12 +722,74 @@ class WallpaperSchedulerService: ObservableObject {
                 }
                 migratedCount += 1
             }
+
+            claimedTargets.insert(newScreenID)
         }
 
         if migratedCount > 0 {
             persistSchedulerState()
             print("\(logTag) Relinked scheduler state by fingerprint (\(migratedCount) migrated value(s))")
         }
+    }
+
+    /// 在当前屏幕列表中按指纹找回目标屏。优先精确匹配；旧版无 position 的短指纹
+    /// 若命中多块同型号屏，只在「唯一未占用」时才绑定，避免 2/3 配置互换。
+    private func resolveScreenID(
+        forFingerprint fingerprint: String,
+        among screens: [NSScreen],
+        excluding claimedTargets: Set<String>
+    ) -> String? {
+        let exactMatches = screens.filter { screen in
+            let id = screen.wallpaperScreenIdentifier
+            guard !claimedTargets.contains(id) else { return false }
+            return screen.schedulerFingerprintCandidates.contains(fingerprint)
+                || screen.wallpaperScreenFingerprint == fingerprint
+                || screen.schedulerConfigFingerprint == fingerprint
+                || screen.legacyWallpaperScreenFingerprint == fingerprint
+                || screen.externalConnectionFingerprint == fingerprint
+        }
+
+        if exactMatches.count == 1 {
+            return exactMatches[0].wallpaperScreenIdentifier
+        }
+
+        // 短指纹（无 position）可能同时命中两块同型号屏：只接受唯一未占用目标。
+        let available = exactMatches.map(\.wallpaperScreenIdentifier)
+        if available.count == 1 {
+            return available[0]
+        }
+
+        // 模糊匹配：历史 fingerprint 与当前候选有公共前缀（旧 noserial 无 position）。
+        if exactMatches.isEmpty {
+            let fuzzy = screens.filter { screen in
+                let id = screen.wallpaperScreenIdentifier
+                guard !claimedTargets.contains(id) else { return false }
+                return screen.schedulerFingerprintCandidates.contains { candidate in
+                    fingerprintsLooselyMatch(fingerprint, candidate)
+                }
+            }
+            if fuzzy.count == 1 {
+                return fuzzy[0].wallpaperScreenIdentifier
+            }
+        }
+
+        return nil
+    }
+
+    private func fingerprintsLooselyMatch(_ lhs: String, _ rhs: String) -> Bool {
+        if lhs == rhs { return true }
+        // 新指纹 = 旧指纹 + ":position:..."
+        if lhs.hasPrefix(rhs + ":position:") || rhs.hasPrefix(lhs + ":position:") {
+            return true
+        }
+        // 去掉 position 后缀后比较
+        let strip: (String) -> String = { value in
+            if let range = value.range(of: ":position:") {
+                return String(value[..<range.lowerBound])
+            }
+            return value
+        }
+        return strip(lhs) == strip(rhs)
     }
 
     /// Persists fingerprint mapping whenever display configs are saved.
@@ -444,14 +850,50 @@ class WallpaperSchedulerService: ObservableObject {
     func start() {
         guard !isRunning else { return }
         isRunning = true
+        // Anchor missing last-change times so the first switch waits a full interval
+        // (matches previous repeating-timer behavior) instead of firing immediately.
+        seedMissingLastChangeTimesIfNeeded()
         scheduleNextChange()
         saveConfig()
-        print("\(logTag) Started. Check interval: \(effectiveCheckInterval())s")
+        let delayDesc: String
+        if let next = nextTimerFireDate(from: Date()) {
+            delayDesc = String(format: "%.1fs", max(0, next.timeIntervalSinceNow))
+        } else {
+            delayDesc = "none (event-driven)"
+        }
+        print("\(logTag) Started. Next check: \(delayDesc)")
+    }
+
+    /// When a timed display has never recorded a switch, treat "now" as the start
+    /// of the interval so enabling auto-switch does not instantly replace the wallpaper.
+    private func seedMissingLastChangeTimesIfNeeded(now: Date = Date()) {
+        var didSeed = false
+        if config.isGlobalDisplaySyncEnabled {
+            if timedIntervalSeconds(for: config.globalDisplayConfig) != nil,
+               lastChangeTimes[globalSchedulerStateKey] == nil {
+                lastChangeTimes[globalSchedulerStateKey] = now
+                didSeed = true
+            }
+        } else {
+            for screen in NSScreen.screens {
+                let screenID = screen.wallpaperScreenIdentifier
+                let displayConfig = resolvedDisplayConfig(for: screen)
+                guard timedIntervalSeconds(for: displayConfig) != nil else { continue }
+                guard lastChangeTimes[screenID] == nil else { continue }
+                lastChangeTimes[screenID] = now
+                didSeed = true
+            }
+        }
+        if didSeed {
+            persistSchedulerState()
+        }
     }
 
     func stop() {
-        dispatchTimer?.cancel()
-        dispatchTimer = nil
+        cancelDispatchTimer()
+        endSchedulerActivity()
+        cancelTimedRotation()
+        failedApplyRetryAfter.removeAll()
         isRunning = false
         saveConfig()
         // 停止时保留持久化状态，以便重新启用时继续上轮随机进度
@@ -462,12 +904,19 @@ class WallpaperSchedulerService: ObservableObject {
     /// 手动设置壁纸后调用：重置该屏幕的调度计时器，避免刚设置完就被自动切换覆盖。
     /// - Parameter screenID: 被手动设置壁纸的屏幕标识符；nil 表示重置所有屏幕。
     func notifyManualWallpaperChange(screenID: String? = nil) {
+        cancelTimedRotation()
         let now = Date()
-        if let screenID = screenID {
+        if config.isGlobalDisplaySyncEnabled {
+            lastChangeTimes[globalSchedulerStateKey] = now
+            failedApplyRetryAfter.removeValue(forKey: globalSchedulerStateKey)
+        } else if let screenID = screenID {
             lastChangeTimes[screenID] = now
+            failedApplyRetryAfter.removeValue(forKey: screenID)
         } else {
             for screen in NSScreen.screens {
-                lastChangeTimes[screen.wallpaperScreenIdentifier] = now
+                let id = screen.wallpaperScreenIdentifier
+                lastChangeTimes[id] = now
+                failedApplyRetryAfter.removeValue(forKey: id)
             }
         }
         persistSchedulerState()
@@ -479,7 +928,7 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateConfig(_ newConfig: SchedulerConfig) {
-        // 根据各屏启用的内容类型校验 folderIDs：移除属于已关闭类型（或 on-end 模式下的壁纸类型）
+        // 根据各屏启用的内容类型校验 folderIDs：移除属于已关闭类型
         // 的文件夹 ID。若全部失效则回退为 nil（全部），避免文件夹过滤把候选清空导致自动更换失效。
         var validated = newConfig
         for screenID in validated.displayConfigs.keys {
@@ -490,6 +939,10 @@ class WallpaperSchedulerService: ObservableObject {
                 validated.displayConfigs[screenID] = dc
             }
         }
+        validated.globalDisplayConfig.folderIDs = validatedFolderIDs(
+            validated.globalDisplayConfig.folderIDs,
+            displayConfig: validated.globalDisplayConfig
+        )
         config = validated
         saveConfig()
         if isRunning {
@@ -501,12 +954,11 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     /// 校验 folderIDs 是否仍属于当前启用的内容类型。
-    /// - on-end 模式仅消费媒体，壁纸文件夹视为失效。
     /// - 已删除（在两类文件夹存储中均查不到）的 ID 一并剔除。
     /// - 全部失效时返回 nil（等价于"全部"），避免空过滤把候选清空。
     private func validatedFolderIDs(_ folderIDs: [String]?, displayConfig: DisplaySchedulerConfig) -> [String]? {
         guard let folderIDs, !folderIDs.isEmpty else { return folderIDs }
-        let includeWallpapers = displayConfig.includeWallpapers && !displayConfig.isOnEndMode
+        let includeWallpapers = displayConfig.includeWallpapers
         let includeMedia = displayConfig.includeMedia
         let store = LibraryFolderStore.shared
         let filtered = folderIDs.filter { id in
@@ -521,17 +973,231 @@ class WallpaperSchedulerService: ObservableObject {
 
     /// 是否有至少一个显示器开启了自动更换
     private var hasAnyEnabledDisplay: Bool {
-        NSScreen.screens.contains { screen in
-            let displayConfig = config.resolvedDisplayConfig(for: screen.wallpaperScreenIdentifier)
-            return displayConfig.isEnabled
+        if config.isGlobalDisplaySyncEnabled {
+            return config.globalDisplayConfig.isEnabled
+                && !NSScreen.screens.isEmpty
+        }
+        return NSScreen.screens.contains { screen in
+            resolvedDisplayConfig(for: screen).isEnabled
         }
     }
 
     // MARK: - Per-Display Updates
 
-    func updateDisplayEnabled(_ enabled: Bool, for screenID: String) {
+    func updateGlobalDisplaySyncEnabled(_ enabled: Bool) {
+        guard config.isGlobalDisplaySyncEnabled != enabled else { return }
+
+        displayModeTransitionGeneration &+= 1
+        let transitionGeneration = displayModeTransitionGeneration
+        displayModeTransitionTask?.cancel()
+        displayModeTransitionTask = nil
+
+        if enabled {
+            var newConfig = config
+            newConfig.isGlobalDisplaySyncEnabled = true
+            updateConfig(newConfig)
+            GlobalWallpaperSyncCoordinator.shared.synchronizeCurrentWallpaperAfterEnabling()
+            return
+        }
+
+        // 先让旧全局选片任务失效；其底层全局事务会在异步切换阶段完整收尾。
+        globalRotationGeneration &+= 1
+        let supersededGlobalTask = globalRotationTask
+        supersededGlobalTask?.cancel()
+        globalRotationTask = nil
+        globalOnEndSwitchCooldownUntil = nil
+        failedApplyRetryAfter.removeValue(forKey: globalSchedulerStateKey)
+
         var newConfig = config
-        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
+        newConfig.isGlobalDisplaySyncEnabled = false
+        updateConfig(newConfig)
+
+        // updateConfig 会按独立配置启动计时器；模式切换完成前先阻止它抢跑。
+        cancelDispatchTimer()
+        endSchedulerActivity()
+        cancelTimedRotation()
+
+        displayModeTransitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard !Task.isCancelled,
+                  self.displayModeTransitionGeneration == transitionGeneration,
+                  !self.config.isGlobalDisplaySyncEnabled else { return }
+
+            // 等待已开始的全局事务结束，避免它在各屏重选后又覆盖全部屏幕。
+            await GlobalWallpaperSyncCoordinator.shared.drainBeforeLeavingGlobalMode()
+            if let supersededGlobalTask {
+                await supersededGlobalTask.value
+            }
+
+            guard !Task.isCancelled,
+                  self.displayModeTransitionGeneration == transitionGeneration,
+                  !self.config.isGlobalDisplaySyncEnabled else { return }
+
+            // 先把当前共享 AVPlayer 拆成各屏独立播放器；未启用调度的屏幕保留当前画面。
+            if let primary = NSScreen.screensOrderedForDisplay.first,
+               VideoWallpaperManager.shared.isVideoWallpaperActive {
+                VideoWallpaperManager.shared.setSharedDecoderPlaybackEnabled(
+                    false,
+                    sourceScreen: primary
+                )
+            }
+
+            await self.applyIndependentSelectionsAfterGlobalDisable(
+                transitionGeneration: transitionGeneration
+            )
+
+            guard self.displayModeTransitionGeneration == transitionGeneration,
+                  !self.config.isGlobalDisplaySyncEnabled else { return }
+            self.displayModeTransitionTask = nil
+            if self.isRunning {
+                self.scheduleNextChange()
+            }
+        }
+    }
+
+    /// 按每块显示器已保存的启用状态、内容范围、文件夹过滤和顺序立即重选一次。
+    private func applyIndependentSelectionsAfterGlobalDisable(
+        transitionGeneration: UInt64
+    ) async {
+        for screen in NSScreen.screensOrderedForDisplay {
+            guard !Task.isCancelled,
+                  displayModeTransitionGeneration == transitionGeneration,
+                  !config.isGlobalDisplaySyncEnabled else { return }
+
+            let screenID = screen.wallpaperScreenIdentifier
+            let displayConfig = resolvedDisplayConfig(for: screen)
+            guard displayConfig.isEnabled else {
+                print("\(logTag) Global sync disabled: scheduler remains off for \(screen.localizedName)")
+                continue
+            }
+
+            let items = getSchedulableItems(for: displayConfig, screenID: screenID)
+            guard let item = selectNextItem(
+                from: items,
+                lastID: lastChangedItemIDs[screenID],
+                screenID: screenID,
+                order: displayConfig.order
+            ) else {
+                print("\(logTag) Global sync disabled: no candidate for \(screen.localizedName)")
+                continue
+            }
+
+            let success = await applyItem(item, toScreenID: screenID)
+            guard displayModeTransitionGeneration == transitionGeneration,
+                  !config.isGlobalDisplaySyncEnabled else { return }
+            if success {
+                lastChangeTimes[screenID] = Date()
+                lastChangedItemIDs[screenID] = item.id
+                failedApplyRetryAfter.removeValue(forKey: screenID)
+                print("\(logTag) Activated independent scheduler for \(screen.localizedName): \(item.title)")
+            } else {
+                failedApplyRetryAfter[screenID] = Date().addingTimeInterval(failedApplyRetryDelay)
+                print("\(logTag) Failed initial independent selection for \(screen.localizedName)")
+            }
+        }
+        persistSchedulerState()
+    }
+
+    func updateGlobalDisplayEnabled(_ enabled: Bool) {
+        let wasUsingOnEndPlayback = config.globalDisplayConfig.isEnabled
+            && config.globalDisplayConfig.isOnEndMode
+        updateGlobalDisplayConfig { $0.isEnabled = enabled }
+        let isUsingOnEndPlayback = config.globalDisplayConfig.isEnabled
+            && config.globalDisplayConfig.isOnEndMode
+        if wasUsingOnEndPlayback != isUsingOnEndPlayback {
+            reconfigureCurrentGlobalVideoForScheduling()
+        }
+    }
+
+    func updateGlobalDisplayInterval(_ minutes: Int) {
+        let wasOnEndMode = config.globalDisplayConfig.isOnEndMode
+        updateGlobalDisplayConfig { $0.intervalMinutes = minutes }
+        if wasOnEndMode != config.globalDisplayConfig.isOnEndMode {
+            reconfigureCurrentGlobalVideoForScheduling()
+        }
+    }
+
+    func updateGlobalDisplayOrder(_ order: ScheduleOrder) {
+        updateGlobalDisplayConfig { $0.order = order }
+    }
+
+    func updateGlobalDisplayIncludeWallpapers(_ include: Bool) {
+        updateGlobalDisplayConfig { $0.includeWallpapers = include }
+    }
+
+    func updateGlobalDisplayIncludeMedia(_ include: Bool) {
+        updateGlobalDisplayConfig { $0.includeMedia = include }
+    }
+
+    func updateGlobalDisplayFolderIDs(_ folderIDs: [String]?) {
+        updateGlobalDisplayConfig { $0.folderIDs = folderIDs }
+    }
+
+    func updateGlobalDisplayWebSceneSwitchSeconds(_ seconds: Int?) {
+        updateGlobalDisplayConfig { $0.webSceneSwitchSeconds = seconds }
+    }
+
+    private func updateGlobalDisplayConfig(_ mutate: (inout DisplaySchedulerConfig) -> Void) {
+        var newConfig = config
+        mutate(&newConfig.globalDisplayConfig)
+        updateConfig(newConfig)
+    }
+
+    /// An existing AVPlayerLooper cannot change into non-looping playback by
+    /// configuration alone. Rebuild the global player whenever the scheduling
+    /// mode crosses the play-to-end boundary.
+    private func reconfigureCurrentGlobalVideoForScheduling() {
+        guard config.isGlobalDisplaySyncEnabled,
+              let videoURL = VideoWallpaperManager.shared.currentVideoURL,
+              FileManager.default.fileExists(atPath: videoURL.path) else {
+            return
+        }
+
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return }
+        let posterURL = VideoWallpaperManager.shared.currentPosterURL
+        Task { @MainActor in
+            do {
+                try VideoWallpaperManager.shared.applyVideoWallpaper(
+                    from: videoURL,
+                    posterURL: posterURL,
+                    muted: VideoWallpaperManager.shared.isMuted,
+                    targetScreens: screens,
+                    animatedTransition: false,
+                    usesSharedVideoDecoder: screens.count > 1,
+                    forceRebuild: true
+                )
+                print("\(logTag) Reconfigured global video playback for scheduler mode")
+            } catch {
+                print("\(logTag) Failed to reconfigure global video playback: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// 写入前把「当前 screenID」规范到真实配置 key。
+    /// sleep/wake 后 UI 传来的是新 NSScreenNumber，但配置可能仍在旧 id 下；
+    /// 若不迁移就直接写，会留下双份配置并在设置页看起来像 2/3 对调。
+    private func canonicalDisplayConfigScreenID(_ screenID: String) -> String {
+        if config.displayConfigs[screenID] != nil {
+            if let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) {
+                displayFingerprints[screenID] = screen.schedulerConfigFingerprint
+            }
+            return screenID
+        }
+        guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
+              let existing = existingConfigScreenID(for: screen),
+              existing != screenID,
+              config.displayConfigs[existing] != nil else {
+            return screenID
+        }
+        migrateDisplayConfig(from: existing, to: screen)
+        return screen.wallpaperScreenIdentifier
+    }
+
+    func updateDisplayEnabled(_ enabled: Bool, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
+        var newConfig = config
+        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         let wasOnEndMode = displayConfig.isOnEndMode
         displayConfig.isEnabled = enabled
         newConfig.displayConfigs[screenID] = displayConfig
@@ -548,7 +1214,8 @@ class WallpaperSchedulerService: ObservableObject {
                             from: videoURL,
                             posterURL: posterURL,
                             muted: VideoWallpaperManager.shared.isMuted,
-                            targetScreen: screen
+                            targetScreen: screen,
+                            forceRebuild: true
                         )
                         print("\(logTag) Auto-switch disabled for screen \(screenID) (was on-end mode), re-enabled looping")
                     }
@@ -561,8 +1228,9 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateDisplayInterval(_ minutes: Int, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
-        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
+        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         let wasOnEndMode = displayConfig.isOnEndMode
         displayConfig.intervalMinutes = minutes
         let isNowOnEndMode = minutes == SchedulerConfig.intervalOnEndMinutes
@@ -584,7 +1252,8 @@ class WallpaperSchedulerService: ObservableObject {
                             from: videoURL,
                             posterURL: posterURL,
                             muted: VideoWallpaperManager.shared.isMuted,
-                            targetScreen: screen
+                            targetScreen: screen,
+                            forceRebuild: true
                         )
                         print("\(logTag) Switched to on-end mode, reapplied wallpaper for screen \(screenID)")
                         return
@@ -609,7 +1278,8 @@ class WallpaperSchedulerService: ObservableObject {
                             from: videoURL,
                             posterURL: posterURL,
                             muted: VideoWallpaperManager.shared.isMuted,
-                            targetScreen: screen
+                            targetScreen: screen,
+                            forceRebuild: true
                         )
                         print("\(logTag) Switched from on-end mode, reapplied wallpaper with looping for screen \(screenID)")
                     }
@@ -619,111 +1289,265 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateDisplayOrder(_ order: ScheduleOrder, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
-        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
+        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         displayConfig.order = order
         newConfig.displayConfigs[screenID] = displayConfig
         updateConfig(newConfig)
     }
 
     func updateDisplayIncludeWallpapers(_ include: Bool, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
-        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
+        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         displayConfig.includeWallpapers = include
         newConfig.displayConfigs[screenID] = displayConfig
         updateConfig(newConfig)
     }
 
     func updateDisplayIncludeMedia(_ include: Bool, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
-        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
+        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         displayConfig.includeMedia = include
         newConfig.displayConfigs[screenID] = displayConfig
         updateConfig(newConfig)
     }
 
     func updateDisplayFolderIDs(_ folderIDs: [String]?, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
-        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
+        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         displayConfig.folderIDs = folderIDs
         newConfig.displayConfigs[screenID] = displayConfig
         updateConfig(newConfig)
     }
 
     func updateDisplayWebSceneSwitchSeconds(_ seconds: Int?, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
-        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
+        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         displayConfig.webSceneSwitchSeconds = seconds
         newConfig.displayConfigs[screenID] = displayConfig
         updateConfig(newConfig)
     }
 
-    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screenID: String) {
+    /// 外接显示器变更后，重新把当前全局壁纸覆盖到完整的屏幕集合。
+    /// 调度器只发起统一应用；媒体类型分发不在此处实现。
+    func synchronizeCurrentGlobalWallpaperToConnectedDisplays() {
+        guard config.isGlobalDisplaySyncEnabled else { return }
+        if VideoWallpaperManager.shared.isVideoWallpaperActive {
+            VideoWallpaperManager.shared.refreshSharedDecoderTargets()
+        } else {
+            GlobalWallpaperSyncCoordinator.shared.reapplyToConnectedDisplays()
+        }
+    }
+
+    /// Configures a newly connected external display to use the same schedulable
+    /// range as the primary display while choosing its first item randomly.
+    func configureExternalDisplayForRandomAllWallpapers(_ screen: NSScreen) {
+        guard !config.isGlobalDisplaySyncEnabled else { return }
+        let screenID = displayConfigScreenID(for: screen)
         var newConfig = config
-        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
-        displayConfig.autoChangeOnExternalConnect = enabled
+        let primary = NSScreen.screens.first
+        var displayConfig = primary.map { resolvedDisplayConfig(for: $0) }
+            ?? newConfig.storedDisplayConfig(for: screenID)
+        displayConfig.isEnabled = true
+        displayConfig.order = .random
+        displayConfig.folderIDs = nil
+        newConfig.displayConfigs[screenID] = displayConfig
+        updateConfig(newConfig)
+        triggerRandomWallpaperNow(for: screenID)
+    }
+
+    /// Keeps the display outside automatic rotation until the user explicitly
+    /// chooses a wallpaper or enables its scheduler settings.
+    func configureExternalDisplayWithoutAutoSwitch(_ screen: NSScreen) {
+        guard !config.isGlobalDisplaySyncEnabled else { return }
+        let screenID = displayConfigScreenID(for: screen)
+        var newConfig = config
+        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
+        displayConfig.isEnabled = false
         newConfig.displayConfigs[screenID] = displayConfig
         updateConfig(newConfig)
     }
 
-    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screen: NSScreen) {
-        let screenID = displayConfigScreenID(for: screen)
+    /// Removes scheduler-only state for a disconnected display that the user did
+    /// not choose to retain. Rendering services own cleanup of their own states.
+    func discardPersistedDisplayState(screenID: String, fingerprint: String) {
         var newConfig = config
-        var displayConfig = resolvedDisplayConfig(for: screen)
-        displayConfig.autoChangeOnExternalConnect = enabled
-        newConfig.displayConfigs[screenID] = displayConfig
+        let matchingIDs = Set(newConfig.displayConfigs.keys.filter {
+            $0 == screenID || displayFingerprints[$0] == fingerprint
+        })
+        for id in matchingIDs {
+            newConfig.displayConfigs.removeValue(forKey: id)
+            displayFingerprints.removeValue(forKey: id)
+            lastChangedItemIDs.removeValue(forKey: id)
+            lastChangeTimes.removeValue(forKey: id)
+            usedItemIDs.removeValue(forKey: id)
+        }
         updateConfig(newConfig)
+        persistSchedulerState()
+        saveDisplayFingerprints()
     }
 
     // MARK: - Scheduling
 
-    /// Returns the smallest interval among enabled timed displays.
-    /// 注意：特殊模式（intervalMinutes < 0）不参与定时器调度；
-    /// 但如果设置了 webSceneSwitchSeconds（Web/Scene 壁纸切换间隔），则仍需定时器。
-    private func effectiveCheckInterval() -> TimeInterval {
-        let screens = NSScreen.screens
-        let intervals = screens.compactMap { screen -> TimeInterval? in
-            let screenID = screen.wallpaperScreenIdentifier
-            let displayConfig = config.resolvedDisplayConfig(for: screenID)
-            guard displayConfig.isEnabled else { return nil }
-            guard !displayConfig.isOnUnlockMode else { return nil }
-            // "播完即换"模式的屏幕：仅当设置了 Web/Scene 切换间隔时才纳入定时器
-            guard !displayConfig.isOnEndMode else {
-                if let wsSec = displayConfig.webSceneSwitchSeconds {
-                    return TimeInterval(wsSec)
-                }
-                return nil
-            }
-            return TimeInterval(displayConfig.intervalMinutes * 60)
+    /// User-facing rotation interval for a timed (non-event) display config.
+    /// Returns nil when the display only switches on unlock / pure on-end video events.
+    private func timedIntervalSeconds(for displayConfig: DisplaySchedulerConfig) -> TimeInterval? {
+        guard displayConfig.isEnabled, !displayConfig.isOnUnlockMode else { return nil }
+        if displayConfig.isOnEndMode {
+            return displayConfig.webSceneSwitchSeconds.map(TimeInterval.init)
         }
-        return intervals.min() ?? 0
+        guard displayConfig.intervalMinutes > 0 else { return nil }
+        return TimeInterval(displayConfig.intervalMinutes * 60)
     }
 
-    private func scheduleNextChange() {
+    /// Earliest wall-clock time this state key is eligible for a timed switch.
+    private func dueDate(
+        forStateKey stateKey: String,
+        interval: TimeInterval,
+        now: Date
+    ) -> Date {
+        let base: Date
+        if let last = lastChangeTimes[stateKey] {
+            base = last.addingTimeInterval(interval - intervalEligibilitySlack)
+        } else {
+            // No prior change: allow immediately (first enable / fresh screen).
+            base = now
+        }
+        if let retryAfter = failedApplyRetryAfter[stateKey], retryAfter > base {
+            return retryAfter
+        }
+        return base
+    }
+
+    /// Next one-shot fire: earliest due time among timed displays, or a short
+    /// deferred poll when apply is blocked. nil = event-driven only (no timer).
+    private func nextTimerFireDate(from now: Date) -> Date? {
+        if WallpaperEngineXBridge.shared.isSettingWallpaper
+            || timedRotationTask != nil
+            || globalRotationTask != nil {
+            return now.addingTimeInterval(deferredRetryDelay)
+        }
+
+        var earliest: Date?
+
+        func consider(_ date: Date) {
+            if earliest == nil || date < earliest! {
+                earliest = date
+            }
+        }
+
+        if config.isGlobalDisplaySyncEnabled {
+            let global = config.globalDisplayConfig
+            guard let interval = timedIntervalSeconds(for: global) else { return nil }
+            if global.isOnEndMode, VideoWallpaperManager.shared.isVideoWallpaperActive {
+                // Pure video on-end: web/scene timer only applies when no native video.
+                // Keep a light poll so we notice when video stops.
+                consider(now.addingTimeInterval(deferredRetryDelay))
+                return earliest
+            }
+            consider(dueDate(forStateKey: globalSchedulerStateKey, interval: interval, now: now))
+            return earliest
+        }
+
+        var hasTimedDisplay = false
+        for screen in NSScreen.screens {
+            let screenID = screen.wallpaperScreenIdentifier
+            let displayConfig = resolvedDisplayConfig(for: screen)
+            guard let interval = timedIntervalSeconds(for: displayConfig) else { continue }
+            hasTimedDisplay = true
+            if displayConfig.isOnEndMode,
+               VideoWallpaperManager.shared.hasActiveWallpaper(on: screen) {
+                consider(now.addingTimeInterval(deferredRetryDelay))
+                continue
+            }
+            consider(dueDate(forStateKey: screenID, interval: interval, now: now))
+        }
+        return hasTimedDisplay ? earliest : nil
+    }
+
+    private func cancelDispatchTimer() {
         dispatchTimer?.cancel()
         dispatchTimer = nil
+    }
 
-        let interval = effectiveCheckInterval()
-        // interval 为 0 表示所有启用的显示器都使用事件触发模式，不需要定时器
-        guard interval > 0 else {
+    private func beginSchedulerActivityIfNeeded() {
+        guard schedulerActivity == nil else { return }
+        // Resist App Nap so 1-minute deadlines stay accurate; still allow idle sleep.
+        schedulerActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Wallpaper auto-switch timer"
+        )
+    }
+
+    private func endSchedulerActivity() {
+        if let activity = schedulerActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            schedulerActivity = nil
+        }
+    }
+
+    /// Arm a one-shot timer for the next due switch (not a fixed repeating period).
+    /// - Parameter earliestDelay: Optional floor on delay (e.g. empty-library poll backoff).
+    private func scheduleNextChange(earliestDelay: TimeInterval = 0) {
+        cancelDispatchTimer()
+        guard isRunning, !isScreenLocked else {
+            endSchedulerActivity()
+            return
+        }
+
+        let now = Date()
+        guard let nextFire = nextTimerFireDate(from: now) else {
+            endSchedulerActivity()
             print("\(logTag) All enabled displays use event-driven modes, no timer needed")
             return
         }
 
+        beginSchedulerActivityIfNeeded()
+        let delay = max(nextFire.timeIntervalSince(now), minimumTimerDelay, earliestDelay)
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .seconds(1))
+        // One-shot: recompute after each fire so interval tracks last successful apply.
+        timer.schedule(deadline: .now() + delay, repeating: .never, leeway: scheduleLeeway)
         timer.setEventHandler { [weak self] in
-            self?.changeWallpaperIfNeeded()
+            self?.handleTimerFired()
         }
         timer.activate()
         dispatchTimer = timer
+        print("\(logTag) Next check in \(String(format: "%.1f", delay))s")
     }
 
-    private func changeWallpaperIfNeeded() {
-        guard !isScreenLocked else { return }
+    private func handleTimerFired() {
+        dispatchTimer = nil
+        let startedWork = changeWallpaperIfNeeded()
+        // If a batch started, it reschedules when finished; otherwise re-arm now.
+        if isRunning, !startedWork, timedRotationTask == nil, globalRotationTask == nil {
+            // Due but nothing applied (empty library / blocked path): avoid a 0.25s spin.
+            if let next = nextTimerFireDate(from: Date()), next.timeIntervalSinceNow <= minimumTimerDelay {
+                scheduleNextChange(earliestDelay: deferredRetryDelay)
+            } else {
+                scheduleNextChange()
+            }
+        }
+    }
+
+    /// - Returns: true if a timed apply batch was started (caller must not re-arm;
+    ///   the batch re-arms on completion).
+    @discardableResult
+    private func changeWallpaperIfNeeded() -> Bool {
+        if isScreenLocked {
+            clearStuckScreenLockIfNeeded(source: "timer")
+        }
+        guard !isScreenLocked else { return false }
         guard !WallpaperEngineXBridge.shared.isSettingWallpaper else {
             print("\(logTag) Skipping: manual wallpaper setting in progress")
-            return
+            return false
+        }
+        if config.isGlobalDisplaySyncEnabled {
+            return changeGlobalWallpaperIfNeeded()
         }
         let screens = NSScreen.screens
         let now = Date()
@@ -735,46 +1559,38 @@ class WallpaperSchedulerService: ObservableObject {
 
         for screen in screens {
             let screenID = screen.wallpaperScreenIdentifier
-            let displayConfig = config.resolvedDisplayConfig(for: screenID)
+            let displayConfig = resolvedDisplayConfig(for: screen)
             guard displayConfig.isEnabled else { continue }
             guard !displayConfig.isOnUnlockMode else { continue }
+            guard let interval = timedIntervalSeconds(for: displayConfig) else { continue }
 
-            // "播完即换"模式的屏幕：设置了 webSceneSwitchSeconds 时由定时器调度（仅 Web/Scene 壁纸）
-            // 视频壁纸仍由播放完成通知触发，不走定时器
+            // "播完即换"模式设置了秒级兜底时，Web/Scene/静态图都由定时器继续轮换。
+            // 本机视频仍必须等播放完成通知，不能被秒级定时器中途切走。
             if displayConfig.isOnEndMode {
-                guard let wsSec = displayConfig.webSceneSwitchSeconds,
-                      WallpaperEngineXBridge.shared.isManaging(screen: screen) else { continue }
-                let items = getSchedulableItems(for: displayConfig)
-                if items.isEmpty {
-                    print("\(logTag) Screen \(screenID): no schedulable items for on-end mode with webSceneSwitchSeconds")
+                guard !VideoWallpaperManager.shared.hasActiveWallpaper(on: screen) else {
                     continue
                 }
-                let interval = TimeInterval(wsSec)
-                if let lastChange = lastChangeTimes[screenID],
-                   now.timeIntervalSince(lastChange) < interval - 0.5 {
-                    continue
-                }
-                guard let item = selectNextItem(from: items, lastID: lastChangedItemIDs[screenID], screenID: screenID, order: displayConfig.order) else {
-                    print("\(logTag) Screen \(screenID): item selection returned nil for on-end mode with webSceneSwitchSeconds")
-                    continue
-                }
-                pending.append((screenID, item, screen))
+            }
+
+            if dueDate(forStateKey: screenID, interval: interval, now: now) > now {
                 continue
             }
 
             let items = getSchedulableItems(for: displayConfig)
             if items.isEmpty {
-                print("\(logTag) Screen \(screenID): no schedulable items (wallpapers=\(displayConfig.includeWallpapers), media=\(displayConfig.includeMedia))")
+                let context = displayConfig.isOnEndMode
+                    ? "on-end mode with webSceneSwitchSeconds"
+                    : "wallpapers=\(displayConfig.includeWallpapers), media=\(displayConfig.includeMedia)"
+                print("\(logTag) Screen \(screenID): no schedulable items (\(context))")
                 continue
             }
 
-            let interval = TimeInterval(displayConfig.intervalMinutes * 60)
-            if let lastChange = lastChangeTimes[screenID],
-               now.timeIntervalSince(lastChange) < interval - 0.5 {
-                continue
-            }
-
-            guard let item = selectNextItem(from: items, lastID: lastChangedItemIDs[screenID], screenID: screenID, order: displayConfig.order) else {
+            guard let item = selectNextItem(
+                from: items,
+                lastID: lastChangedItemIDs[screenID],
+                screenID: screenID,
+                order: displayConfig.order
+            ) else {
                 print("\(logTag) Screen \(screenID): item selection returned nil")
                 continue
             }
@@ -782,34 +1598,61 @@ class WallpaperSchedulerService: ObservableObject {
             pending.append((screenID, item, screen))
         }
 
-        guard !pending.isEmpty else { return }
+        guard !pending.isEmpty else { return false }
+        guard timedRotationTask == nil else {
+            print("\(logTag) Timed rotation already in flight; coalescing tick")
+            return true
+        }
 
-        Task { @MainActor in
+        let generation = timedRotationGeneration
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.timedRotationGeneration == generation {
+                    self.timedRotationTask = nil
+                    if self.isRunning {
+                        self.scheduleNextChange()
+                    }
+                }
+            }
+
             for (index, change) in pending.enumerated() {
-                await self.waitBeforeApplyingBatchedWallpaper(index: index)
+                guard self.timedRotationGeneration == generation,
+                      await self.waitBeforeApplyingBatchedWallpaper(index: index) else {
+                    return
+                }
                 let (screenID, item, _) = change
-                let bakeStatus: String
-                if item.bakedVideoPath != nil { bakeStatus = "mp4" }
-                else { bakeStatus = "none" }
+                let bakeStatus = item.bakedVideoPath != nil ? "mp4" : "none"
                 print("\(logTag) Applying '\(item.title)' to screen \(screenID) [bake=\(bakeStatus)]")
 
                 let success = await applyItem(item, toScreenID: screenID)
+                guard self.timedRotationGeneration == generation else { return }
                 if success {
-                    self.lastChangeTimes[screenID] = now
+                    self.failedApplyRetryAfter.removeValue(forKey: screenID)
+                    self.lastChangeTimes[screenID] = Date()
                     self.lastChangedItemIDs[screenID] = item.id
                     self.persistSchedulerState()
                     print("\(logTag) Successfully applied '\(item.title)' to screen \(screenID)")
                 } else {
-                    print("\(logTag) Failed to apply '\(item.title)' to screen \(screenID), will retry next cycle")
+                    self.failedApplyRetryAfter[screenID] = Date().addingTimeInterval(self.failedApplyRetryDelay)
+                    print("\(logTag) Failed to apply '\(item.title)' to screen \(screenID), retry in \(Int(self.failedApplyRetryDelay))s")
                 }
             }
         }
+        timedRotationTask = task
+        return true
     }
 
     private func changeUnlockWallpapersIfNeeded() {
         guard !isScreenLocked else { return }
         guard !WallpaperEngineXBridge.shared.isSettingWallpaper else {
             print("\(logTag) Skipping unlock switch: manual wallpaper setting in progress")
+            return
+        }
+        if config.isGlobalDisplaySyncEnabled {
+            let global = config.globalDisplayConfig
+            guard global.isEnabled, global.isOnUnlockMode else { return }
+            applyNextGlobalWallpaper(requiredMode: nil)
             return
         }
 
@@ -825,7 +1668,7 @@ class WallpaperSchedulerService: ObservableObject {
 
         for screen in NSScreen.screens {
             let screenID = screen.wallpaperScreenIdentifier
-            let displayConfig = config.resolvedDisplayConfig(for: screenID)
+            let displayConfig = resolvedDisplayConfig(for: screen)
             guard displayConfig.isEnabled && displayConfig.isOnUnlockMode else { continue }
 
             let items = getSchedulableItems(for: displayConfig, screenID: screenID)
@@ -847,7 +1690,9 @@ class WallpaperSchedulerService: ObservableObject {
 
         Task { @MainActor in
             for (index, change) in pending.enumerated() {
-                await self.waitBeforeApplyingBatchedWallpaper(index: index)
+                guard await self.waitBeforeApplyingBatchedWallpaper(index: index) else {
+                    return
+                }
                 let (screenID, item) = change
                 print("\(logTag) Unlock applying '\(item.title)' to screen \(screenID)")
 
@@ -866,208 +1711,123 @@ class WallpaperSchedulerService: ObservableObject {
 
     // MARK: - Item Application
 
-    private func waitBeforeApplyingBatchedWallpaper(index: Int) async {
-        guard index > 0 else { return }
+    private func waitBeforeApplyingBatchedWallpaper(index: Int) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        guard index > 0 else { return true }
         let delayNanoseconds = UInt64(index) * 1_200_000_000
-        try? await Task.sleep(nanoseconds: delayNanoseconds)
+        do {
+            try await Task.sleep(nanoseconds: delayNanoseconds)
+        } catch {
+            return false
+        }
+        return !Task.isCancelled
     }
 
+    private func cancelTimedRotation() {
+        timedRotationGeneration &+= 1
+        timedRotationTask?.cancel()
+        timedRotationTask = nil
+    }
+
+    /// 调度只选片 + 触发；真正设壁纸与详情页共用 `LocalWallpaperApplyService`。
     private func applyItem(_ item: SchedulableItem, toScreenID screenID: String) async -> Bool {
         guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else {
             return false
         }
 
-        let displayConfig = config.resolvedDisplayConfig(for: screenID)
-        let isOnEndMode = displayConfig.isOnEndMode
-        // Web/Scene 壁纸在播完即换模式下是否启用了定时切换
-        let webSceneSwitchEnabled = isOnEndMode && displayConfig.webSceneSwitchSeconds != nil
+        let displayConfig = resolvedDisplayConfig(for: screen)
+        // 播完即换且未开 web/scene 定时：只能切可接播放完成通知的视频类
+        let requirePlaybackEndSupport = displayConfig.isOnEndMode
+            && displayConfig.webSceneSwitchSeconds == nil
 
-        let fileURL = item.fileURL
-        let ext = fileURL.pathExtension.lowercased()
-        let isDirectory = (try? FileManager.default
-            .attributesOfItem(atPath: fileURL.path)[.type] as? FileAttributeType) == .typeDirectory
+        // 自动切换常在 App 未激活时发生；短暂拉起 userInitiated activity，
+        // 避免 App Nap 挂起桌面层 CA / AVPlayer 首帧提交（表现为要点一下才更新）。
+        let applyActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Wallpaper auto-switch apply"
+        )
+        defer { ProcessInfo.processInfo.endActivity(applyActivity) }
 
         do {
-            // 优先使用烘焙 MP4 产物（WE Scene 离线烘焙）。
-            // 实时渲染模式下需跳过：scene 壁纸的烘焙 MP4 仅供锁屏/桌面 poster，不得反向替换
-            // 桌面实时渲染（否则会变成播放固定时长 MP4 循环而非 wallpaper-wgpu 实时渲染）。
-            // on-end 模式下：如果设置了 webSceneSwitchSeconds（走定时器而非视频通知），允许实时渲染。
-            let preferRealtime = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
-                && (!isOnEndMode || webSceneSwitchEnabled)
-            if let bakedPath = item.bakedVideoPath,
-               !preferRealtime,
-               SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: bakedPath)) {
-                print("\(logTag) Using baked video: \(bakedPath)")
-                let bakedURL = URL(fileURLWithPath: bakedPath)
-                let posterURL: URL?
-                if let itemID = item.sceneBakeItemID {
-                    posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
-                        forLocalVideo: bakedURL,
-                        itemID: itemID
-                    )
-                } else {
-                    posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(
-                        forLocalVideo: bakedURL,
-                        fallbackPosterURL: nil
-                    )
-                }
-                try VideoWallpaperManager.shared.applyVideoWallpaper(
-                    from: bakedURL,
-                    posterURL: posterURL,
+            print("\(logTag) applyItem via LocalWallpaperApplyService '\(item.title)' → \(screen.localizedName)")
+            let ok = try await LocalWallpaperApplyService.apply(
+                localURL: item.fileURL,
+                targetScreens: [screen],
+                options: LocalWallpaperApplyService.Options(
+                    animatedTransition: true,
+                    requirePlaybackEndSupport: requirePlaybackEndSupport,
                     muted: true,
-                    targetScreen: screen,
-                    animatedTransition: true
+                    fallbackPosterURL: nil,
+                    // 无预生成 HD poster 时后台抽帧补系统静帧（不阻塞切换）
+                    generatePosterFromVideoIfNeeded: true,
+                    sceneBakeItemID: item.sceneBakeItemID,
+                    bakedVideoPath: item.bakedVideoPath,
+                    reason: "scheduler"
                 )
-                if let posterURL = posterURL {
-                    DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
-                }
-            } else if isDirectory || ext == "pkg" {
-                // 2. Workshop 目录 → 根据 project.json 类型分发
-                let resolvedRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: fileURL)
-                let projectJSONPath = resolvedRoot.appendingPathComponent("project.json")
-
-                if FileManager.default.fileExists(atPath: projectJSONPath.path),
-                   let projectData = try? Data(contentsOf: projectJSONPath),
-                   let projectJSON = try? JSONSerialization.jsonObject(with: projectData) as? [String: Any] {
-
-                    // Preset 类型（图片轮播）：project.json 含 "preset" 字段且无 "type" 字段
-                    if projectJSON["type"] == nil,
-                       let presetDict = projectJSON["preset"] as? [String: Any],
-                       let customDir = presetDict["customdirectory"] as? String {
-                        // "播完即换"模式下跳过图片轮播（不支持播放完成通知）
-                        // 但如果设置了 webSceneSwitchSeconds，则允许图片轮播
-                        if isOnEndMode && !webSceneSwitchEnabled {
-                            print("\(logTag) Skipping preset slideshow in on-end mode")
-                            return false
-                        }
-                        let imagesDir = resolvedRoot.appendingPathComponent(customDir)
-                        let images = enumerateImages(in: imagesDir)
-                        if !images.isEmpty {
-                            // 根据 preset 配置生成 HTML 轮播页面
-                            // imageswitchtimes 是倍率（1=默认），使用 5 秒基础间隔
-                            let multiplier = presetDict["imageswitchtimes"] as? Int ?? 1
-                            let switchTime = max(multiplier * 5, 3)
-                            let transitionMode = presetDict["TransitionMode"] as? Int ?? 1
-                            generatePresetHTML(
-                                images: images, imagesDir: imagesDir,
-                                switchTime: switchTime, transitionMode: transitionMode,
-                                outputDir: resolvedRoot
-                            )
-                            print("\(logTag) Generated preset HTML slideshow: \(images.count) images, interval=\(switchTime)s")
-                            // 通过 CLI web 渲染器渲染
-                            try await WallpaperEngineXBridge.shared.setWallpaper(
-                                path: resolvedRoot.path,
-                                targetScreens: [screen]
-                            )
-                            // 注：CLI 壁纸由 daemon 自身管理桌面 capture，不注册到 DesktopWallpaperSyncManager
-                            return true
-                        }
-                    }
-
-                    let typeString = projectJSON["type"] as? String
-                    let type = typeString?.lowercased() ?? ""
-
-                    if type == "video" {
-                        // Video 类型：提取实际视频文件路径，用 VideoWallpaperManager 播放
-                        if let videoURL = findVideoFileInProject(projectJSON: projectJSON, root: resolvedRoot) {
-                            print("\(logTag) Using video from WE project: \(videoURL.lastPathComponent)")
-                            let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(
-                                forLocalVideo: videoURL,
-                                fallbackPosterURL: nil
-                            )
-                            try VideoWallpaperManager.shared.applyVideoWallpaper(
-                                from: videoURL,
-                                posterURL: posterURL,
-                                muted: true,
-                                targetScreen: screen,
-                                animatedTransition: true
-                            )
-                            if let posterURL = posterURL {
-                                DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
-                            }
-                        } else {
-                            print("\(logTag) Video type but no video file found in project, falling back to CLI")
-                            // "播完即换"模式下不能用 CLI 壁纸
-                            // 但如果设置了 webSceneSwitchSeconds，则允许 CLI fallback
-                            if isOnEndMode && !webSceneSwitchEnabled {
-                                print("\(logTag) Skipping CLI fallback in on-end mode")
-                                return false
-                            }
-                            try await WallpaperEngineXBridge.shared.setWallpaper(
-                                path: resolvedRoot.path,
-                                targetScreens: [screen]
-                            )
-                            // 注：CLI 壁纸由 daemon 自身管理桌面 capture，不注册到 DesktopWallpaperSyncManager
-                        }
-                    } else {
-                        // Scene/Web 类型：通过 CLI 渲染
-                        // "播完即换"模式下不能用 CLI 壁纸（无播放完成通知），跳过
-                        // 但如果设置了 webSceneSwitchSeconds，则允许通过 CLI 渲染
-                        if isOnEndMode && !webSceneSwitchEnabled {
-                            print("\(logTag) Skipping \(type) wallpaper '\(item.title)' in on-end mode (CLI renderer not supported)")
-                            return false
-                        }
-                        print("\(logTag) Using CLI renderer for WE \(type): \(resolvedRoot.path)")
-                        let isRealtime = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
-                        let userProps = isRealtime
-                            ? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: resolvedRoot.path)
-                            : nil
-                        try await WallpaperEngineXBridge.shared.setWallpaper(
-                            path: resolvedRoot.path,
-                            targetScreens: [screen],
-                            userProperties: userProps
-                        )
-                        // 实时渲染模式下，后台生成离线 MP4；完成后若动态锁屏开启，则推送到当前屏幕实例。
-                        if isRealtime {
-                            SceneOfflineBakeService.scheduleRealtimeCompanionBake(
-                                path: resolvedRoot.path,
-                                targetScreens: [screen],
-                                reason: "scheduler"
-                            )
-                        }
-                        // 注：CLI 壁纸由 daemon 自身管理桌面 capture，不注册到 DesktopWallpaperSyncManager
-                    }
-                } else {
-                    // 无 project.json 的静态图目录
-                    if isOnEndMode && !webSceneSwitchEnabled {
-                        print("\(logTag) Skipping static image directory '\(item.title)' in on-end mode")
-                        return false
-                    }
-                    print("\(logTag) Using static image from directory: \(fileURL.path)")
-                    let vm = WallpaperViewModel()
-                    try await vm.setWallpaper(from: fileURL, option: .desktop, for: screen)
-                }
-            } else if videoExtensions.contains(ext) {
-                // 3. 视频文件 → VideoWallpaperManager
-                print("\(logTag) Using video wallpaper: \(fileURL.lastPathComponent)")
-                let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(
-                    forLocalVideo: fileURL,
-                    fallbackPosterURL: nil
-                )
-                try VideoWallpaperManager.shared.applyVideoWallpaper(
-                    from: fileURL,
-                    posterURL: posterURL,
-                    muted: true,
-                    targetScreen: screen,
-                    animatedTransition: true
-                )
-                if let posterURL = posterURL {
-                    DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
-                }
-            } else {
-                // 4. 静态图 → WallpaperViewModel
-                if isOnEndMode && !webSceneSwitchEnabled {
-                    print("\(logTag) Skipping static image '\(item.title)' in on-end mode")
-                    return false
-                }
-                print("\(logTag) Using static image: \(fileURL.lastPathComponent)")
-                let vm = WallpaperViewModel()
-                try await vm.setWallpaper(from: fileURL, option: .desktop, for: screen)
-            }
-            // com.apple.desktop 通知已由 setDesktopImageURLForAllSpaces 内部发送，无需重复触发
-            return true
+            )
+            return ok
         } catch {
-            print("\(logTag) applyItem failed for '\(item.title)' (\(fileURL.lastPathComponent)): \(error)")
+            print("\(logTag) applyItem failed for '\(item.title)' (\(item.fileURL.lastPathComponent)): \(error)")
+            return false
+        }
+    }
+
+    /// - Returns: true if a global apply task was started or is already in flight.
+    @discardableResult
+    private func changeGlobalWallpaperIfNeeded() -> Bool {
+        let global = config.globalDisplayConfig
+        guard global.isEnabled, !global.isOnUnlockMode else { return false }
+        guard let interval = timedIntervalSeconds(for: global) else { return false }
+        let now = Date()
+
+        if global.isOnEndMode {
+            // Web/Scene 秒级兜底：仅在没有本机视频时由定时器推进。
+            guard !VideoWallpaperManager.shared.isVideoWallpaperActive else { return false }
+        }
+
+        if dueDate(forStateKey: globalSchedulerStateKey, interval: interval, now: now) > now {
+            return false
+        }
+
+        if globalRotationTask != nil {
+            print("\(logTag) Global rotation already in flight; coalescing tick")
+            return true
+        }
+
+        applyNextGlobalWallpaper(requiredMode: global.isOnEndMode ? .onEnd : nil)
+        return globalRotationTask != nil
+    }
+
+    private func applyItemGlobally(_ item: SchedulableItem, to screens: [NSScreen]) async -> Bool {
+        let displayConfig = config.globalDisplayConfig
+        let requirePlaybackEndSupport = displayConfig.isOnEndMode
+            && displayConfig.webSceneSwitchSeconds == nil
+
+        let applyActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Wallpaper global auto-switch apply"
+        )
+        defer { ProcessInfo.processInfo.endActivity(applyActivity) }
+
+        do {
+            return try await LocalWallpaperApplyService.apply(
+                localURL: item.fileURL,
+                targetScreens: screens,
+                options: LocalWallpaperApplyService.Options(
+                    animatedTransition: true,
+                    requirePlaybackEndSupport: requirePlaybackEndSupport,
+                    muted: true,
+                    fallbackPosterURL: nil,
+                    // 无预生成 HD poster 时后台抽帧补系统静帧（不阻塞切换）
+                    generatePosterFromVideoIfNeeded: true,
+                    sceneBakeItemID: item.sceneBakeItemID,
+                    bakedVideoPath: item.bakedVideoPath,
+                    usesSharedVideoDecoder: screens.count > 1,
+                    reason: "globalScheduler"
+                )
+            )
+        } catch {
+            print("\(logTag) Global apply failed for '\(item.title)': \(error.localizedDescription)")
             return false
         }
     }
@@ -1089,14 +1849,44 @@ class WallpaperSchedulerService: ObservableObject {
         }
 
         // 2. 递归查找目录中的视频文件
-        if let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: nil) {
-            for case let fileURL as URL in enumerator {
-                if videoExts.contains(fileURL.pathExtension.lowercased()) {
-                    return fileURL
-                }
+        return findFirstVideoFile(in: root, extensions: videoExts)
+    }
+
+    /// 在目录树中找第一个可播视频（用于 project.json 解析失败时的兜底）。
+    private func findFirstVideoFile(
+        in root: URL,
+        extensions: Set<String> = ["mp4", "mov", "webm", "m4v"]
+    ) -> URL? {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: nil) else {
+            return nil
+        }
+        for case let fileURL as URL in enumerator {
+            if extensions.contains(fileURL.pathExtension.lowercased()),
+               fm.fileExists(atPath: fileURL.path) {
+                return fileURL
             }
         }
         return nil
+    }
+
+    /// Validates a Workshop directory before it enters an event-driven rotation.
+    /// Scene and web projects have no AVPlayer completion event, so selecting either
+    /// after a video ends would leave the finished player paused without a successor.
+    private func workshopDirectoryContainsPlayableVideo(
+        at directory: URL,
+        allowedExtensions: Set<String>
+    ) -> Bool {
+        let root = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: directory)
+        let projectURL = root.appendingPathComponent("project.json")
+        guard let data = try? Data(contentsOf: projectURL),
+              let project = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (project["type"] as? String)?.lowercased() == "video",
+              let videoURL = findVideoFileInProject(projectJSON: project, root: root) else {
+            return false
+        }
+
+        return allowedExtensions.contains(videoURL.pathExtension.lowercased())
     }
 
     private let videoExtensions: Set<String> = ["mp4", "mov", "webm", "mkv", "avi", "m4v", "flv"]
@@ -1305,12 +2095,20 @@ class WallpaperSchedulerService: ObservableObject {
                 // 不得反向替换桌面实时渲染——否则轮播第二次起会变成播放固定时长的
                 // 烘焙视频而非 wallpaper-wgpu 实时渲染。
                 // on-end 模式下：如果设置了 webSceneSwitchSeconds（走定时器），允许实时渲染。
-                let isRealtimeRenderingEnabled = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
+                let isRealtimeRenderingEnabled = UserDefaults.standard.object(forKey: "scene_realtime_rendering_enabled") as? Bool ?? true
                 let preferRealtimeForScene = isRealtimeRenderingEnabled && (!onEndMode || webSceneSwitchEnabled)
                 var bakedVideoPath: String? = nil
                 var sceneBakeItemID: String? = nil
-                if isWorkshop, !preferRealtimeForScene, let art = record.sceneBakeArtifact {
-                    if SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) {
+                if isWorkshop,
+                   let art = SceneOfflineBakeService.usableArtifact(from: record) {
+                    // Scene and web share the same rule: realtime mode keeps live
+                    // rendering; baked MP4 is only used when realtime is off (or
+                    // on-end without web/scene timer where live cannot participate).
+                    let isWebBake = art.renderer == .wallpaperEngineWeb
+                    let preferRealtime = isWebBake
+                        ? (isRealtimeRenderingEnabled && (!onEndMode || webSceneSwitchEnabled))
+                        : preferRealtimeForScene
+                    if !preferRealtime {
                         bakedVideoPath = art.videoPath
                         sceneBakeItemID = record.item.id
                     }
@@ -1324,16 +2122,19 @@ class WallpaperSchedulerService: ObservableObject {
 
                 // "播完即换"模式下只保留可通过 VideoWallpaperManager 播放的视频项：
                 // 1. 有 bakedVideoPath 的烘焙 mp4 项
-                // 2. 直接是 mp4/m4v 视频文件的非 Workshop 项
-                // 3. Workshop 目录项（包含可提取的视频文件，由 applyItem 运行时判断）
+                // 2. 直接的视频文件
+                // 3. 声明为 video 类型且包含可播放视频的 Workshop 目录
                 // 如果设置了 webSceneSwitchSeconds，则放宽限制，允许所有 Workshop 项
                 if onEndMode && !webSceneSwitchEnabled {
                     if bakedVideoPath != nil {
                         // 有烘焙视频产物，可播放
-                    } else if !isWorkshop && isAllowedExt && !isDirectory {
-                        // 本地 mp4/m4v 视频文件，可播放
-                    } else if isWorkshop && isDirectory {
-                        // Workshop 目录项，由 applyItem 在运行时根据 project.json 类型分发
+                    } else if isAllowedExt && !isDirectory {
+                        // 可由 AVFoundation 直接播放的视频文件
+                    } else if isWorkshop && isDirectory && workshopDirectoryContainsPlayableVideo(
+                        at: url,
+                        allowedExtensions: allowedMediaExts
+                    ) {
+                        // 候选阶段已验证，避免结束后选到 scene/web 再黑屏。
                     } else {
                         continue
                     }

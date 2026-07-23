@@ -70,7 +70,12 @@ class AnimePlayerWindowController: NSWindowController {
     private func setupEventMonitors() {
         // 键盘事件监听
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, event.window?.isKeyWindow == true else { return event }
+            guard let self,
+                  let playerWindow = self.window,
+                  event.window === playerWindow,
+                  playerWindow.isKeyWindow else {
+                return event
+            }
             
             switch event.keyCode {
             case 49: // 空格键
@@ -105,7 +110,12 @@ class AnimePlayerWindowController: NSWindowController {
         
         // 鼠标移动监听（用于控制栏显隐）
         mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .mouseEntered, .leftMouseDragged]) { [weak self] event in
-            guard let self, event.window?.isKeyWindow == true else { return event }
+            guard let self,
+                  let playerWindow = self.window,
+                  event.window === playerWindow,
+                  playerWindow.isKeyWindow else {
+                return event
+            }
             self.showControlBar()
             return event
         }

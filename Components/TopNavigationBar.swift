@@ -149,6 +149,52 @@ struct CustomWindowControls: View {
             )
         }
     }
+
+    /// 主窗口红绿灯（关闭=隐藏主窗口，黄=最小化，绿=全屏）
+    static func mainWindow() -> CustomWindowControls {
+        CustomWindowControls(
+            onClose: {
+                (NSApp.delegate as? AppDelegate)?.hideMainWindow()
+            },
+            onMinimize: {
+                NSApp.mainWindow?.miniaturize(nil)
+            },
+            onMaximize: {
+                NSApp.mainWindow?.toggleFullScreen(nil)
+            }
+        )
+    }
+}
+
+// MARK: - 详情页顶部栏布局
+/// 红绿灯独占窗口标题栏一行；返回/右侧工具在其下方，避免并排。
+enum DetailSheetTopBarLayout {
+    static let windowControlsTop: CGFloat = 12
+    static let windowControlsLeading: CGFloat = 12
+    static let windowControlsHeight: CGFloat = 34
+    /// 红绿灯行底边 + 与主顶栏 bottom 10 对齐的间距
+    static let actionRowTop: CGFloat = windowControlsTop + windowControlsHeight + 10 // 56
+    static let actionRowLeading: CGFloat = 28
+    static let actionRowTrailing: CGFloat = 20
+    /// Hero 内容相对窗口顶部的预留（动作行 + 按钮高度余量）
+    static let heroContentTop: CGFloat = actionRowTop + 44 // 100
+}
+
+// MARK: - 详情页顶部红绿灯
+/// 贴在窗口标题栏区域；返回按钮等动作控件使用 `DetailSheetTopBarLayout.actionRowTop` 另起一行。
+struct DetailSheetWindowControls: View {
+    var body: some View {
+        CustomWindowControls.mainWindow()
+            .frame(
+                width: 80,
+                height: DetailSheetTopBarLayout.windowControlsHeight,
+                alignment: .center
+            )
+            .padding(.top, DetailSheetTopBarLayout.windowControlsTop)
+            .padding(.leading, DetailSheetTopBarLayout.windowControlsLeading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .allowsHitTesting(true)
+    }
 }
 
 struct WindowControlButton: View {
@@ -285,9 +331,11 @@ struct HelpPopoverView: View {
                             t("tutorial.network.l1"),
                             t("tutorial.network.l2"),
                             t("tutorial.network.l3"),
-                            t("tutorial.network.l4"),
                             t("tutorial.network.l5"),
-                            t("tutorial.network.l6")
+                            t("tutorial.network.l6"),
+                            t("tutorial.network.l7"),
+                            t("tutorial.network.l8"),
+                            t("tutorial.network.l9")
                         ]
                     )
 
@@ -308,7 +356,12 @@ struct HelpPopoverView: View {
                         title: t("tutorial.settings.title"),
                         lines: [
                             t("tutorial.settings.l1"),
-                            t("tutorial.settings.l2")
+                            t("tutorial.settings.l2"),
+                            t("tutorial.settings.l3"),
+                            t("tutorial.settings.l4"),
+                            t("tutorial.settings.l5"),
+                            t("tutorial.settings.l6"),
+                            t("tutorial.settings.l7")
                         ]
                     )
 
@@ -351,7 +404,8 @@ struct HelpPopoverView: View {
                             t("tutorial.sceneWeb.l2"),
                             t("tutorial.sceneWeb.l3"),
                             t("tutorial.sceneWeb.l4"),
-                            t("tutorial.sceneWeb.l5")
+                            t("tutorial.sceneWeb.l5"),
+                            t("tutorial.sceneWeb.l6")
                         ]
                     )
 

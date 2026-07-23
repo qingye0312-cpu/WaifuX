@@ -23,6 +23,11 @@ struct FolderStackView: View {
     private var stackContent: some View {
         ZStack {
             let count = min(imageURLs.count, 4)
+            // ⚡ 降采样目标尺寸：避免全分辨率解码小缩略图（文件夹卡片约 260x160 pt）
+            let targetPixelSize = CGSize(
+                width: max(1, size.width * 0.75 * 2),
+                height: max(1, size.height * 0.68 * 2)
+            )
 
             // 从后往前画：数组[0]是最新/最重要的，应该在最上面
             ForEach(0..<count, id: \.self) { index in
@@ -30,6 +35,7 @@ struct FolderStackView: View {
                 let cfg = config(for: index)
 
                 KFImage(url)
+                    .setProcessor(DownsamplingImageProcessor(size: targetPixelSize))
                     .resizable()
                     .aspectRatio(contentMode: .fill)
                     .frame(width: size.width * 0.75, height: size.height * 0.68)
@@ -73,6 +79,8 @@ struct LibraryFolderCard: View {
     let onRename: () -> Void
     let onToggleLock: (() -> Void)?
     let onRelock: (() -> Void)?
+    let onOptimizeVideos: (() -> Void)?
+    let onRedownloadAll: (() -> Void)?
 
     @State private var isHovered = false
     @State private var isDropTarget = false
@@ -193,6 +201,17 @@ struct LibraryFolderCard: View {
                     } else {
                         Label(t("folder.lock"), systemImage: "lock")
                     }
+                }
+            }
+            if let onOptimizeVideos {
+                Divider()
+                Button(action: onOptimizeVideos) {
+                    Label(t("videoOptimizationBatchOptimizeVideos"), systemImage: "sparkles")
+                }
+            }
+            if let onRedownloadAll {
+                Button(action: onRedownloadAll) {
+                    Label(t("folder.redownload.all.media"), systemImage: "arrow.clockwise.circle")
                 }
             }
             Button(role: .destructive, action: onDisband) {

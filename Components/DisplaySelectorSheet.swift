@@ -13,7 +13,8 @@ struct DisplaySelectorSheet: View {
     @State private var selectedScreenID: String? = nil
 
     private var screens: [NSScreen] {
-        NSScreen.screens
+        // 与设置页「显示器 N」编号一致：主屏优先、从左到右，不跟系统枚举顺序。
+        NSScreen.screensOrderedForDisplay
     }
 
     private var hasMultipleDisplays: Bool {

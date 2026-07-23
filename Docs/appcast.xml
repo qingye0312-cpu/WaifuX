@@ -6,28 +6,15 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.128</title>
-      <sparkle:version>38.0.128</sparkle:version>
-      <sparkle:shortVersionString>38.0.128</sparkle:shortVersionString>
-      <pubDate>Mon, 06 Jul 2026 13:52:34 +0800</pubDate>
+      <title>Version 38.0.137</title>
+      <sparkle:version>38.0.137</sparkle:version>
+      <sparkle:shortVersionString>38.0.137</sparkle:shortVersionString>
+      <pubDate>Tue, 21 Jul 2026 18:51:44 +0800</pubDate>
       <description><![CDATA[
-        <h3>WaifuX 38.0.128</h3>
-        <ul>
-          <li>fix: Pixiv cookie 逐条删除清理 + 状态栏菜单新增检查更新 (13b5c22)</li>
-          <li>fix: 补帧 UI 文案三语本地化 + 状态栏菜单调整 + pbxproj 清理 (#59) (057c08e)</li>
-          <li>Add dynamic wallpaper frame interpolation workflow (#58) (d06dda6)</li>
-          <li>feat: Wallpaper Engine 配置面板真实默认值 + 漫画阅读滚动模式优化 + CLI 构建体积优化 (9791f9b)</li>
-          <li>feat: 漫画阅读体验升级 + Pixiv 搜索稳定性优化 (30a5920)</li>
-          <li>云同步功能（未完成） (c40752a)</li>
-          <li>feat: 新增 Pixiv 壁纸源集成，提升内容分级与数据加载体验 (7e49132)</li>
-          <li>Restore hide notch setting (0865919)</li>
-          <li>Fix settings slider window drag (afd53f3)</li>
-          <li>feat: auto remove video letterbox bars (28eb27e)</li>
-          <li>feat: 分离 assets 嵌入与 CLI 构建流程 (ccde374)</li>
-        </ul>
+<h3>WaifuX 38.0.137</h3><ul><li><strong>feat: Apple Music 歌词集成与 Now Playing 回退链 (9aa0aee)</strong><ul><li>【Web 壁纸支持歌词显示】Monstercat 等壁纸可同步显示 Apple Music 歌词</li><li>新增 `AppleMusicLyricsService`，通过 amp-api 获取 TTML 格式歌词</li><li>Host 侧持有 developerToken + userToken（环境变量 / 运行时抓取），Web 只收推送</li><li>整首歌词就绪后推 `mediaLyrics`，当前行变化时推 `mediaLyricsLine`</li><li>支持行内进度（progress 0~1），歌词行时间线以 0.2 秒间隔平滑推进</li><li>壁纸侧 `wallpaperRegisterMediaLyricsListener` 正常回调</li><li>【Now Playing 双源回退】媒体信息获取更可靠</li><li>主源 MediaRemote（私有框架）被签名限制拒掉时，自动回退到 AppleScript</li><li>（Music.app / Spotify），无需用户手动切换</li><li>新增 DistributedNotificationCenter 监听 `com.apple.Music.playerInfo`，</li><li>切歌即时感知</li><li>连续 2 次 MediaRemote 空结果后自动降级，不丢失正在播放信息</li><li>启动时自动申请 MusicKit 授权，提升 MediaRemote 可用性</li><li>【权限与合规】新增隐私声明描述</li><li>`Info.plist` 添加 `NSAppleMusicUsageDescription`、</li><li>`NSAppleEventsUsageDescription` 用户提示文本</li><li>`WaifuX.entitlements` 添加 `com.apple.security.automation.apple-events`</li><li>以支持 Hardened Runtime 下发送 Apple Events</li><li>其他</li><li>歌词 Token 失败冷却 20 秒 / 进程内缓存，Web 永不收到 Token 字段</li><li>删除烘焙产物后正确失效文件存在性缓存，避免详情页仍显示旧视频路径</li><li>wallpaperengine-cli 同步更新，支持歌词 IPC 协议</li></ul></li><li><strong>feat: Web 壁纸 Now Playing 集成、视频优化策略统一、列表封面质量修复 (2945290)</strong><ul><li>【Web 壁纸 Now Playing 集成】Monstercat 等音频壁纸能显示正在播放了</li><li>新增 `NowPlayingService`，通过 MediaRemote 读取系统正在播放（歌名/歌手/专辑/封面/进度）</li><li>新增 `WallpaperWebMediaRelay`，将元数据推送给 wallpaperengine-cli daemon</li><li>壁纸侧 `wallpaperRegisterMediaPropertiesListener` 等 API 正常回调</li><li>暂停/恢复时自动启停中继，不浪费资源</li><li>【视频优化策略合一】不再需要分别开关循环分析和补帧</li><li>下载/设壁纸/烘焙后的自动优化入口合并为单一「自动优化视频」开关</li><li>内部按「循环分析 → 补帧」顺序执行，与手动操作路径一致</li><li>旧版双开关配置自动迁移，用户无感</li><li>新增防连点保护（`planningVideoPaths`），快速连点不会重复入队</li><li>【列表封面不再裁歪】竖屏/带黑边视频的库封面更准确</li><li>缩略图优先级从「高清 poster → 列表小图」反转为「列表小图 → poster」</li><li>避免 poster 去黑边后再经 Downsampling + scaledToFill 导致的放大裁切</li><li>新增并发限流（最多同时 2 路抽帧），外置硬盘列表浏览不再卡死</li><li>【Workshop 预览修复】部分 Scene 壁纸不再错误地没有封面</li><li>引入缓存代际号，旧版「有 .pkg 就不找视频」的负结果在策略更新后自动失效</li><li>混合工程（同时含 .pkg 和 video.mp4）现在能正确生成预览</li><li>其他</li><li>WE 桥接层暂停/恢复时同步管理媒体中继生命周期</li><li>库卡片、详情页视频优化按钮统一使用 `isPlanningOrQueued` 判断状态</li><li>wallpaperengine-cli 同步更新</li></ul></li><li>feat: 更新项目配置，提升构建兼容性和性能 (6ef5096)</li><li>feat: 优化我的库加载IO (5488719)</li><li><strong>feat: 多屏稳定顺序、视频解码器合并、壁纸链接支持短链 (41fac6b)</strong><ul><li>【多屏壁纸不串位】外接屏插拔/睡眠唤醒后调度配置精确恢复</li><li>所有 UI 层（设置页、状态栏、显示器选择弹窗、CLI 索引）统一使用主屏优先</li><li>的稳定屏幕排序，系统枚举顺序变化不再导致「显示器 2」和「显示器 3」互换</li><li>调度配置迁移升级为两轮匹配：先按序列号精确匹配，同型号屏按硬件身份分组后</li><li>1:1 有序分配，不再出现配置错挂到同型号另一块屏</li><li>【视频壁纸解码器减半】多屏播同一视频时不再每屏独立解码</li><li>自动合并同一视频的多路 AVQueuePlayer，减少 VTDecoderXPCService 进程数</li><li>「重新应用同一壁纸」时正确跳过重复解码，不会残留无用进程</li><li>桌面壁纸窗口呈现优化：App 活跃时做淡入动画，后台/未激活时瞬时提交，</li><li>解决「切换已生效但画面要点一下才更新」的陈旧 bug</li><li>【目录迁移性能提升】大库迁移不再卡死 UI</li><li>文件枚举移至后台线程，每批 4 个文件回一次进度，避免数百 GB 库的扫描卡顿</li><li>【CI/CD 更新日志统一】本地与 CI 共享同一生成脚本</li><li>新增 `generate-appcast-changelog.py`，同时输出 HTML（appcast）和 Markdown</li><li>（GitHub Release），格式一致、不再手动维护</li><li>其他</li><li>新增 WallpaperScreenIdentityTests 测试覆盖</li><li>wallpaperengine-cli 同步更新</li><li>WE 桥接层所有屏幕索引改用稳定顺序，修复截屏/截图指向错误显示器的问题</li><li>预提交钩子同步优化</li></ul></li></ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.128/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.137/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />

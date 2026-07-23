@@ -158,6 +158,7 @@ struct MyLibraryContentView: View {
 
     // MARK: - Scroll 恢复
     @StateObject private var libraryScrollRuntimeState = LibraryScrollRuntimeState()
+    @ObservedObject private var currentWallpaperService = CurrentWallpaperService.shared
     @State private var isLibraryHeaderContentVisible = true
     /// 详情页导航前保存的滚动位置（>=0 表示需要恢复）
     @State private var savedLibraryScrollOffset: CGFloat = -1
@@ -193,11 +194,18 @@ struct MyLibraryContentView: View {
     @State private var wallpaperFolderStack: [String] = []  // 面包屑栈
     @State private var mediaFolderStack: [String] = []  // 面包屑栈
 
+    // 触摸板双指右滑返回（文件夹内）
+    @State private var folderBackSwipeRegistration: UUID?
+
     // 新建文件夹
     @State private var showNewFolderSheet = false
     @State private var newFolderName = ""
     @State private var renamingFolder: LibraryFolder?
     @State private var renameFolderName = ""
+    @State private var pendingRedownloadMediaFolder: LibraryFolder?
+    @State private var showRedownloadMediaFolderConfirm = false
+    @State private var pendingRedownloadMediaItem: MediaItem?
+    @State private var showRedownloadMediaItemConfirm = false
 
     // 添加壁纸到文件夹
     @State private var showAddToFolderSheet = false
@@ -245,6 +253,9 @@ struct MyLibraryContentView: View {
         let previewURLs: [URL]
         let itemCount: Int
     }
+
+    /// 文件夹叠图后台预热任务（按 content+subTab 合并，避免快速切换时堆积）
+    @State private var folderPreviewWarmupTask: Task<Void, Never>?
 
     private enum LastLibraryPageStore {
         private static let contentTypeKey = "my_library_last_content_type_v1"
@@ -362,6 +373,7 @@ struct MyLibraryContentView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .environmentObject(CurrentWallpaperService.shared)
         .task {
             await viewModel.initialLoad()
             updateWallpaperItems()
@@ -382,6 +394,11 @@ struct MyLibraryContentView: View {
             if savedLibraryScrollOffset > 0 {
                 libraryScrollRestoreToken += 1
             }
+            // 注册触摸板双指右滑返回手势（文件夹内）。
+            registerFolderBackSwipeHandler()
+        }
+        .onDisappear {
+            unregisterFolderBackSwipeHandler()
         }
         .onReceive(animeFavoriteStore.$favorites) { _ in
             Task {
@@ -498,6 +515,33 @@ struct MyLibraryContentView: View {
         }
         .sheet(isPresented: $showAddToFolderSheet) {
             addToFolderSheetContent
+        }
+        .alert(t("folder.redownload.all.media.confirm.title"), isPresented: $showRedownloadMediaFolderConfirm) {
+            Button(t("folder.redownload.all.media"), role: .destructive) {
+                guard let folder = pendingRedownloadMediaFolder else { return }
+                redownloadAllMedia(in: folder)
+                pendingRedownloadMediaFolder = nil
+            }
+            Button(t("cancel"), role: .cancel) {
+                pendingRedownloadMediaFolder = nil
+            }
+        } message: {
+            let count = pendingRedownloadMediaFolder.map {
+                MediaLibraryService.shared.downloadedItems(inFolder: $0.id).count
+            } ?? 0
+            Text(String(format: t("folder.redownload.all.media.confirm.message"), count))
+        }
+        .alert(t("library.redownload.item.confirm.title"), isPresented: $showRedownloadMediaItemConfirm) {
+            Button(t("library.redownload.item"), role: .destructive) {
+                guard let item = pendingRedownloadMediaItem else { return }
+                redownloadMediaItem(item)
+                pendingRedownloadMediaItem = nil
+            }
+            Button(t("cancel"), role: .cancel) {
+                pendingRedownloadMediaItem = nil
+            }
+        } message: {
+            Text(t("library.redownload.item.confirm.message"))
         }
         .sheet(isPresented: $showSyncProfileSheet) {
             syncProfileSheet
@@ -635,6 +679,8 @@ struct MyLibraryContentView: View {
 
     private func handleLibraryScroll(_ offset: CGFloat) {
         libraryScrollRuntimeState.currentOffset = offset
+        // 滚动中抑制媒体卡 hover/GIF 叠加，避免滚过时反复挂载 KFAnimatedImage
+        LibraryScrollHoverGate.shared.noteScrollActivity()
 
         let hideThreshold = libraryHeaderHeight + 24
         let showThreshold = libraryHeaderHeight - 24
@@ -832,7 +878,11 @@ struct MyLibraryContentView: View {
             },
             onRelock: {
                 folderLockService.lockFolder(folder.id)
-            }
+            },
+            onOptimizeVideos: {
+                _ = VideoOptimizationQueueService.shared.enqueueLibraryFolder(folder)
+            },
+            onRedownloadAll: nil
         )
     }
 
@@ -854,8 +904,48 @@ struct MyLibraryContentView: View {
         updateWallpaperItems()
     }
 
+    // MARK: - 触摸板双指右滑返回
+
+    /// 当前是否处于某个文件夹内（壁纸或媒体）
+    private var isInAnyFolder: Bool {
+        isVisible && (currentWallpaperFolderID != nil || currentMediaFolderID != nil)
+    }
+
+    /// 注册共享滚动事件路由：详情页的优先级更高，避免返回详情时同时退出后台文件夹。
+    private func registerFolderBackSwipeHandler() {
+        guard folderBackSwipeRegistration == nil else { return }
+        folderBackSwipeRegistration = TrackpadBackSwipeRouter.shared.register(
+            priority: 10,
+            isEnabled: { self.isInAnyFolder },
+            action: {
+                if self.selectedContentType == .wallpaper {
+                    self.popWallpaperFolder()
+                } else if self.selectedContentType == .video {
+                    self.popMediaFolder()
+                }
+            }
+        )
+    }
+
+    private func unregisterFolderBackSwipeHandler() {
+        guard let folderBackSwipeRegistration else { return }
+        TrackpadBackSwipeRouter.shared.unregister(folderBackSwipeRegistration)
+        self.folderBackSwipeRegistration = nil
+    }
+
+    private var currentWallpaperFolderScope: WallpaperLibraryService.FolderMembershipScope {
+        selectedSubTab == .favorites ? .favorites : .downloads
+    }
+
+    private var currentMediaFolderScope: MediaLibraryService.FolderMembershipScope {
+        selectedSubTab == .favorites ? .favorites : .downloads
+    }
+
     private func moveWallpapersToFolder(ids: [String], folderID: String) {
+        // 空字符串不是合法文件夹 ID，统一视为根目录 nil，避免写入 "" 后变成“幽灵归属”
+        let normalizedFolderID = WallpaperLibraryService.normalizedFolderID(folderID)
         gridOrderStore.removeIDs(Set(ids), from: currentGridOrderScope)
+        let scope = currentWallpaperFolderScope
         let unifiedByID: [String: UnifiedLocalWallpaper] = Dictionary(
             uniqueKeysWithValues: viewModel.allLocalWallpapers.map { ($0.id, $0) }
         )
@@ -863,14 +953,15 @@ struct MyLibraryContentView: View {
             // 对「扫描进来但还没有 DownloadRecord」的项传 fallback，
             // 让 Service 层自动补登记，确保 folderID 写得进去。
             let fallback: (wallpaper: Wallpaper, fileURL: URL)?
-            if let unified = unifiedByID[id], unified.downloadRecord == nil {
+            if scope == .downloads, let unified = unifiedByID[id], unified.downloadRecord == nil {
                 fallback = (unified.wallpaper, unified.fileURL)
             } else {
                 fallback = nil
             }
             folderStore.moveWallpaperToFolder(
                 wallpaperID: id,
-                folderID: folderID,
+                folderID: normalizedFolderID,
+                scope: scope,
                 fallback: fallback
             )
         }
@@ -901,18 +992,23 @@ struct MyLibraryContentView: View {
         switch selectedSubTab {
         case .favorites:
             let allFavorites = viewModel.favorites
-            let folderID = currentWallpaperFolderID
+            let folderID = WallpaperLibraryService.normalizedFolderID(currentWallpaperFolderID)
             let filtered = allFavorites.filter { wallpaper in
                 guard let record = WallpaperLibraryService.shared.favoriteRecord(for: wallpaper.id) else { return false }
-                return record.folderID == folderID
+                return WallpaperLibraryService.normalizedFolderID(record.folderID) == folderID
             }
-            baseItems = filtered.map { AnyWallpaperItem(wallpaper: $0) }
+            baseItems = filtered.map {
+                AnyWallpaperItem(
+                    wallpaper: $0,
+                    localFileURL: viewModel.localFileURLIfAvailable(for: $0)
+                )
+            }
         case .downloads:
             let allLocal = viewModel.allLocalWallpapers
-            let folderID = currentWallpaperFolderID
+            let folderID = WallpaperLibraryService.normalizedFolderID(currentWallpaperFolderID)
             let filtered = allLocal.filter { unified in
                 if let record = unified.downloadRecord {
-                    return record.folderID == folderID
+                    return WallpaperLibraryService.normalizedFolderID(record.folderID) == folderID
                 }
                 // 扫描到的本地文件只在根目录显示
                 return folderID == nil
@@ -1022,10 +1118,10 @@ struct MyLibraryContentView: View {
         switch selectedSubTab {
         case .favorites:
             let allFavorites = mediaViewModel.favoriteItems
-            let folderID = currentMediaFolderID
+            let folderID = MediaLibraryService.normalizedFolderID(currentMediaFolderID)
             let filtered = allFavorites.filter { item in
                 guard let record = MediaLibraryService.shared.favoriteRecord(for: item.id) else { return false }
-                return record.folderID == folderID
+                return MediaLibraryService.normalizedFolderID(record.folderID) == folderID
             }
             baseItems = filtered.map {
                 AnyMediaItem(
@@ -1035,10 +1131,10 @@ struct MyLibraryContentView: View {
             }
         case .downloads:
             let allLocal = mediaViewModel.allLocalMedia
-            let folderID = currentMediaFolderID
+            let folderID = MediaLibraryService.normalizedFolderID(currentMediaFolderID)
             let filtered = allLocal.filter { unified in
                 if let record = unified.downloadRecord {
-                    return record.folderID == folderID
+                    return MediaLibraryService.normalizedFolderID(record.folderID) == folderID
                 }
                 // 扫描到的本地文件只在根目录显示
                 return folderID == nil
@@ -1094,7 +1190,9 @@ struct MyLibraryContentView: View {
             isEditing: isEditing,
             isSelected: selectedItems.contains(item.id),
             downloadDate: item.downloadDate,
-            cardWidth: config.cardWidth
+            cardWidth: config.cardWidth,
+            isCurrentWallpaper: currentWallpaperService.isCurrentWallpaper(localFileURL: item.localFileURL)
+                || currentWallpaperService.isCurrentWallpaper(localFileURL: item.wallpaper.fullImageURL)
         ) {
             handleWallpaperTap(item.wallpaper)
         }
@@ -1103,10 +1201,27 @@ struct MyLibraryContentView: View {
             if currentWallpaperFolderID != nil {
                 Button {
                     gridOrderStore.removeIDs([item.id], from: currentGridOrderScope)
-                    folderStore.moveWallpaperToFolder(wallpaperID: item.id, folderID: nil)
+                    folderStore.moveWallpaperToFolder(
+                        wallpaperID: item.id,
+                        folderID: nil,
+                        scope: currentWallpaperFolderScope
+                    )
                     updateWallpaperItems()
                 } label: {
                     Label(t("remove.from.folder"), systemImage: "folder.badge.minus")
+                }
+            }
+            if let videoURL = VideoOptimizationQueueService.shared.optimizableVideoURL(from: item.localFileURL) {
+                Divider()
+                Button {
+                    _ = VideoOptimizationQueueService.shared.enqueueOptimizeVideo(
+                        videoURL: videoURL,
+                        title: item.wallpaper.title,
+                        targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
+                        source: .manual
+                    )
+                } label: {
+                    Label(t("videoOptimizationOptimizeVideo"), systemImage: "sparkles")
                 }
             }
         }
@@ -1190,7 +1305,14 @@ struct MyLibraryContentView: View {
             },
             onRelock: {
                 folderLockService.lockFolder(folder.id)
-            }
+            },
+            onOptimizeVideos: {
+                _ = VideoOptimizationQueueService.shared.enqueueLibraryFolder(folder)
+            },
+            onRedownloadAll: selectedSubTab == .downloads && display.itemCount > 0 ? {
+                pendingRedownloadMediaFolder = folder
+                showRedownloadMediaFolderConfirm = true
+            } : nil
         )
     }
 
@@ -1213,20 +1335,23 @@ struct MyLibraryContentView: View {
     }
 
     private func moveMediasToFolder(ids: [String], folderID: String) {
+        let normalizedFolderID = MediaLibraryService.normalizedFolderID(folderID)
         gridOrderStore.removeIDs(Set(ids), from: currentGridOrderScope)
+        let scope = currentMediaFolderScope
         let unifiedByID: [String: UnifiedLocalMedia] = Dictionary(
             uniqueKeysWithValues: mediaViewModel.allLocalMedia.map { ($0.id, $0) }
         )
         for id in ids {
             let fallback: (item: MediaItem, fileURL: URL)?
-            if let unified = unifiedByID[id], unified.downloadRecord == nil {
+            if scope == .downloads, let unified = unifiedByID[id], unified.downloadRecord == nil {
                 fallback = (unified.mediaItem, unified.fileURL)
             } else {
                 fallback = nil
             }
             folderStore.moveMediaToFolder(
                 mediaID: id,
-                folderID: folderID,
+                folderID: normalizedFolderID,
+                scope: scope,
                 fallback: fallback
             )
         }
@@ -1254,7 +1379,9 @@ struct MyLibraryContentView: View {
             thumbnailURL: item.thumbnailURL,
             shouldProbeAnimatedThumbnail: item.shouldProbeAnimatedThumbnail,
             resolvedVideoFileURL: item.resolvedVideoFileURL,
-            isVisible: isVisible
+            isVisible: isVisible,
+            isCurrentWallpaper: currentWallpaperService.isCurrentWallpaper(localFileURL: item.localFileURL)
+                || currentWallpaperService.isCurrentWallpaper(localFileURL: item.resolvedVideoFileURL)
         ) {
             handleMediaTap(item.mediaItem)
         }
@@ -1263,10 +1390,39 @@ struct MyLibraryContentView: View {
             if currentMediaFolderID != nil {
                 Button {
                     gridOrderStore.removeIDs([item.id], from: currentGridOrderScope)
-                    folderStore.moveMediaToFolder(mediaID: item.id, folderID: nil)
+                    folderStore.moveMediaToFolder(
+                        mediaID: item.id,
+                        folderID: nil,
+                        scope: currentMediaFolderScope
+                    )
                     updateMediaItems()
                 } label: {
                     Label(t("remove.from.folder"), systemImage: "folder.badge.minus")
+                }
+            }
+            if selectedSubTab == .downloads, canRedownloadMediaItem(item.mediaItem) {
+                Button {
+                    pendingRedownloadMediaItem = item.mediaItem
+                    showRedownloadMediaItemConfirm = true
+                } label: {
+                    Label(t("library.redownload.item"), systemImage: "arrow.clockwise.circle")
+                }
+            }
+            // Scene 烘焙 MP4 优先：纯 scene 工程目录本身没有视频，不能只看 localFileURL。
+            if let videoURL = VideoOptimizationQueueService.shared.optimizableVideoURL(
+                forMediaItem: item.mediaItem,
+                localURL: item.localFileURL
+            ) {
+                Divider()
+                Button {
+                    _ = VideoOptimizationQueueService.shared.enqueueOptimizeVideo(
+                        videoURL: videoURL,
+                        title: item.mediaItem.title,
+                        targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
+                        source: .manual
+                    )
+                } label: {
+                    Label(t("videoOptimizationOptimizeVideo"), systemImage: "sparkles")
                 }
             }
         }
@@ -1371,9 +1527,18 @@ struct MyLibraryContentView: View {
 
         let targetSize = CGSize(width: 512, height: 512)
         let range = prefetchRange(around: index, totalCount: wallpaperItems.count)
+        // 优先本机 SSD 列表缩略图 / 站点 thumb，绝不 prefetch 外置原图路径
         let urls = range
             .filter { $0 != index }
-            .compactMap { wallpaperItems[$0].wallpaper.thumbURL }
+            .compactMap { idx -> URL? in
+                let entry = wallpaperItems[idx]
+                if let local = entry.localFileURL,
+                   LocalImageThumbnailCache.isRasterImageFile(local),
+                   let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
+                    return cached
+                }
+                return entry.wallpaper.thumbURL ?? entry.wallpaper.smallThumbURL
+            }
 
         ForegroundPrefetchManager.shared.stop(namespace: wallpaperPrefetchNamespace)
         ForegroundPrefetchManager.shared.start(
@@ -1381,6 +1546,17 @@ struct MyLibraryContentView: View {
             options: [.processor(DownsamplingImageProcessor(size: targetSize))],
             namespace: wallpaperPrefetchNamespace
         )
+
+        // 后台为附近静图生成 SSD 缩略图，后续滚动直接命中
+        let nearbyLocals = range.compactMap { wallpaperItems[$0].localFileURL }
+            .filter { LocalImageThumbnailCache.isRasterImageFile($0) }
+        if !nearbyLocals.isEmpty {
+            Task { @MainActor in
+                for url in nearbyLocals.prefix(12) {
+                    _ = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: url)
+                }
+            }
+        }
     }
 
     private func preloadNearbyMedia(around item: AnyMediaItem, config: LibraryGridConfig) {
@@ -1439,21 +1615,140 @@ struct MyLibraryContentView: View {
             return
         }
 
+        // ⚡ O(N) 预分组：按 folderID 建索引，避免对每个文件夹线性扫描全部记录。
+        // 收藏/下载集合各自只读对应记录，避免跨集合污染封面与计数。
         var next: [String: FolderDisplayInfo] = [:]
-        for folder in folders {
-            let favoriteWallpapers = WallpaperLibraryService.shared.favoriteWallpapers(inFolder: folder.id)
-            let downloadedWallpapers = WallpaperLibraryService.shared.downloadedWallpapers(inFolder: folder.id).map(\.wallpaper)
-            // 有序去重：优先 favorite 顺序，下载记录替换同名项
-            var seen = Set<String>()
-            var wallpapers: [Wallpaper] = []
-            // 下载记录优先（有本地抽帧），favorite 补充去重
-            for w in downloadedWallpapers + favoriteWallpapers {
-                if seen.insert(w.id).inserted { wallpapers.append(w) }
+        var warmupTargets: [(local: URL?, remote: URL?)] = []
+
+        if selectedSubTab == .favorites {
+            var favoriteByFolder: [String: [WallpaperFavoriteRecord]] = [:]
+            for r in WallpaperLibraryService.shared.favoriteRecords where r.isActive {
+                guard let fid = WallpaperLibraryService.normalizedFolderID(r.folderID) else { continue }
+                favoriteByFolder[fid, default: []].append(r)
             }
-            next[folder.id] = FolderDisplayInfo(
-                previewURLs: Array(wallpapers.prefix(3).compactMap(\.thumbURL)),
-                itemCount: wallpapers.count
-            )
+            for folder in folders {
+                let wallpapers = favoriteByFolder[folder.id, default: []].map(\.wallpaper)
+                let preview = Self.wallpaperFolderPreviewURLs(from: wallpapers, localPathByID: [:])
+                next[folder.id] = FolderDisplayInfo(
+                    previewURLs: preview.urls,
+                    itemCount: wallpapers.count
+                )
+                warmupTargets.append(contentsOf: preview.warmup)
+            }
+        } else {
+            var downloadedByFolder: [String: [WallpaperDownloadRecord]] = [:]
+            for r in WallpaperLibraryService.shared.downloadRecords where r.isActive {
+                guard let fid = WallpaperLibraryService.normalizedFolderID(r.folderID) else { continue }
+                downloadedByFolder[fid, default: []].append(r)
+            }
+            for folder in folders {
+                let records = downloadedByFolder[folder.id, default: []]
+                let wallpapers = records.map(\.wallpaper)
+                var localPathByID: [String: URL] = [:]
+                for r in records {
+                    localPathByID[r.wallpaper.id] = r.localFileURL
+                }
+                let preview = Self.wallpaperFolderPreviewURLs(from: wallpapers, localPathByID: localPathByID)
+                next[folder.id] = FolderDisplayInfo(
+                    previewURLs: preview.urls,
+                    itemCount: wallpapers.count
+                )
+                warmupTargets.append(contentsOf: preview.warmup)
+            }
+        }
+        wallpaperFolderDisplay = next
+        scheduleWallpaperFolderPreviewWarmup(targets: warmupTargets)
+    }
+
+    /// 壁纸夹叠图：优先本机 SSD 列表小图 / 本地文件，再远程 thumb（避免夹外永远糊远程图）。
+    private static func wallpaperFolderPreviewURLs(
+        from wallpapers: [Wallpaper],
+        localPathByID: [String: URL]
+    ) -> (urls: [URL], warmup: [(local: URL?, remote: URL?)]) {
+        var urls: [URL] = []
+        var warmup: [(local: URL?, remote: URL?)] = []
+        urls.reserveCapacity(3)
+        for wallpaper in wallpapers.prefix(3) {
+            let local = localPathByID[wallpaper.id]
+                ?? WallpaperLibraryService.shared.localFileURLIfAvailable(for: wallpaper)
+            let remote = wallpaper.thumbURL ?? wallpaper.smallThumbURL
+            if let local, local.isFileURL {
+                if LocalImageThumbnailCache.isRasterImageFile(local),
+                   let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
+                    urls.append(cached)
+                    continue
+                }
+                // 无 SSD 小图：先远程占位，后台预热
+                if let remote {
+                    urls.append(remote)
+                } else {
+                    urls.append(local)
+                }
+                warmup.append((local, remote))
+            } else if let remote {
+                urls.append(remote)
+            }
+        }
+        return (urls, warmup)
+    }
+
+    private func scheduleWallpaperFolderPreviewWarmup(targets: [(local: URL?, remote: URL?)]) {
+        let needWarmup = targets.compactMap(\.local).filter { local in
+            LocalImageThumbnailCache.isRasterImageFile(local)
+                && LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) == nil
+        }
+        guard !needWarmup.isEmpty else { return }
+
+        folderPreviewWarmupTask?.cancel()
+        folderPreviewWarmupTask = Task { @MainActor in
+            var any = false
+            for url in needWarmup.prefix(12) {
+                guard !Task.isCancelled else { return }
+                if await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: url) != nil {
+                    any = true
+                }
+            }
+            guard any, !Task.isCancelled else { return }
+            // 小图落盘后重算夹外预览，替换远程糊图
+            refreshWallpaperFolderDisplayWithoutWarmup()
+        }
+    }
+
+    /// 预热完成后刷新，避免递归再 schedule 同一批任务。
+    private func refreshWallpaperFolderDisplayWithoutWarmup() {
+        let folders = currentWallpaperFolders
+        guard !folders.isEmpty else {
+            wallpaperFolderDisplay = [:]
+            return
+        }
+        var next: [String: FolderDisplayInfo] = [:]
+        if selectedSubTab == .favorites {
+            var favoriteByFolder: [String: [WallpaperFavoriteRecord]] = [:]
+            for r in WallpaperLibraryService.shared.favoriteRecords where r.isActive {
+                guard let fid = WallpaperLibraryService.normalizedFolderID(r.folderID) else { continue }
+                favoriteByFolder[fid, default: []].append(r)
+            }
+            for folder in folders {
+                let wallpapers = favoriteByFolder[folder.id, default: []].map(\.wallpaper)
+                let preview = Self.wallpaperFolderPreviewURLs(from: wallpapers, localPathByID: [:])
+                next[folder.id] = FolderDisplayInfo(previewURLs: preview.urls, itemCount: wallpapers.count)
+            }
+        } else {
+            var downloadedByFolder: [String: [WallpaperDownloadRecord]] = [:]
+            for r in WallpaperLibraryService.shared.downloadRecords where r.isActive {
+                guard let fid = WallpaperLibraryService.normalizedFolderID(r.folderID) else { continue }
+                downloadedByFolder[fid, default: []].append(r)
+            }
+            for folder in folders {
+                let records = downloadedByFolder[folder.id, default: []]
+                let wallpapers = records.map(\.wallpaper)
+                var localPathByID: [String: URL] = [:]
+                for r in records {
+                    localPathByID[r.wallpaper.id] = r.localFileURL
+                }
+                let preview = Self.wallpaperFolderPreviewURLs(from: wallpapers, localPathByID: localPathByID)
+                next[folder.id] = FolderDisplayInfo(previewURLs: preview.urls, itemCount: wallpapers.count)
+            }
         }
         wallpaperFolderDisplay = next
     }
@@ -1465,75 +1760,124 @@ struct MyLibraryContentView: View {
             return
         }
 
+        // ⚡ O(N) 预分组；收藏/下载各自只读对应记录
         var next: [String: FolderDisplayInfo] = [:]
-        for folder in folders {
-            let favoriteItems = MediaLibraryService.shared.favoriteItems(inFolder: folder.id)
-            let records = MediaLibraryService.shared.downloadedItems(inFolder: folder.id)
+        var warmupItems: [(item: MediaItem, local: URL?)] = []
 
-            // 下载记录优先；使用与卡片封面一致的 libraryGridThumbnailURL 解析
-            var seen = Set<String>()
-            var items: [MediaItem] = []
-            var localPaths: [String: URL] = [:]  // id → local file URL
-
-            for r in records {
-                guard seen.insert(r.item.id).inserted else { continue }
-                items.append(r.item)
-                let url = URL(fileURLWithPath: r.localFilePath)
-                localPaths[r.item.id] = url
+        if selectedSubTab == .favorites {
+            var favoriteByFolder: [String: [MediaFavoriteRecord]] = [:]
+            for r in MediaLibraryService.shared.favoriteRecords where r.isActive {
+                guard let fid = MediaLibraryService.normalizedFolderID(r.folderID) else { continue }
+                favoriteByFolder[fid, default: []].append(r)
             }
-            // favorite 补充不重复的项
-            for item in favoriteItems where seen.insert(item.id).inserted {
-                items.append(item)
-            }
-            // 使用与卡片封面完全一致的解析链（抽帧 > 本地静图 > 海报 > 站点封面）
-            let previewURLs = items.prefix(3).map { item in
-                item.libraryGridThumbnailURL(localFileURL: localPaths[item.id])
-            }
-            // 异步生成尚未缓存的抽帧（与 MediaVideoCard.onAppear 逻辑一致）
-            for (itemID, localURL) in localPaths {
-                guard FileManager.default.fileExists(atPath: localURL.path) else { continue }
-                // 第一步：尝试常规视频文件解析
-                let resolvedVideo = MediaItem.resolveLocalVideoFile(from: localURL) ?? (
-                    ["mp4", "mov", "webm", "m4v", "mkv"].contains(localURL.pathExtension.lowercased()) ? localURL : nil
+            for folder in folders {
+                let items = favoriteByFolder[folder.id, default: []].map(\.item)
+                // 收藏也可能已下载：尽量解析本地路径，夹外才能用抽帧
+                let previewURLs: [URL] = items.prefix(3).map { item in
+                    let local = MediaLibraryService.shared.localFileURLIfAvailable(for: item)
+                    if let local { warmupItems.append((item, local)) }
+                    return item.libraryFolderThumbnailURL(localFileURL: local)
+                }
+                next[folder.id] = FolderDisplayInfo(
+                    previewURLs: previewURLs,
+                    itemCount: items.count
                 )
-                // 第二步：若常规解析失败，尝试查找烘焙产物（Scene 项目）
-                let bakeVideoURL: URL? = (resolvedVideo == nil)
-                    ? MediaLibraryService.shared.downloadRecords
-                        .first(where: { $0.item.id == itemID })?
-                        .sceneBakeArtifact
-                        .flatMap { URL(fileURLWithPath: $0.videoPath) }
-                    : nil
-                let videoURL = resolvedVideo ?? bakeVideoURL
-                let hasCachedPoster: Bool = {
-                    if resolvedVideo == nil {
-                        return VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: itemID) != nil
-                    }
-                    guard let videoURL else { return false }
-                    return VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: videoURL) != nil
-                }()
-                if let videoURL,
-                   !hasCachedPoster,
-                   ["mp4", "mov", "webm", "m4v", "mkv"].contains(videoURL.pathExtension.lowercased()) {
-                    Task { @MainActor in
-                        let posterURL: URL?
-                        if resolvedVideo == nil {
-                            posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
-                                forLocalVideo: videoURL,
-                                itemID: itemID
-                            )
-                        } else {
-                            posterURL = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoURL)
-                        }
-                        if posterURL != nil {
-                            refreshMediaFolderDisplay()
-                        }
-                    }
+            }
+        } else {
+            var downloadedByFolder: [String: [MediaDownloadRecord]] = [:]
+            for r in MediaLibraryService.shared.downloadRecords where r.isActive {
+                guard let fid = MediaLibraryService.normalizedFolderID(r.folderID) else { continue }
+                downloadedByFolder[fid, default: []].append(r)
+            }
+            for folder in folders {
+                let records = downloadedByFolder[folder.id, default: []]
+                var items: [MediaItem] = []
+                var localPaths: [String: URL] = [:]
+                var seen = Set<String>()
+                for r in records {
+                    guard seen.insert(r.item.id).inserted else { continue }
+                    items.append(r.item)
+                    localPaths[r.item.id] = URL(fileURLWithPath: r.localFilePath)
+                }
+                let previewURLs = items.prefix(3).map { item -> URL in
+                    let local = localPaths[item.id]
+                    warmupItems.append((item, local))
+                    return item.libraryFolderThumbnailURL(localFileURL: local)
+                }
+                next[folder.id] = FolderDisplayInfo(
+                    previewURLs: previewURLs,
+                    itemCount: items.count
+                )
+            }
+        }
+        mediaFolderDisplay = next
+        scheduleMediaFolderPreviewWarmup(targets: warmupItems)
+    }
+
+    /// 夹外叠图：后台为前若干项生成列表抽帧/静图小图，完成后刷新 display。
+    private func scheduleMediaFolderPreviewWarmup(targets: [(item: MediaItem, local: URL?)]) {
+        guard !targets.isEmpty else { return }
+        // 去重，限制总量，避免一次对整库外置卡抽帧
+        var seen = Set<String>()
+        let unique = targets.filter { seen.insert($0.item.id).inserted }.prefix(18)
+
+        folderPreviewWarmupTask?.cancel()
+        folderPreviewWarmupTask = Task { @MainActor in
+            var any = false
+            for entry in unique {
+                guard !Task.isCancelled else { return }
+                if await entry.item.ensureFolderPreviewCache(localFileURL: entry.local) {
+                    any = true
                 }
             }
-            next[folder.id] = FolderDisplayInfo(
-                previewURLs: previewURLs,
-                itemCount: items.count
-            )
+            guard any, !Task.isCancelled else { return }
+            refreshMediaFolderDisplayWithoutWarmup()
+        }
+    }
+
+    private func refreshMediaFolderDisplayWithoutWarmup() {
+        let folders = currentMediaFolders
+        guard !folders.isEmpty else {
+            mediaFolderDisplay = [:]
+            return
+        }
+        var next: [String: FolderDisplayInfo] = [:]
+        if selectedSubTab == .favorites {
+            var favoriteByFolder: [String: [MediaFavoriteRecord]] = [:]
+            for r in MediaLibraryService.shared.favoriteRecords where r.isActive {
+                guard let fid = MediaLibraryService.normalizedFolderID(r.folderID) else { continue }
+                favoriteByFolder[fid, default: []].append(r)
+            }
+            for folder in folders {
+                let items = favoriteByFolder[folder.id, default: []].map(\.item)
+                let previewURLs = items.prefix(3).map { item in
+                    item.libraryFolderThumbnailURL(
+                        localFileURL: MediaLibraryService.shared.localFileURLIfAvailable(for: item)
+                    )
+                }
+                next[folder.id] = FolderDisplayInfo(previewURLs: previewURLs, itemCount: items.count)
+            }
+        } else {
+            var downloadedByFolder: [String: [MediaDownloadRecord]] = [:]
+            for r in MediaLibraryService.shared.downloadRecords where r.isActive {
+                guard let fid = MediaLibraryService.normalizedFolderID(r.folderID) else { continue }
+                downloadedByFolder[fid, default: []].append(r)
+            }
+            for folder in folders {
+                let records = downloadedByFolder[folder.id, default: []]
+                var items: [MediaItem] = []
+                var localPaths: [String: URL] = [:]
+                var seen = Set<String>()
+                for r in records {
+                    guard seen.insert(r.item.id).inserted else { continue }
+                    items.append(r.item)
+                    localPaths[r.item.id] = URL(fileURLWithPath: r.localFilePath)
+                }
+                let previewURLs = items.prefix(3).map {
+                    $0.libraryFolderThumbnailURL(localFileURL: localPaths[$0.id])
+                }
+                next[folder.id] = FolderDisplayInfo(previewURLs: previewURLs, itemCount: items.count)
+            }
         }
         mediaFolderDisplay = next
     }
@@ -1905,9 +2249,14 @@ struct MyLibraryContentView: View {
     private func addSelectedItemsToFolder(ids: [String]) {
         switch selectedContentType {
         case .wallpaper:
-            moveWallpapersToFolder(ids: ids, folderID: currentWallpaperFolderID ?? "")
+            // 只允许在已进入某个文件夹时添加；根目录没有目标 folderID
+            if let folderID = currentWallpaperFolderID {
+                moveWallpapersToFolder(ids: ids, folderID: folderID)
+            }
         case .video:
-            moveMediasToFolder(ids: ids, folderID: currentMediaFolderID ?? "")
+            if let folderID = currentMediaFolderID {
+                moveMediasToFolder(ids: ids, folderID: folderID)
+            }
         case .anime:
             break
         }
@@ -2554,6 +2903,58 @@ struct MyLibraryContentView: View {
         updateMediaItems()
     }
 
+    /// 将视频文件夹中的现有下载先登记到下载任务列表，再删除旧文件并重新下载。
+    /// 下载落盘时始终携带原 folderID，避免重建下载记录后掉回媒体库根目录。
+    private func redownloadAllMedia(in folder: LibraryFolder) {
+        guard folder.contentType == .media, folder.collection == .downloads else { return }
+
+        let records = MediaLibraryService.shared.downloadedItems(inFolder: folder.id)
+        guard !records.isEmpty else { return }
+        redownloadMediaRecords(records, folderID: folder.id)
+    }
+
+    /// 单个库内壁纸重新下载：保留原文件夹归属（若有），先入队再删旧文件。
+    private func redownloadMediaItem(_ item: MediaItem) {
+        guard canRedownloadMediaItem(item) else { return }
+        guard let record = MediaLibraryService.shared.downloadRecord(for: item.id),
+              record.isActive else {
+            return
+        }
+        redownloadMediaRecords([record], folderID: record.folderID)
+    }
+
+    private func canRedownloadMediaItem(_ item: MediaItem) -> Bool {
+        // 本地导入文件没有远端源，无法重新拉取。
+        if item.id.hasPrefix("local_") { return false }
+        if item.sourceName == t("local") { return false }
+        return MediaLibraryService.shared.downloadRecord(for: item.id)?.isActive == true
+    }
+
+    /// 先持久化下载队列，再清优化状态与旧文件，最后启动传输。
+    private func redownloadMediaRecords(_ records: [MediaDownloadRecord], folderID: String?) {
+        guard !records.isEmpty else { return }
+
+        guard PersistentDownloadQueueService.shared.stage(
+            records.map(\.item),
+            folderID: folderID
+        ) else {
+            mediaViewModel.errorMessage = "无法保存下载队列，已取消删除旧文件"
+            return
+        }
+
+        // 新文件需要重新建立自己的优化判断，不能继承已删除文件的 sidecar 终态。
+        for videoURL in records.compactMap(\.resolvedVideoFileURL) {
+            VideoOptimizationQueueService.shared.cancelSourceRestoreRequest(videoURL: videoURL)
+            VideoOptimizationQueueService.shared.resetOptimizationState(videoURL: videoURL)
+        }
+
+        let itemIDs = Set(records.map(\.item.id))
+        mediaViewModel.removeDownloads(withIDs: itemIDs)
+        updateMediaItems()
+
+        PersistentDownloadQueueService.shared.start(using: mediaViewModel)
+    }
+
     private func matchesLibrarySearch(for folder: LibraryFolder, query: String) -> Bool {
         folder.name.localizedCaseInsensitiveContains(query)
     }
@@ -2759,6 +3160,8 @@ struct MyLibraryContentView: View {
             let message: String
             if progress.failedImports > 0 {
                 message = String(format: t("import.result.partial"), progress.successfulImports, progress.failedImports)
+            } else if progress.skippedImports > 0 {
+                message = String(format: t("import.result.partial.skipped"), progress.successfulImports, progress.skippedImports)
             } else if progress.successfulImports > 0 {
                 message = String(format: t("import.result.success"), progress.successfulImports)
             } else {
@@ -2769,7 +3172,7 @@ struct MyLibraryContentView: View {
                 let alert = NSAlert()
                 alert.messageText = t("import.completed")
                 alert.informativeText = message
-                alert.alertStyle = progress.failedImports > 0 ? .warning : .informational
+                alert.alertStyle = (progress.failedImports > 0 || progress.skippedImports > 0) ? .warning : .informational
                 alert.addButton(withTitle: "OK")
                 alert.runModal()
             }
@@ -3196,10 +3599,10 @@ private struct AnyWallpaperItem: Identifiable {
     let localFileURL: URL?
     let downloadDate: Date?
 
-    init(wallpaper: Wallpaper) {
+    init(wallpaper: Wallpaper, localFileURL: URL? = nil) {
         self.id = wallpaper.id
         self.wallpaper = wallpaper
-        self.localFileURL = nil
+        self.localFileURL = localFileURL
         self.downloadDate = nil
     }
 
@@ -3223,7 +3626,11 @@ private struct AnyMediaItem: Identifiable {
 
     @MainActor
     init(mediaItem: MediaItem, localFileURL: URL? = nil) {
-        let resolvedVideoFileURL = Self.resolveVideoFileURL(localFileURL: localFileURL, downloadRecord: nil)
+        // 列表重建不做 Workshop 递归/外置 stat；视频路径由卡片 onAppear 按需解析。
+        let resolvedVideoFileURL = Self.resolveVideoFileURLLightweight(
+            localFileURL: localFileURL,
+            downloadRecord: nil
+        )
         let thumbnailURL = mediaItem.libraryGridThumbnailURL(localFileURL: localFileURL)
 
         self.id = mediaItem.id
@@ -3240,7 +3647,7 @@ private struct AnyMediaItem: Identifiable {
 
     @MainActor
     init(unified: UnifiedLocalMedia) {
-        let resolvedVideoFileURL = Self.resolveVideoFileURL(
+        let resolvedVideoFileURL = Self.resolveVideoFileURLLightweight(
             localFileURL: unified.fileURL,
             downloadRecord: unified.downloadRecord
         )
@@ -3263,36 +3670,53 @@ private struct AnyMediaItem: Identifiable {
         unifiedLocalMedia?.isPortrait ?? mediaItem.isPortrait
     }
 
-    private static func resolveVideoFileURL(localFileURL: URL?, downloadRecord: MediaDownloadRecord?) -> URL? {
+    /// 轻量解析：只认 bake 记录路径与「本身就是视频文件」的扩展名，不扫目录、不 fileExists 外置卷。
+    private static func resolveVideoFileURLLightweight(
+        localFileURL: URL?,
+        downloadRecord: MediaDownloadRecord?
+    ) -> URL? {
         if let artifactPath = downloadRecord?.sceneBakeArtifact?.videoPath,
-           SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: artifactPath)) {
+           !artifactPath.isEmpty {
+            // 可用性检查延后到卡片/设壁纸路径；此处只给列表一个候选 URL
             return URL(fileURLWithPath: artifactPath)
         }
-        guard let localFileURL,
-              localFileURL.isFileURL,
-              FileManager.default.fileExists(atPath: localFileURL.path) else {
-            return nil
+        guard let localFileURL, localFileURL.isFileURL else { return nil }
+        let ext = localFileURL.pathExtension.lowercased()
+        if ["mp4", "mov", "webm", "m4v", "mkv"].contains(ext) {
+            return localFileURL
         }
-        return MediaItem.resolveLocalVideoFile(from: localFileURL) ?? localFileURL
+        return nil
     }
 
     private static func shouldProbeAnimatedThumbnail(url: URL, mediaItem: MediaItem) -> Bool {
+        // 明确动图元数据 / 路径后缀：必须探测并允许 hover 播放
+        if mediaItem.isAnimatedImage == true {
+            return true
+        }
+        if url.pathExtension.lowercased() == "gif" {
+            return true
+        }
+        // 本地路径文件名含 preview.gif 等（query 少见，仍看 pathExtension 即可）
+        if let local = mediaItem.posterURL, local.pathExtension.lowercased() == "gif" {
+            return true
+        }
+
         if url.isFileURL {
             let path = url.standardizedFileURL.path
-            if path.contains("/WaifuX/VideoThumbnails/") {
+            // 已生成的静态列表缓存绝不是可播放 GIF
+            if path.contains("/WaifuX/VideoThumbnails/")
+                || path.contains("/WaifuX/LocalImageThumbnails/") {
                 return false
             }
 
             let ext = url.pathExtension.lowercased()
-            if ["mp4", "mov", "webm", "m4v", "mkv"].contains(ext) {
+            // 静图/视频封面无需 GIF probe；尤其外置卡上 probe 会再读文件头
+            if ["mp4", "mov", "webm", "m4v", "mkv", "jpg", "jpeg", "png", "webp", "heic", "heif", "avif", "bmp", "tiff", "tif"].contains(ext) {
                 return false
             }
         }
 
-        if mediaItem.isAnimatedImage == true {
-            return true
-        }
-
+        // 远程封面等：保持探测（站点可能返回 GIF 但后缀不是 .gif）
         return true
     }
 }

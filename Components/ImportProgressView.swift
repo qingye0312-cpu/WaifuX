@@ -48,7 +48,8 @@ struct ImportProgressView: View {
                 let result = ImportResult(
                     totalFiles: importService.progress.totalFiles,
                     successfulImports: importService.progress.successfulImports,
-                    failedImports: importService.progress.failedImports
+                    failedImports: importService.progress.failedImports,
+                    skippedImports: importService.progress.skippedImports
                 )
                 showResult = true
                 lastResult = result
@@ -61,7 +62,8 @@ struct ImportProgressView: View {
                 let result = ImportResult(
                     totalFiles: importService.progress.totalFiles,
                     successfulImports: importService.progress.successfulImports,
-                    failedImports: importService.progress.failedImports
+                    failedImports: importService.progress.failedImports,
+                    skippedImports: importService.progress.skippedImports
                 )
                 showResult = true
                 lastResult = result

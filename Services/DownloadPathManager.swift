@@ -19,6 +19,9 @@ final class DownloadPathManager {
 
     private let defaults = UserDefaults.standard
     private let fileManager = FileManager.default
+    /// 当前已 `startAccessingSecurityScopedResource` 的自定义父目录（进程内保持访问）
+    private var activeSecurityScopedRootURL: URL?
+    private var isAccessingSecurityScopedRoot = false
 
     // MARK: - 根目录
 
@@ -36,16 +39,18 @@ final class DownloadPathManager {
     }
 
     /// 根目录: 默认 ~/Library/Application Support/WaifuX/，或用户自定义目录下 WaifuX/
+    /// 自定义目录会先恢复 security-scoped 访问，确保导入/下载写到设置里的存储位置。
     var rootFolderURL: URL {
         let url: URL
         if let customRoot = resolveCustomRootURL() {
+            ensureSecurityScopedAccess(to: customRoot)
             url = customRoot.appendingPathComponent("WaifuX", isDirectory: true)
         } else {
+            stopSecurityScopedAccessIfNeeded()
             url = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
                 .first!
                 .appendingPathComponent("WaifuX", isDirectory: true)
         }
-        print("[DownloadPathManager] rootFolderURL = \(url.path)")
         return url
     }
 
@@ -64,11 +69,16 @@ final class DownloadPathManager {
         rootFolderURL.appendingPathComponent("SceneBakes", isDirectory: true)
     }
 
+    /// 静态壁纸派生文件目录（例如竖图模糊填充），不参与本地壁纸扫描。
+    var derivedWallpapersFolderURL: URL {
+        rootFolderURL.appendingPathComponent("DerivedWallpapers", isDirectory: true)
+    }
+
     private init() {}
 
     // MARK: - 自定义目录解析
 
-    /// 从 bookmark 数据解析用户自定义的根目录 URL，并自动恢复访问权限。
+    /// 从 bookmark 数据解析用户自定义的根目录 URL。
     /// 若 bookmark 解析失败，尝试使用保存的路径字符串作为兜底。
     private func resolveCustomRootURL() -> URL? {
         guard let bookmarkData = defaults.data(forKey: Self.customDownloadRootBookmarkKey) else {
@@ -83,7 +93,8 @@ final class DownloadPathManager {
                 bookmarkDataIsStale: &isStale
             )
             if isStale {
-                // 刷新 bookmark
+                // 刷新 bookmark（需已持有访问权）
+                ensureSecurityScopedAccess(to: url)
                 if let newBookmark = try? createBookmark(for: url) {
                     defaults.set(newBookmark, forKey: Self.customDownloadRootBookmarkKey)
                 }
@@ -91,7 +102,7 @@ final class DownloadPathManager {
             return url
         } catch {
             print("[DownloadPathManager] Failed to resolve custom root bookmark: \(error)")
-            // 兜底：尝试使用保存的纯路径字符串
+            // 兜底：尝试使用保存的纯路径字符串（可能无 security-scope，外置盘可能失败）
             if let savedPath = defaults.string(forKey: Self.customDownloadRootPathKey),
                fileManager.fileExists(atPath: savedPath) {
                 print("[DownloadPathManager] Falling back to saved path: \(savedPath)")
@@ -109,6 +120,42 @@ final class DownloadPathManager {
             includingResourceValuesForKeys: nil,
             relativeTo: nil
         )
+    }
+
+    /// 恢复自定义目录的 security-scoped 访问（导入/下载写盘必需）。
+    @discardableResult
+    private func ensureSecurityScopedAccess(to url: URL) -> Bool {
+        let standardized = url.standardizedFileURL
+        if isAccessingSecurityScopedRoot,
+           let active = activeSecurityScopedRootURL,
+           active.standardizedFileURL == standardized {
+            return true
+        }
+        stopSecurityScopedAccessIfNeeded()
+        let started = standardized.startAccessingSecurityScopedResource()
+        if started {
+            activeSecurityScopedRootURL = standardized
+            isAccessingSecurityScopedRoot = true
+            print("[DownloadPathManager] Started security-scoped access: \(standardized.path)")
+        } else {
+            // 非沙盒 / 已有权限时可能返回 false，仍可尝试使用该路径
+            activeSecurityScopedRootURL = standardized
+            isAccessingSecurityScopedRoot = false
+            print("[DownloadPathManager] Security-scoped start returned false (may still be writable): \(standardized.path)")
+        }
+        return true
+    }
+
+    private func stopSecurityScopedAccessIfNeeded() {
+        guard isAccessingSecurityScopedRoot, let active = activeSecurityScopedRootURL else {
+            activeSecurityScopedRootURL = nil
+            isAccessingSecurityScopedRoot = false
+            return
+        }
+        active.stopAccessingSecurityScopedResource()
+        print("[DownloadPathManager] Stopped security-scoped access: \(active.path)")
+        activeSecurityScopedRootURL = nil
+        isAccessingSecurityScopedRoot = false
     }
 
     // MARK: - 目录选择
@@ -135,9 +182,11 @@ final class DownloadPathManager {
     @discardableResult
     func setCustomRoot(parentURL: URL) -> Bool {
         do {
+            // 面板选中的 URL 在当前 runloop 内通常已可访问；立刻建 bookmark 并接管长期访问
             let bookmarkData = try createBookmark(for: parentURL)
             defaults.set(bookmarkData, forKey: Self.customDownloadRootBookmarkKey)
             defaults.set(parentURL.path, forKey: Self.customDownloadRootPathKey)
+            ensureSecurityScopedAccess(to: parentURL)
             createDirectoryStructure()
             print("[DownloadPathManager] Custom root set to: \(parentURL.path)")
             return true
@@ -149,6 +198,7 @@ final class DownloadPathManager {
 
     /// 恢复为默认目录（Application Support/WaifuX）
     func resetToDefaultRoot() {
+        stopSecurityScopedAccessIfNeeded()
         defaults.removeObject(forKey: Self.customDownloadRootBookmarkKey)
         defaults.removeObject(forKey: Self.customDownloadRootPathKey)
         createDirectoryStructure()
@@ -180,7 +230,15 @@ final class DownloadPathManager {
 
     @discardableResult
     func createDirectoryStructure() -> Bool {
-        let directories = [rootFolderURL, wallpapersFolderURL, mediaFolderURL, sceneBakesFolderURL]
+        // 通过 rootFolderURL 触发自定义目录的 security-scoped 恢复
+        let root = rootFolderURL
+        let directories = [
+            root,
+            wallpapersFolderURL,
+            mediaFolderURL,
+            sceneBakesFolderURL,
+            derivedWallpapersFolderURL
+        ]
         var ok = true
 
         for directory in directories {
@@ -318,11 +376,24 @@ extension Notification.Name {
     static let appShouldReleaseForegroundMemory = Notification.Name("appShouldReleaseForegroundMemory")
     static let appDidReceiveMemoryPressure = Notification.Name("appDidReceiveMemoryPressure")
     static let switchToLibraryTab = Notification.Name("switchToLibraryTab")
+    static let openCurrentWallpaperDetail = Notification.Name("openCurrentWallpaperDetail")
+}
+
+enum MainWallpaperDetailRequest {
+    case wallpaper(Wallpaper)
+    case media(MediaItem)
 }
 
 enum MainNavigationRequestStore {
     private static let pendingTabKey = "mainNavigation.pendingTab"
     private static let libraryTabValue = "myMedia"
+    private static let pendingWallpaperDetailKindKey = "mainNavigation.pendingWallpaperDetail.kind"
+    private static let pendingWallpaperDetailPayloadKey = "mainNavigation.pendingWallpaperDetail.payload"
+
+    private enum WallpaperDetailKind: String {
+        case wallpaper
+        case media
+    }
 
     static func requestLibraryTab() {
         UserDefaults.standard.set(libraryTabValue, forKey: pendingTabKey)
@@ -339,5 +410,46 @@ enum MainNavigationRequestStore {
 
     static func clearLibraryTabRequest() {
         UserDefaults.standard.removeObject(forKey: pendingTabKey)
+    }
+
+    static func requestWallpaperDetail(_ request: MainWallpaperDetailRequest) {
+        let kind: WallpaperDetailKind
+        let payload: Data?
+        switch request {
+        case .wallpaper(let wallpaper):
+            kind = .wallpaper
+            payload = try? JSONEncoder().encode(wallpaper)
+        case .media(let media):
+            kind = .media
+            payload = try? JSONEncoder().encode(media)
+        }
+
+        guard let payload else { return }
+        UserDefaults.standard.set(kind.rawValue, forKey: pendingWallpaperDetailKindKey)
+        UserDefaults.standard.set(payload, forKey: pendingWallpaperDetailPayloadKey)
+        NotificationCenter.default.post(name: .openCurrentWallpaperDetail, object: nil)
+    }
+
+    static func consumeWallpaperDetailRequest() -> MainWallpaperDetailRequest? {
+        defer { clearWallpaperDetailRequest() }
+        guard let rawKind = UserDefaults.standard.string(forKey: pendingWallpaperDetailKindKey),
+              let kind = WallpaperDetailKind(rawValue: rawKind),
+              let payload = UserDefaults.standard.data(forKey: pendingWallpaperDetailPayloadKey) else {
+            return nil
+        }
+
+        switch kind {
+        case .wallpaper:
+            return (try? JSONDecoder().decode(Wallpaper.self, from: payload))
+                .map(MainWallpaperDetailRequest.wallpaper)
+        case .media:
+            return (try? JSONDecoder().decode(MediaItem.self, from: payload))
+                .map(MainWallpaperDetailRequest.media)
+        }
+    }
+
+    static func clearWallpaperDetailRequest() {
+        UserDefaults.standard.removeObject(forKey: pendingWallpaperDetailKindKey)
+        UserDefaults.standard.removeObject(forKey: pendingWallpaperDetailPayloadKey)
     }
 }

@@ -106,10 +106,12 @@ final class MediaExploreViewModel: ObservableObject {
     private var workshopCurrentContentLevel: WorkshopSourceManager.WorkshopContentLevel? = .everyone
     /// Workshop 分辨率/比例筛选
     private var workshopCurrentResolution: String? = nil
-    /// Workshop 排序方式
+    /// Workshop 排序方式（用户选择过则跨启动持久化）
     private(set) var workshopSortBy: WorkshopSearchParams.SortOption = .ranked
     /// Workshop 热门趋势时间范围（仅对 trend 排序有效），nil = 全部时间
     private(set) var workshopDays: Int? = nil
+    /// UI 层 Workshop 排序菜单 rawValue（含 trend_7 等细分）
+    private(set) var workshopSortMenuRawValue: String = "trend_7"
 
     // MARK: - Dynamic Wallpaper (DongTai) 分页状态
     private var dongtaiCurrentPage = 1
@@ -117,11 +119,17 @@ final class MediaExploreViewModel: ObservableObject {
     private var dongtaiSearchQuery = ""
     private var dongtaiCurrentCategories: Set<DynamicWallpaperCategory> = []
     private var dongtaiCurrentListType: DynamicWallpaperListType = .all
-    private var dongtaiSortBy: DynamicWallpaperSortOption = .popular
+    private(set) var dongtaiSortBy: DynamicWallpaperSortOption = .popular
     private var dongtaiFilterAudio: Bool? = nil
     private var dongtaiFilterFourK: Bool? = nil
     /// 加载世代计数器，用于丢弃旧请求的结果
     private var dongtaiLoadGeneration: UInt = 0
+
+    // MARK: - Explore 排序持久化
+    // ⚠️ 不在 init 读 UserDefaults（macOS 26+ _CFXPreferences 栈溢出风险），由 restoreExploreSortPreferences() 延迟恢复
+    private static let workshopSortMenuDefaultsKey = "explore.media.workshopSortMenu"
+    private static let dongtaiSortDefaultsKey = "explore.media.dongtaiSort"
+    private var hasRestoredExploreSort = false
 
     // MARK: - Wallsflow 分页状态
     private var wallsflowCurrentPage = 1
@@ -144,6 +152,7 @@ final class MediaExploreViewModel: ObservableObject {
 
     init() {
         // 缓存 UserDefaults 值，避免后台线程访问触发 _CFXPreferences 递归崩溃
+        // 注意：此读取本身也有风险，但为既有路径；探索排序改为 restoreExploreSortPreferences() 延迟恢复
         persistDownloadedMediaToAppLibrary = UserDefaults.standard.object(forKey: DownloadPathManager.persistDownloadsToAppLibraryDefaultsKey) as? Bool ?? true
 
         // 注册内存压力通知（由 WaifuXApp.configureKingfisher 中的 DispatchSource 触发）
@@ -402,6 +411,8 @@ final class MediaExploreViewModel: ObservableObject {
 
     func initialLoadIfNeeded() async {
         print("[MediaExploreViewModel] initialLoadIfNeeded called, items.count=\(items.count)")
+        // 兜底：确保探索排序在首次加载前已从 UserDefaults 恢复
+        restoreExploreSortPreferences()
         if restoreExploreFeedIfNeededAfterDetailReturn() {
             print("[MediaExploreViewModel] restored preserved explore feed, skipping initial load")
             return
@@ -1019,32 +1030,7 @@ final class MediaExploreViewModel: ObservableObject {
     private let persistDownloadedMediaToAppLibrary: Bool
 
     func download(_ item: MediaItem, preferredOption: MediaDownloadOption? = nil) async throws {
-        let task = downloadTaskService.addTask(mediaItem: item)
-
-        let downloadTask = Task { [weak self] in
-            guard let self else { throw CancellationError() }
-
-            _ = try await ensureLocalVideoFile(
-                for: item,
-                preferredOption: preferredOption,
-                saveToDownloads: persistDownloadedMediaToAppLibrary,
-                taskID: task.id
-            )
-            downloadTaskService.markCompleted(id: task.id)
-        }
-
-        // 注册任务以便支持取消
-        downloadTaskService.registerDownloadTask(id: task.id, task: downloadTask)
-        defer { downloadTaskService.unregisterDownloadTask(id: task.id) }
-
-        do {
-            try await downloadTask.value
-        } catch {
-            if !(error is CancellationError) {
-                downloadTaskService.markFailed(id: task.id)
-            }
-            throw error
-        }
+        _ = try await downloadMedia(item, option: preferredOption)
     }
 
     // MARK: - 便捷方法（用于 MediaDetailSheet）
@@ -1072,49 +1058,85 @@ final class MediaExploreViewModel: ObservableObject {
     ///   - item: 媒体项
     ///   - option: 下载选项
     /// - Returns: 下载后的本地文件 URL
-    func downloadMedia(_ item: MediaItem, option: MediaDownloadOption) async throws -> URL {
-        let task = downloadTaskService.addTask(mediaItem: item)
-
-        // 创建真正执行下载逻辑的 Task（有返回值）
-        let valueTask = Task { [weak self] () -> URL in
-            guard let self else { throw CancellationError() }
-
-            let localURL = try await ensureLocalVideoFile(
-                for: item,
-                preferredOption: option,
-                saveToDownloads: persistDownloadedMediaToAppLibrary,
-                taskID: task.id
-            )
-            downloadTaskService.markCompleted(id: task.id)
-            return localURL
-        }
-
-        // 包装为 Void Task 用于注册（DownloadTaskStorage 要求 Task<Void, Error>）
-        let downloadTask = Task<Void, Error> {
-            _ = try await valueTask.value
-        }
-
-        // 注册任务以便支持取消
-        downloadTaskService.registerDownloadTask(id: task.id, task: downloadTask)
-        defer { downloadTaskService.unregisterDownloadTask(id: task.id) }
-
-        do {
-            return try await valueTask.value
-        } catch {
-            if !(error is CancellationError) {
-                downloadTaskService.markFailed(id: task.id)
-            }
-            throw error
-        }
+    /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
+    ///   为 nil 时不改动已有 folderID；新建记录则落在根目录。
+    func downloadMedia(_ item: MediaItem, option: MediaDownloadOption?, folderID: String? = nil) async throws -> URL {
+        let saveToLibrary = persistDownloadedMediaToAppLibrary
+            || MediaLibraryService.normalizedFolderID(folderID) != nil
+        return try await PersistentDownloadQueueService.shared.enqueueMediaAndWait(
+            item,
+            option: option,
+            saveToLibrary: saveToLibrary,
+            folderID: folderID,
+            using: self
+        )
     }
 
-    func applyDynamicWallpaper(_ item: MediaItem, muted: Bool, targetScreen: NSScreen? = nil) async throws {
+    /// 只执行媒体文件下载；队列统一管理任务生命周期。
+    func executeQueuedMediaDownload(
+        _ item: MediaItem,
+        option: MediaDownloadOption?,
+        saveToLibrary: Bool,
+        folderID: String?,
+        taskID: String
+    ) async throws -> URL {
+        return try await ensureLocalVideoFile(
+            for: item,
+            preferredOption: option,
+            saveToDownloads: saveToLibrary,
+            taskID: taskID,
+            folderID: folderID
+        )
+    }
+
+    /// 只执行 Workshop 下载；Steam Guard 码仅由当次内存任务传入。
+    func executeQueuedWorkshopDownload(
+        _ item: MediaItem,
+        guardCode: String?,
+        folderID: String?,
+        taskID: String
+    ) async throws -> URL {
+        guard item.id.hasPrefix("workshop_") else {
+            throw WorkshopError.workshopNotSupported
+        }
+
+        let workshopID = String(item.id.dropFirst("workshop_".count))
+        let localURL = try await workshopService.downloadWorkshopItem(
+            workshopID: workshopID,
+            guardCode: guardCode,
+            progressHandler: { progress in
+                Task { @MainActor in
+                    DownloadTaskService.shared.updateProgress(id: taskID, progress: progress)
+                }
+            }
+        )
+        let normalizedURL = normalizeWorkshopDownloadLocation(localURL, workshopID: workshopID)
+        mediaLibrary.recordDownload(item: item, localFileURL: normalizedURL, folderID: folderID)
+        return normalizedURL
+    }
+
+    func applyDynamicWallpaper(
+        _ item: MediaItem,
+        muted: Bool,
+        targetScreen: NSScreen? = nil,
+        targetScreens: [NSScreen]? = nil,
+        usesSharedVideoDecoder: Bool = false
+    ) async throws {
+        let resolvedTargetScreens = targetScreens ?? targetScreen.map { [$0] }
         // Workshop 项：优先查找本地已下载的视频文件
         if item.id.hasPrefix("workshop_"),
            let localVideoURL = findLocalWorkshopVideo(for: item) {
             print("[MediaExploreViewModel] Using downloaded Workshop video: \(localVideoURL.path)")
+            mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localVideoURL)
             let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
-            try videoWallpaperManager.applyVideoWallpaper(from: localVideoURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
+            try videoWallpaperManager.applyVideoWallpaper(
+                from: localVideoURL,
+                posterURL: posterURL,
+                muted: muted,
+                targetScreens: resolvedTargetScreens,
+                animatedTransition: true,
+                usesSharedVideoDecoder: usesSharedVideoDecoder
+            )
             return
         }
 
@@ -1123,20 +1145,47 @@ final class MediaExploreViewModel: ObservableObject {
             let localURL = item.previewVideoURL ?? item.pageURL
             if localURL.isFileURL && FileManager.default.fileExists(atPath: localURL.path) {
                 print("[MediaExploreViewModel] Using local media file: \(localURL.path)")
+                mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localURL)
                 let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localURL, fallbackPosterURL: item.posterURL)
-                try videoWallpaperManager.applyVideoWallpaper(from: localURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
+                try videoWallpaperManager.applyVideoWallpaper(
+                    from: localURL,
+                    posterURL: posterURL,
+                    muted: muted,
+                    targetScreens: resolvedTargetScreens,
+                    animatedTransition: true,
+                    usesSharedVideoDecoder: usesSharedVideoDecoder
+                )
                 return
             }
         }
 
         // 网络媒体文件：下载后使用
-        let localVideoURL = try await ensureLocalVideoFile(
-            for: item,
-            preferredOption: preferredWallpaperOption(for: item),
-            saveToDownloads: false
+        let localVideoURL = try await PersistentDownloadQueueService.shared.enqueueMediaAndWait(
+            item,
+            option: preferredWallpaperOption(for: item),
+            saveToLibrary: true,
+            folderID: nil,
+            using: self
         )
         let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
-        try videoWallpaperManager.applyVideoWallpaper(from: localVideoURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
+        try videoWallpaperManager.applyVideoWallpaper(
+            from: localVideoURL,
+            posterURL: posterURL,
+            muted: muted,
+            targetScreens: resolvedTargetScreens,
+            animatedTransition: true,
+            usesSharedVideoDecoder: usesSharedVideoDecoder
+        )
+    }
+
+    /// Registers an already-local item before it is applied from the detail sheet.
+    /// This covers Workshop folders that were downloaded by an earlier build or restored from disk.
+    func ensureMediaIsInLibrary(_ item: MediaItem, localFileURL: URL) {
+        guard localFileURL.isFileURL,
+              FileManager.default.fileExists(atPath: localFileURL.path) else {
+            return
+        }
+        mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localFileURL)
     }
 
     /// Workshop 内容类型
@@ -1379,7 +1428,8 @@ final class MediaExploreViewModel: ObservableObject {
         for item: MediaItem,
         preferredOption: MediaDownloadOption?,
         saveToDownloads: Bool,
-        taskID: String? = nil
+        taskID: String? = nil,
+        folderID: String? = nil
     ) async throws -> URL {
         let resolvedItem = try await loadDetail(for: item)
         if let taskID {
@@ -1410,9 +1460,12 @@ final class MediaExploreViewModel: ObservableObject {
                 updateDownloadProgress(taskID: taskID, progress: saveToDownloads ? 0.72 : 1.0)
             }
 
-            // 如果在旧位置找到，更新下载记录的路径
-            if fileLocation.foundIn == .legacyRootFolder && saveToDownloads {
-                mediaLibrary.updateDownloadPath(for: resolvedItem.id, newURL: fileLocation.url)
+            if saveToDownloads {
+                mediaLibrary.ensureDownloadRecord(
+                    item: resolvedItem,
+                    localFileURL: fileLocation.url,
+                    folderID: folderID
+                )
             }
 
             return fileLocation.url
@@ -1476,7 +1529,12 @@ final class MediaExploreViewModel: ObservableObject {
             if let taskID {
                 updateDownloadProgress(taskID: taskID, progress: 0.96)
             }
-            mediaLibrary.recordDownload(item: resolvedItem, localFileURL: fileURL)
+            // 作者批量下载把 folderID 和落盘登记绑在同一步
+            mediaLibrary.recordDownload(
+                item: resolvedItem,
+                localFileURL: fileURL,
+                folderID: folderID
+            )
             return fileURL
         }
 
@@ -1490,22 +1548,16 @@ final class MediaExploreViewModel: ObservableObject {
     func retryDownload(task: DownloadTask) async throws {
         switch task.kind {
         case .media:
-            guard let item = task.mediaItem else {
+            guard task.mediaItem != nil else {
                 throw NetworkError.invalidResponse
             }
-            let resolvedItem = try await loadDetail(for: item)
-            guard let option = preferredWallpaperOption(for: resolvedItem) else {
-                throw NetworkError.invalidResponse
-            }
-            downloadTaskService.removeTask(id: task.id)
-            _ = try await downloadMedia(resolvedItem, option: option)
+            try await PersistentDownloadQueueService.shared.retryAndWait(task)
 
         case .workshop:
-            guard let item = task.workshopItem ?? task.mediaItem else {
+            guard task.workshopItem != nil || task.mediaItem != nil else {
                 throw NetworkError.invalidResponse
             }
-            downloadTaskService.removeTask(id: task.id)
-            try await downloadWorkshopWallpaper(item)
+            try await PersistentDownloadQueueService.shared.retryAndWait(task)
 
         case .wallpaper:
             throw NetworkError.invalidResponse
@@ -1646,7 +1698,7 @@ final class MediaExploreViewModel: ObservableObject {
         )
     }
 
-    /// 重置 Workshop 浏览状态并强制加载默认趋势列表。
+    /// 重置 Workshop 浏览状态并加载列表（保留用户持久化的排序）。
     @MainActor
     func resetAndLoadDefaultWorkshopFeed() async {
         invalidatePreservedExploreFeed()
@@ -1656,8 +1708,7 @@ final class MediaExploreViewModel: ObservableObject {
         workshopCurrentType = .all
         workshopCurrentContentLevel = .everyone
         workshopCurrentResolution = nil
-        workshopSortBy = .ranked
-        workshopDays = 7
+        // 保留用户持久化过的排序，不强制回默认 trend_7
         workshopCurrentPage = 1
         workshopHasMore = true
         hasMorePages = true
@@ -1717,10 +1768,19 @@ final class MediaExploreViewModel: ObservableObject {
     }
 
     /// 设置 Workshop 排序方式
-    func setWorkshopSort(sortBy: WorkshopSearchParams.SortOption, days: Int? = nil) async {
+    /// - Parameter menuRawValue: UI 菜单项 rawValue（如 `trend_7`），用于跨启动恢复细分趋势
+    func setWorkshopSort(
+        sortBy: WorkshopSearchParams.SortOption,
+        days: Int? = nil,
+        menuRawValue: String? = nil
+    ) async {
         invalidatePreservedExploreFeed()
         workshopSortBy = sortBy
         workshopDays = days
+        if let menuRawValue {
+            workshopSortMenuRawValue = menuRawValue
+            UserDefaults.standard.set(menuRawValue, forKey: Self.workshopSortMenuDefaultsKey)
+        }
         await loadWorkshopFeedInternal(
             query: workshopSearchQuery,
             tags: workshopCurrentTags,
@@ -1728,6 +1788,60 @@ final class MediaExploreViewModel: ObservableObject {
             contentLevel: workshopCurrentContentLevel,
             resolution: workshopCurrentResolution
         )
+    }
+
+    /// 从 UserDefaults 恢复媒体探索排序；仅在用户曾选择过时覆盖默认值。
+    /// 必须在 applicationDidFinishLaunching 之后调用，不可在 init 中调用。
+    func restoreExploreSortPreferences() {
+        guard !hasRestoredExploreSort else { return }
+        hasRestoredExploreSort = true
+
+        let defaults = UserDefaults.standard
+        if let raw = defaults.string(forKey: Self.workshopSortMenuDefaultsKey) {
+            applyWorkshopSortMenuRawValue(raw)
+        }
+        if let raw = defaults.string(forKey: Self.dongtaiSortDefaultsKey),
+           let option = DynamicWallpaperSortOption(rawValue: raw) {
+            dongtaiSortBy = option
+        }
+    }
+
+    /// 将 Workshop 排序菜单 rawValue 映射到 API 参数（与 MediaExploreContentView.WorkshopSortOption 对齐）
+    private func applyWorkshopSortMenuRawValue(_ raw: String) {
+        workshopSortMenuRawValue = raw
+        switch raw {
+        case "trend_1":
+            workshopSortBy = .ranked
+            workshopDays = 1
+        case "trend_7":
+            workshopSortBy = .ranked
+            workshopDays = 7
+        case "trend_30":
+            workshopSortBy = .ranked
+            workshopDays = 30
+        case "trend_90":
+            workshopSortBy = .ranked
+            workshopDays = 90
+        case "trend_365":
+            workshopSortBy = .ranked
+            workshopDays = 365
+        case "trend":
+            workshopSortBy = .ranked
+            workshopDays = nil
+        case "updated":
+            workshopSortBy = .updated
+            workshopDays = nil
+        case "created":
+            workshopSortBy = .created
+            workshopDays = nil
+        case "toprated":
+            workshopSortBy = .topRated
+            workshopDays = nil
+        default:
+            workshopSortBy = .ranked
+            workshopDays = 7
+            workshopSortMenuRawValue = "trend_7"
+        }
     }
 
     /// 内部方法：加载 Workshop 数据
@@ -1878,7 +1992,7 @@ final class MediaExploreViewModel: ObservableObject {
         currentQuery = ""
         dongtaiCurrentCategories = []
         dongtaiCurrentListType = .all
-        dongtaiSortBy = .popular
+        // 保留用户持久化过的排序，不强制回默认 popular
         dongtaiFilterAudio = nil
         dongtaiFilterFourK = nil
         dongtaiCurrentPage = 1
@@ -1897,7 +2011,7 @@ final class MediaExploreViewModel: ObservableObject {
             query: "",
             categories: [],
             listType: .all,
-            sortBy: .popular,
+            sortBy: dongtaiSortBy,
             hasAudio: nil,
             isFourK: nil
         )
@@ -1954,6 +2068,7 @@ final class MediaExploreViewModel: ObservableObject {
     func setDongTaiSort(sortBy: DynamicWallpaperSortOption) async {
         invalidatePreservedExploreFeed()
         dongtaiSortBy = sortBy
+        UserDefaults.standard.set(sortBy.rawValue, forKey: Self.dongtaiSortDefaultsKey)
         await loadDongTaiFeedInternal(
             query: dongtaiSearchQuery,
             categories: dongtaiCurrentCategories,
@@ -2238,12 +2353,18 @@ final class MediaExploreViewModel: ObservableObject {
 
     // MARK: - 按作者获取 Workshop 物品
 
+    /// 作者媒体分页结果。hasMore 不依赖固定 30 条假设（Steam 可能忽略 numperpage）。
+    struct AuthorMediaPageResult {
+        let items: [MediaItem]
+        let hasMore: Bool
+    }
+
     /// 获取指定作者的所有 Workshop 壁纸
     /// - Parameters:
     ///   - steamID: Steam 64位数字 ID
     ///   - page: 页码
-    /// - Returns: 壁纸列表（已转为 MediaItem）
-    func fetchMediaByAuthor(steamID: String, page: Int = 1) async throws -> [MediaItem] {
+    /// - Returns: 本页媒体 + 是否还有下一页
+    func fetchMediaByAuthor(steamID: String, page: Int = 1) async throws -> AuthorMediaPageResult {
         let wallpapers = try await workshopService.fetchByAuthor(steamID: steamID, page: page)
         let mediaItems = workshopService.convertToMediaItems(wallpapers)
 
@@ -2252,57 +2373,32 @@ final class MediaExploreViewModel: ObservableObject {
             mediaLibrary.upsert(item)
         }
 
-        return mediaItems
+        // 作者页实测可按 numperpage=30 翻页；满页继续，未满/空页结束。
+        // 不用「非空即 hasMore」，否则最后一页仍会多请求一次空页。
+        let hasMore = mediaItems.count >= 30
+        return AuthorMediaPageResult(items: mediaItems, hasMore: hasMore)
     }
 
     // MARK: - Workshop 下载
 
     /// 下载 Workshop 壁纸（通过 SteamCMD）
-    func downloadWorkshopWallpaper(_ item: MediaItem, guardCode: String? = nil) async throws {
+    /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
+    func downloadWorkshopWallpaper(_ item: MediaItem, guardCode: String? = nil, folderID: String? = nil) async throws {
         guard item.id.hasPrefix("workshop_") else {
             throw WorkshopError.workshopNotSupported
         }
 
-        let workshopID = String(item.id.dropFirst("workshop_".count))
         AppLogger.info(.download, "downloadWorkshopWallpaper", metadata: [
             "item.id": item.id,
-            "workshopID": workshopID,
+            "workshopID": String(item.id.dropFirst("workshop_".count)),
             "title": item.title
         ])
-        let task = downloadTaskService.addTask(workshopWallpaper: item)
-        let taskID = task.id
-        downloadTaskService.markDownloading(id: taskID)
-
-        let downloadTask = Task { [weak self] in
-            guard let self else { throw CancellationError() }
-
-            let localURL = try await workshopService.downloadWorkshopItem(
-                workshopID: workshopID,
-                guardCode: guardCode,
-                progressHandler: { [weak self] progress in
-                    Task { @MainActor in
-                        self?.downloadTaskService.updateProgress(id: taskID, progress: progress)
-                    }
-                }
-            )
-            let normalizedURL = normalizeWorkshopDownloadLocation(localURL, workshopID: workshopID)
-            mediaLibrary.recordDownload(item: item, localFileURL: normalizedURL)
-            downloadTaskService.markCompleted(id: taskID)
-            print("[MediaExploreViewModel] downloadWorkshopWallpaper completed: \(normalizedURL)")
-        }
-
-        // 注册任务以便支持取消
-        downloadTaskService.registerDownloadTask(id: taskID, task: downloadTask)
-        defer { downloadTaskService.unregisterDownloadTask(id: taskID) }
-
-        do {
-            try await downloadTask.value
-        } catch {
-            if !(error is CancellationError) {
-                downloadTaskService.markFailed(id: taskID)
-            }
-            throw error
-        }
+        try await PersistentDownloadQueueService.shared.enqueueWorkshopAndWait(
+            item,
+            guardCode: guardCode,
+            folderID: folderID,
+            using: self
+        )
     }
 
     private func normalizeWorkshopDownloadLocation(_ url: URL, workshopID: String) -> URL {
@@ -2319,6 +2415,103 @@ final class MediaExploreViewModel: ObservableObject {
             return appContentPath
         }
         return url
+    }
+
+    // MARK: - Workshop 更新检测 / 重下
+
+    /// 检查已下载 Workshop 条目是否有远端更新。
+    /// - Returns: `(hasUpdate, remoteUpdatedAt)`；网络失败时返回 `nil`（保持当前 UI）。
+    func checkWorkshopUpdateAvailability(for item: MediaItem) async -> (hasUpdate: Bool, remoteUpdatedAt: Date?)? {
+        guard item.id.hasPrefix("workshop_") else { return nil }
+        guard let record = mediaLibrary.downloadRecord(for: item.id), record.isActive else {
+            return (false, nil)
+        }
+
+        let workshopID = String(item.id.dropFirst("workshop_".count))
+        do {
+            guard let remote = try await workshopService.fetchWorkshopRemoteUpdateInfo(workshopID: workshopID) else {
+                return (false, nil)
+            }
+
+            // 优先对比下载时记录的 Steam time_updated；老记录无此字段时退回 downloadedAt。
+            let baseline = record.item.updatedAt ?? record.downloadedAt
+            let hasUpdate = remote.updatedAt > baseline.addingTimeInterval(1)
+
+            if !hasUpdate, record.item.updatedAt == nil || record.item.fileSize == nil {
+                // 历史记录补齐元数据，后续比较更稳
+                let patched = mediaItemByUpdatingRemoteMetadata(
+                    record.item,
+                    updatedAt: remote.updatedAt,
+                    fileSize: remote.fileSize
+                )
+                mediaLibrary.upsert(patched)
+            }
+
+            return (hasUpdate, remote.updatedAt)
+        } catch {
+            AppLogger.info(.download, "Workshop 更新检查失败", metadata: [
+                "id": item.id,
+                "error": error.localizedDescription
+            ])
+            return nil
+        }
+    }
+
+    /// 删除本地 Workshop 包后重新下载（覆盖为最新版）。
+    /// 调用方应先停掉正在播放的该壁纸。
+    func updateWorkshopWallpaper(_ item: MediaItem, guardCode: String? = nil) async throws {
+        guard item.id.hasPrefix("workshop_") else {
+            throw WorkshopError.workshopNotSupported
+        }
+
+        let folderID = mediaLibrary.downloadRecord(for: item.id)?.folderID
+        // 先拉远端元数据，下载成功后写入最新 updatedAt
+        var itemToDownload = item
+        let workshopID = String(item.id.dropFirst("workshop_".count))
+        if let remote = try? await workshopService.fetchWorkshopRemoteUpdateInfo(workshopID: workshopID) {
+            itemToDownload = mediaItemByUpdatingRemoteMetadata(
+                item,
+                updatedAt: remote.updatedAt,
+                fileSize: remote.fileSize
+            )
+        }
+
+        mediaLibrary.removeDownloadRecord(withID: item.id)
+        try await downloadWorkshopWallpaper(itemToDownload, guardCode: guardCode, folderID: folderID)
+    }
+
+    private func mediaItemByUpdatingRemoteMetadata(
+        _ item: MediaItem,
+        updatedAt: Date?,
+        fileSize: Int64?
+    ) -> MediaItem {
+        MediaItem(
+            slug: item.slug,
+            title: item.title,
+            pageURL: item.pageURL,
+            thumbnailURL: item.thumbnailURL,
+            resolutionLabel: item.resolutionLabel,
+            collectionTitle: item.collectionTitle,
+            summary: item.summary,
+            previewVideoURL: item.previewVideoURL,
+            posterURL: item.posterURL,
+            tags: item.tags,
+            exactResolution: item.exactResolution,
+            durationSeconds: item.durationSeconds,
+            downloadOptions: item.downloadOptions,
+            sourceName: item.sourceName,
+            isAnimatedImage: item.isAnimatedImage,
+            subscriptionCount: item.subscriptionCount,
+            favoriteCount: item.favoriteCount,
+            viewCount: item.viewCount,
+            ratingScore: item.ratingScore,
+            authorName: item.authorName,
+            authorSteamID: item.authorSteamID,
+            authorAvatarURL: item.authorAvatarURL,
+            fileSize: fileSize ?? item.fileSize,
+            createdAt: item.createdAt,
+            updatedAt: updatedAt ?? item.updatedAt
+        )
     }
 
     // MARK: - 通过 URL 解析项目
@@ -2349,6 +2542,19 @@ final class MediaExploreViewModel: ObservableObject {
     func resolveDongTaiItemByURL(_ urlString: String) async throws -> MediaItem {
         let item = try await dynamicWallpaperService.resolveItemByOSSURL(urlString)
         print("[MediaExploreViewModel] resolveDongTaiItemByURL success: \(item.id) - \(item.title)")
+        return item
+    }
+
+    /// 解析 Wallsflow 详情页链接并返回 MediaItem
+    func resolveWallsflowItemByURL(_ urlString: String) async throws -> MediaItem {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let host = url.host?.lowercased(),
+              host.contains("wallsflow.com") else {
+            throw WorkshopError.invalidURL
+        }
+        let item = try await wallsflowService.fetchDetail(url: url)
+        print("[MediaExploreViewModel] resolveWallsflowItemByURL success: \(item.id) - \(item.title)")
         return item
     }
 

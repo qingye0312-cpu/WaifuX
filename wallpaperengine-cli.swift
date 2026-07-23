@@ -18,6 +18,32 @@ extension NSScreen {
         }
         return localizedName + ":\(frame.origin.x):\(frame.origin.y)"
     }
+
+    /// 与主 App `WallpaperScreenIdentity.orderedScreens` 保持一致：
+    /// 主屏优先、从左到右、从上到下。CLI 索引必须与 App 侧一致，
+    /// 否则 sleep/wake 后 `NSScreen.screens` 打乱会导致 Web 壁纸落到错误显示器。
+    static var screensOrderedForDisplay: [NSScreen] {
+        let screens = NSScreen.screens
+        let mainID = NSScreen.main?.wallpaperScreenIdentifier
+        return screens.sorted { lhs, rhs in
+            let lhsIsMain = lhs.wallpaperScreenIdentifier == mainID
+            let rhsIsMain = rhs.wallpaperScreenIdentifier == mainID
+            if lhsIsMain != rhsIsMain {
+                return lhsIsMain
+            }
+            let lx = lhs.frame.origin.x
+            let rx = rhs.frame.origin.x
+            if abs(lx - rx) > 0.5 {
+                return lx < rx
+            }
+            let ly = lhs.frame.origin.y
+            let ry = rhs.frame.origin.y
+            if abs(ly - ry) > 0.5 {
+                return lhs.frame.maxY > rhs.frame.maxY
+            }
+            return lhs.wallpaperScreenIdentifier < rhs.wallpaperScreenIdentifier
+        }
+    }
 }
 
 // MARK: - Constants
@@ -41,6 +67,31 @@ private func isDynamicLockScreenEnabledForCurrentLaunch() -> Bool {
     let rawValue = ProcessInfo.processInfo.environment["WAIFUX_DYNAMIC_LOCK_SCREEN_ENABLED"]?
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
+    return rawValue == "1" || rawValue == "true" || rawValue == "yes"
+}
+
+/// 与 App「系统壁纸同步」开关对齐。
+/// 优先读热更新控制文件（App 改开关后立刻生效），再回退到启动环境变量；都没有则默认开启。
+private let systemWallpaperSyncControlPath = "/tmp/waifux-system-wallpaper-sync.json"
+
+private func isSystemWallpaperSyncEnabledForCurrentLaunch() -> Bool {
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: systemWallpaperSyncControlPath)),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if let enabled = obj["enabled"] as? Bool {
+            return enabled
+        }
+        if let n = obj["enabled"] as? NSNumber {
+            return n.boolValue
+        }
+        if let s = obj["enabled"] as? String {
+            let v = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return v == "1" || v == "true" || v == "yes"
+        }
+    }
+    let rawValue = ProcessInfo.processInfo.environment["WAIFUX_SYSTEM_WALLPAPER_SYNC_ENABLED"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    if rawValue == nil || rawValue?.isEmpty == true { return true }
     return rawValue == "1" || rawValue == "true" || rawValue == "yes"
 }
 
@@ -107,6 +158,16 @@ private func waifuXGrayscaleThumb(from cgImage: CGImage, dimension: Int) -> [UIn
 // MARK: - IPC
 private enum IPCCommand: String, Codable {
     case set, pause, resume, stop, applyProperties, audioControl, audioData
+    /// Host → daemon：系统 Now Playing 元数据（低频）
+    case mediaUpdate, mediaThumbnail
+    /// Host → daemon：Apple Music 歌词（整首 / 当前行）；Web 只收 JSON
+    case mediaLyrics, mediaLyricsLine
+}
+
+private struct IPCLyricLine: Codable {
+    let start: Double
+    let end: Double?
+    let text: String
 }
 
 private struct IPCMessage: Codable {
@@ -118,8 +179,68 @@ private struct IPCMessage: Codable {
     let volume: Double?
     /// WE 音频频谱（128 floats; 0..63 = L, 64..127 = R）；仅 `.audioData` 命令使用。
     let spectrum: [Float]?
+    // MARK: mediaUpdate / mediaThumbnail（可选字段，其它命令忽略）
+    let enabled: Bool?
+    let title: String?
+    let artist: String?
+    let albumTitle: String?
+    /// WE playback state: 0=STOPPED, 1=PLAYING, 2=PAUSED
+    let state: Int?
+    let position: Double?
+    let duration: Double?
+    let rate: Double?
+    /// data URL 或空字符串
+    let thumbnail: String?
+    // MARK: mediaLyrics / mediaLyricsLine
+    let hasLyrics: Bool?
+    let songId: String?
+    let storefront: String?
+    let source: String?
+    let lineCount: Int?
+    let lines: [IPCLyricLine]?
+    let index: Int?
+    let text: String?
+    let nextText: String?
+    let previousText: String?
+    let start: Double?
+    let end: Double?
+    let progress: Double?
+    let elapsedTime: Double?
+    let hasLine: Bool?
 
-    init(command: IPCCommand, path: String?, screen: Int?, propertiesJSON: String? = nil, muted: Bool? = nil, volume: Double? = nil, spectrum: [Float]? = nil) {
+    init(
+        command: IPCCommand,
+        path: String?,
+        screen: Int?,
+        propertiesJSON: String? = nil,
+        muted: Bool? = nil,
+        volume: Double? = nil,
+        spectrum: [Float]? = nil,
+        enabled: Bool? = nil,
+        title: String? = nil,
+        artist: String? = nil,
+        albumTitle: String? = nil,
+        state: Int? = nil,
+        position: Double? = nil,
+        duration: Double? = nil,
+        rate: Double? = nil,
+        thumbnail: String? = nil,
+        hasLyrics: Bool? = nil,
+        songId: String? = nil,
+        storefront: String? = nil,
+        source: String? = nil,
+        lineCount: Int? = nil,
+        lines: [IPCLyricLine]? = nil,
+        index: Int? = nil,
+        text: String? = nil,
+        nextText: String? = nil,
+        previousText: String? = nil,
+        start: Double? = nil,
+        end: Double? = nil,
+        progress: Double? = nil,
+        elapsedTime: Double? = nil,
+        hasLine: Bool? = nil
+    ) {
         self.command = command
         self.path = path
         self.screen = screen
@@ -127,6 +248,30 @@ private struct IPCMessage: Codable {
         self.muted = muted
         self.volume = volume
         self.spectrum = spectrum
+        self.enabled = enabled
+        self.title = title
+        self.artist = artist
+        self.albumTitle = albumTitle
+        self.state = state
+        self.position = position
+        self.duration = duration
+        self.rate = rate
+        self.thumbnail = thumbnail
+        self.hasLyrics = hasLyrics
+        self.songId = songId
+        self.storefront = storefront
+        self.source = source
+        self.lineCount = lineCount
+        self.lines = lines
+        self.index = index
+        self.text = text
+        self.nextText = nextText
+        self.previousText = previousText
+        self.start = start
+        self.end = end
+        self.progress = progress
+        self.elapsedTime = elapsedTime
+        self.hasLine = hasLine
     }
 }
 
@@ -422,10 +567,12 @@ private func readWebWallpaperUserPropertiesJSON(contentDir: URL) -> String? {
 // MARK: - Web Renderer Bridge (WKWebView-based HTML wallpaper)
 private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     static let shared = WebRendererBridge()
+    static let offlineBakeScreen = -1
 
-    /// 对齐 [Wallpaper Engine Web 文档](https://docs.wallpaperengine.io/en/web/api/propertylistener.html) 等：提供 `wallpaperRegisterAudioListener`、
-    /// 媒体集成注册函数与 `wallpaperMediaIntegration` 命名空间。无系统音频捕获时音频为全零；媒体集成默认 `enabled: false`。
-    /// 避免壁纸脚本因 `undefined is not a function` 整页中断。
+    /// 对齐 Wallpaper Engine Web 文档：`wallpaperRegisterAudioListener`、Media Integration
+    /// 注册函数与 `wallpaperMediaIntegration` 命名空间。
+    /// 音频由 Host `__wxUpdateAudioBuf` 注入；媒体元数据由 `__wxPushMediaUpdate` / `__wxPushMediaThumbnail` 注入。
+    /// 注册 listener 时回放最近一次状态，避免壁纸晚于推送注册而丢首帧。
     private static let wallpaperEngineWebAPIShim = WKUserScript(
         source: """
         (function() {
@@ -440,7 +587,6 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             window.wallpaperRegisterAudioListener = function(cb) {
               if (typeof cb === 'function') __wxAudioCbs.push(cb);
             };
-            // 暴露给 Swift 侧注入真实音频 FFT 数据
             window.__wxUpdateAudioBuf = function(arr) {
               if (arr && arr.length) {
                 __wxAudioEnabled = true;
@@ -453,7 +599,6 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 }
               }
             };
-            // Fallback：无真实音频时维持旧行为（全零），或做 idle 动画
             setInterval(function() {
               if (!__wxAudioEnabled || Date.now() - __wxLastAudioAt > 500) {
                 for (var i = 0; i < __wxAudioBuf.length; i++) __wxAudioBuf[i] = 0;
@@ -462,19 +607,131 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 try { __wxAudioCbs[j](__wxAudioBuf); } catch (e) {}
               }
             }, 33);
+
+            // ---- Media Integration ----
+            var __wxMedia = {
+              status: [], properties: [], thumbnail: [], playback: [], timeline: [], lyrics: [], lyricsLine: []
+            };
+            var __wxMediaState = {
+              enabled: false,
+              title: "",
+              artist: "",
+              albumTitle: "",
+              state: 0,
+              position: 0,
+              duration: 0,
+              rate: 1,
+              thumbnail: "",
+              lyrics: null,
+              lyricsLine: null
+            };
+            function __wxFire(list, payload) {
+              for (var i = 0; i < list.length; i++) {
+                try { list[i](payload); } catch (e) {}
+              }
+            }
             window.wallpaperRegisterMediaStatusListener = function(cb) {
-              if (typeof cb === 'function') {
-                try { cb({ enabled: false }); } catch (e) {}
-              }
+              if (typeof cb !== 'function') return;
+              __wxMedia.status.push(cb);
+              try { cb({ enabled: !!__wxMediaState.enabled }); } catch (e) {}
             };
-            window.wallpaperRegisterMediaPropertiesListener = function(cb) {};
-            window.wallpaperRegisterMediaThumbnailListener = function(cb) {};
+            window.wallpaperRegisterMediaPropertiesListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.properties.push(cb);
+              try {
+                cb({
+                  title: __wxMediaState.title || "",
+                  artist: __wxMediaState.artist || "",
+                  albumTitle: __wxMediaState.albumTitle || "",
+                  subTitle: __wxMediaState.artist || ""
+                });
+              } catch (e) {}
+            };
+            window.wallpaperRegisterMediaThumbnailListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.thumbnail.push(cb);
+              try { cb({ thumbnail: __wxMediaState.thumbnail || "" }); } catch (e) {}
+            };
             window.wallpaperRegisterMediaPlaybackListener = function(cb) {
-              if (typeof cb === 'function') {
-                try { cb({ state: window.wallpaperMediaIntegration.playback.STOPPED }); } catch (e) {}
+              if (typeof cb !== 'function') return;
+              __wxMedia.playback.push(cb);
+              try { cb({ state: __wxMediaState.state|0 }); } catch (e) {}
+            };
+            window.wallpaperRegisterMediaTimelineListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.timeline.push(cb);
+              try {
+                cb({
+                  position: __wxMediaState.position||0,
+                  duration: __wxMediaState.duration||0
+                });
+              } catch (e) {}
+            };
+            window.wallpaperRegisterMediaLyricsListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.lyrics.push(cb);
+              try { if (__wxMediaState.lyrics) cb(__wxMediaState.lyrics); } catch (e) {}
+            };
+            window.wallpaperRegisterMediaLyricsLineListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.lyricsLine.push(cb);
+              try { if (__wxMediaState.lyricsLine) cb(__wxMediaState.lyricsLine); } catch (e) {}
+            };
+            // UTF-8 安全：JSON.parse(atob(b64)) 会把多字节中文解成 Latin-1 乱码。
+            // 正确：atob → 字节数组 → TextDecoder('utf-8') → JSON.parse
+            window.__wxParseB64JSON = function(b64) {
+              if (!b64) return null;
+              try {
+                var bin = atob(b64);
+                var bytes = new Uint8Array(bin.length);
+                for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xff;
+                var text = (typeof TextDecoder !== 'undefined')
+                  ? new TextDecoder('utf-8').decode(bytes)
+                  : decodeURIComponent(escape(bin));
+                return JSON.parse(text);
+              } catch (e) {
+                try { return JSON.parse(atob(b64)); } catch (e2) { return null; }
               }
             };
-            window.wallpaperRegisterMediaTimelineListener = function(cb) {};
+            // Host 注入：整包媒体状态
+            window.__wxPushMediaUpdate = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              if (typeof obj.enabled === 'boolean') __wxMediaState.enabled = obj.enabled;
+              if (typeof obj.title === 'string') __wxMediaState.title = obj.title;
+              if (typeof obj.artist === 'string') __wxMediaState.artist = obj.artist;
+              if (typeof obj.albumTitle === 'string') __wxMediaState.albumTitle = obj.albumTitle;
+              if (typeof obj.state === 'number') __wxMediaState.state = obj.state;
+              if (typeof obj.position === 'number') __wxMediaState.position = obj.position;
+              if (typeof obj.duration === 'number') __wxMediaState.duration = obj.duration;
+              if (typeof obj.rate === 'number') __wxMediaState.rate = obj.rate;
+              __wxFire(__wxMedia.status, { enabled: !!__wxMediaState.enabled });
+              __wxFire(__wxMedia.properties, {
+                title: __wxMediaState.title || "",
+                artist: __wxMediaState.artist || "",
+                albumTitle: __wxMediaState.albumTitle || "",
+                subTitle: __wxMediaState.artist || ""
+              });
+              __wxFire(__wxMedia.playback, { state: __wxMediaState.state|0 });
+              __wxFire(__wxMedia.timeline, {
+                position: __wxMediaState.position||0,
+                duration: __wxMediaState.duration||0
+              });
+            };
+            window.__wxPushMediaThumbnail = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.thumbnail = (typeof obj.thumbnail === 'string') ? obj.thumbnail : "";
+              __wxFire(__wxMedia.thumbnail, { thumbnail: __wxMediaState.thumbnail });
+            };
+            window.__wxPushMediaLyrics = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.lyrics = obj;
+              __wxFire(__wxMedia.lyrics, obj);
+            };
+            window.__wxPushMediaLyricsLine = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.lyricsLine = obj;
+              __wxFire(__wxMedia.lyricsLine, obj);
+            };
           } catch (e) {}
         })();
         """,
@@ -484,12 +741,35 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     /// `file://` 壁纸常见兼容问题：
     /// 1) Spine 等库对 `HTMLImageElement` 设置 `crossOrigin = "anonymous"`，WebKit 在本地文件场景下会拒绝加载同目录纹理 → 画面空白。
-    /// 2) 部分 Workshop 脚本用 `fetch()` 读相对路径 JSON，在 `file` 协议下可能失败；XHR 更稳。
+    /// 2) 部分 Workshop 脚本用 `fetch()` 读相对路径 JSON / `.splat` 等二进制资源；
+    ///    原生 `fetch(file://...)` 常返回 status=0 或直接失败。
+    ///    尤其是 `fetch(new URL("test.splat", location.href))` 传入的是 URL 对象：
+    ///    旧兼容层只识别 string / Request.url，漏掉了 URL.href，导致仍走原生 fetch。
+    ///    改走 XHR，并把 file:// 的 status 0 规范成 200，保证 body.getReader() 可用。
     private static let localFileCompatScript = WKUserScript(
         source: """
         (function() {
           try {
             if (location.protocol !== "file:") return;
+
+            function resolveFetchURL(input) {
+              if (typeof input === "string") return input;
+              if (!input) return "";
+              // URL 用 .href；Request 用 .url
+              if (typeof input.href === "string" && input.href) return input.href;
+              if (typeof input.url === "string" && input.url) return input.url;
+              try { return String(input); } catch (e) { return ""; }
+            }
+
+            function isLocalNonHTTPURL(url) {
+              if (!url) return false;
+              var lower = String(url).toLowerCase();
+              if (lower.indexOf("http:") === 0 || lower.indexOf("https:") === 0) return false;
+              if (lower.indexOf("data:") === 0 || lower.indexOf("blob:") === 0) return false;
+              // 相对路径 / file:// / 其他本地 scheme
+              return true;
+            }
+
             var proto = HTMLImageElement.prototype;
             var srcDesc = Object.getOwnPropertyDescriptor(proto, "src");
             if (srcDesc && srcDesc.set) {
@@ -497,7 +777,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 set: function(value) {
                   try {
                     var s = String(value || "");
-                    if (s.indexOf("http:") !== 0 && s.indexOf("https:") !== 0 && s.indexOf("data:") !== 0 && s.indexOf("blob:") !== 0) {
+                    if (isLocalNonHTTPURL(s)) {
                       this.removeAttribute("crossorigin");
                     }
                   } catch (e) {}
@@ -507,33 +787,55 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 configurable: true
               });
             }
+
             var origFetch = window.fetch;
             if (typeof origFetch === "function") {
               window.fetch = function(input, init) {
-                var url = typeof input === "string" ? input : (input && input.url) ? input.url : "";
-                if (url && url.indexOf("http:") !== 0 && url.indexOf("https:") !== 0 && url.indexOf("data:") !== 0 && url.indexOf("blob:") !== 0) {
+                var url = resolveFetchURL(input);
+                if (isLocalNonHTTPURL(url)) {
                   return new Promise(function(resolve, reject) {
-                    var xhr = new XMLHttpRequest();
-                    xhr.open("GET", url, true);
-                    xhr.responseType = "arraybuffer";
-                    xhr.onload = function() {
-                      if (xhr.status === 200 || xhr.status === 0) {
-                        var headers = new Headers();
-                        try {
-                          var contentType = xhr.getResponseHeader("Content-Type");
-                          if (contentType) headers.set("Content-Type", contentType);
-                        } catch (e) {}
-                        resolve(new Response(xhr.response, {
-                          status: xhr.status === 0 ? 200 : xhr.status,
-                          statusText: xhr.statusText || "OK",
-                          headers: headers
-                        }));
-                      } else {
-                        reject(new Error("HTTP " + xhr.status));
-                      }
-                    };
-                    xhr.onerror = function() { reject(new Error("network error")); };
-                    xhr.send();
+                    try {
+                      var xhr = new XMLHttpRequest();
+                      // 显式串化，避免某些 WebKit 对 URL 对象 open 行为不一致
+                      xhr.open("GET", String(url), true);
+                      xhr.responseType = "arraybuffer";
+                      xhr.onload = function() {
+                        // file:// 成功时常为 status 0；部分环境也可能给 200
+                        if (xhr.status === 200 || xhr.status === 0) {
+                          var headers = new Headers();
+                          try {
+                            var contentType = xhr.getResponseHeader("Content-Type");
+                            if (contentType) headers.set("Content-Type", contentType);
+                            var contentLength = xhr.getResponseHeader("Content-Length");
+                            if (contentLength) headers.set("Content-Length", contentLength);
+                          } catch (e) {}
+                          // 无 Content-Type 时给二进制默认值，避免部分库误判
+                          if (!headers.has("Content-Type")) {
+                            headers.set("Content-Type", "application/octet-stream");
+                          }
+                          var body = xhr.response || new ArrayBuffer(0);
+                          if (!headers.has("Content-Length") && body && typeof body.byteLength === "number") {
+                            headers.set("Content-Length", String(body.byteLength));
+                          }
+                          resolve(new Response(body, {
+                            status: 200,
+                            statusText: "OK",
+                            headers: headers
+                          }));
+                        } else {
+                          reject(new Error("HTTP " + xhr.status + " Unable to load " + url));
+                        }
+                      };
+                      xhr.onerror = function() {
+                        reject(new Error("0 Unable to load " + url));
+                      };
+                      xhr.onabort = function() {
+                        reject(new Error("Aborted loading " + url));
+                      };
+                      xhr.send();
+                    } catch (e) {
+                      reject(e);
+                    }
                   });
                 }
                 return origFetch.call(this, input, init);
@@ -611,6 +913,174 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 this.lastDownTarget = null;
               }
             }
+          };
+        })();
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false
+    )
+
+    /// Offline bake 虚拟时钟：把动画时间与墙钟解耦。
+    ///
+    /// 关键：Spine 等用 **rAF 回调参数 timestamp**（不是 performance.now）算 delta。
+    /// 因此 documentStart 即包装 rAF：仍走浏览器调度，但回调拿到的是虚拟 contentMs。
+    /// - setContentTime 推进 contentMs 后，下一次真实 rAF 看到非零 dt → 动画前进一步
+    /// - 抓帧等待期间 contentMs 不变 → 多次 rAF 的 dt=0 → 动画冻结，不会超速
+    /// - 同时对齐 performance.now / Date.now / timer / media
+    private static let offlineBakeClockScript = WKUserScript(
+        source: """
+        (function() {
+          'use strict';
+          if (window.__wxBakeClock) return;
+          var contentMs = 0;
+          var startMs = 0;
+          /// Real wall epoch ms corresponding to contentMs==startMs (Date.now must stay epoch-based).
+          var epochAtStart = 0;
+          var running = false;
+          var timerId = 1;
+          var timers = Object.create(null);
+          var origRAF = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : null;
+          var origCAF = window.cancelAnimationFrame ? window.cancelAnimationFrame.bind(window) : null;
+          var origSTO = window.setTimeout.bind(window);
+          var origDateNow = Date.now.bind(Date);
+          var origPerfNow = (window.performance && performance.now)
+            ? performance.now.bind(performance) : function() { return origDateNow(); };
+
+          function nowMs() {
+            return running ? contentMs : origPerfNow();
+          }
+
+          function epochNowMs() {
+            return running ? (epochAtStart + (contentMs - startMs)) : origDateNow();
+          }
+
+          function flushTimers() {
+            var ids = Object.keys(timers);
+            for (var i = 0; i < ids.length; i++) {
+              var id = ids[i];
+              var t = timers[id];
+              if (!t) continue;
+              if (contentMs + 1e-6 < t.fireAt) continue;
+              try { t.fn.apply(null, t.args || []); } catch (e) {}
+              if (t.interval > 0) {
+                t.fireAt = contentMs + t.interval;
+                while (t.fireAt <= contentMs) t.fireAt += t.interval;
+              } else {
+                delete timers[id];
+              }
+            }
+          }
+
+          function syncMedia() {
+            var sec = (contentMs - startMs) / 1000.0;
+            try {
+              var nodes = document.querySelectorAll('video,audio');
+              for (var i = 0; i < nodes.length; i++) {
+                var el = nodes[i];
+                try {
+                  if (el.paused) {
+                    var p = el.play();
+                    if (p && typeof p.catch === 'function') p.catch(function(){});
+                  }
+                  if (isFinite(el.duration) && el.duration > 0) {
+                    var target = sec % el.duration;
+                    if (!isFinite(el.currentTime) || Math.abs(el.currentTime - target) > 0.04) {
+                      el.currentTime = target;
+                    }
+                  } else if (!isFinite(el.currentTime) || Math.abs(el.currentTime - sec) > 0.04) {
+                    el.currentTime = sec;
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {}
+          }
+
+          // Always wrap rAF so bake mode can inject virtual timestamps.
+          // Before enable: pass browser timestamp through. After: pass contentMs.
+          if (origRAF) {
+            window.requestAnimationFrame = function(cb) {
+              return origRAF(function(realT) {
+                var t = running ? contentMs : realT;
+                try { cb(t); } catch (e) {}
+              });
+            };
+          }
+          if (origCAF) {
+            window.cancelAnimationFrame = function(id) {
+              try { origCAF(id); } catch (e) {}
+            };
+          }
+
+          window.__wxBakeClock = {
+            enable: function() {
+              if (running) return true;
+              // Freeze content timeline at current wall time; subsequent setContentTime advances both.
+              contentMs = origPerfNow();
+              startMs = contentMs;
+              epochAtStart = origDateNow();
+              running = true;
+              try {
+                if (window.performance && typeof Object.defineProperty === 'function') {
+                  Object.defineProperty(window.performance, 'now', {
+                    configurable: true,
+                    writable: true,
+                    value: function() { return nowMs(); }
+                  });
+                }
+              } catch (e) {
+                try { performance.now = function() { return nowMs(); }; } catch (e2) {}
+              }
+              // Spine TimeKeeper uses Date.now()/1e3 — must remain epoch milliseconds.
+              try { Date.now = function() { return Math.floor(epochNowMs()); }; } catch (e) {}
+              window.setTimeout = function(fn, delay) {
+                var id = timerId++;
+                var ms = (typeof delay === 'number' && isFinite(delay)) ? Math.max(0, delay) : 0;
+                var args = [].slice.call(arguments, 2);
+                timers[id] = { fn: fn, fireAt: contentMs + ms, interval: 0, args: args };
+                return id;
+              };
+              window.clearTimeout = function(id) { delete timers[id]; };
+              window.setInterval = function(fn, delay) {
+                var id = timerId++;
+                var ms = (typeof delay === 'number' && isFinite(delay) && delay > 0) ? delay : 1;
+                var args = [].slice.call(arguments, 2);
+                timers[id] = { fn: fn, fireAt: contentMs + ms, interval: ms, args: args };
+                return id;
+              };
+              window.clearInterval = function(id) { delete timers[id]; };
+              return true;
+            },
+            /// Absolute content timeline offset from enable (ms). Frame N → N * (1000/fps).
+            setContentTime: function(ms) {
+              if (!running) this.enable();
+              var offset = Math.max(0, Number(ms) || 0);
+              contentMs = startMs + offset;
+              flushTimers();
+              syncMedia();
+              return contentMs - startMs;
+            },
+            /// Wait for `count` real animation frames after time advance (lets Spine/WebGL paint).
+            afterFrames: function(count, token) {
+              count = Math.max(1, count | 0);
+              return new Promise(function(resolve) {
+                if (!origRAF) {
+                  origSTO(function() { resolve(token || 0); }, 16);
+                  return;
+                }
+                var left = count;
+                function step() {
+                  left -= 1;
+                  if (left <= 0) {
+                    resolve(token || 0);
+                    return;
+                  }
+                  origRAF(step);
+                }
+                origRAF(step);
+              });
+            },
+            getContentTime: function() { return contentMs - startMs; },
+            isEnabled: function() { return running; }
           };
         })();
         """,
@@ -728,8 +1198,11 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         var extractedPKGDir: URL?
         var mergedDependencyDir: URL?
         var injectedPropertiesJSON: String?
+        /// 每次 load/stop 递增。首帧 settle 与 30s 超时回调必须比对 generation，
+        /// 否则旧 load 的 asyncAfter 会误杀后续 set 的 pendingCompletion（exit=1 竞态）。
         var firstFrameSettleGeneration: UInt64 = 0
         var isLoaded: Bool = false
+        var isOffscreen: Bool = false
         var mouseEventMonitors: [Any] = []
         var lastMouseMoveTime: TimeInterval = 0
     }
@@ -739,7 +1212,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     private enum FirstFramePolicy {
         /// 至少经历此时长后才允许「稳定」判真，避免白屏/首帧未绘制误判
-        static let minElapsed: TimeInterval = 1.05
+        static let minElapsed: TimeInterval = 3.0
         /// 含加载动画时最长等到此时长，取最后一帧作为首帧
         static let maxElapsed: TimeInterval = 24
         static let pollInterval: TimeInterval = 0.5
@@ -750,41 +1223,69 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         static let thumbDimension: Int = 48
     }
 
-    func loadWallpaper(path: String, width: Int, height: Int, screen: Int? = nil, completion: ((Bool) -> Void)? = nil) {
-        // 解析目标屏幕索引
-        let screens = NSScreen.screens
+    func loadWallpaper(
+        path: String,
+        width: Int,
+        height: Int,
+        screen: Int? = nil,
+        offscreen: Bool = false,
+        userPropertiesJSON: String? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        // 解析目标屏幕索引（与 App 共用稳定顺序，禁止依赖系统枚举）
+        let screens = NSScreen.screensOrderedForDisplay
         let screenIdx: Int
-        if let s = screen, s >= 0, s < screens.count {
+        if offscreen {
+            screenIdx = Self.offlineBakeScreen
+        } else if let s = screen, s >= 0, s < screens.count {
             screenIdx = s
-        } else if let main = NSScreen.main, let mainIdx = screens.firstIndex(of: main) {
+        } else if let main = NSScreen.main,
+                  let mainIdx = screens.firstIndex(where: {
+                      $0.wallpaperScreenIdentifier == main.wallpaperScreenIdentifier
+                  }) {
             screenIdx = mainIdx
         } else {
             screenIdx = 0
         }
 
+        // 先保留旧 generation 再 stop：stop 会 fail 旧 pendingCompletion 并 +1 generation
+        let previousGeneration = screenStates[screenIdx]?.firstFrameSettleGeneration ?? 0
         stop(screen: screenIdx) // 只清理目标屏幕的旧状态
+        // stop 后可能仍留下空 state；统一重建，并分配本代 loadGeneration
+        let loadGeneration = max(previousGeneration, screenStates[screenIdx]?.firstFrameSettleGeneration ?? 0) &+ 1
         screenStates[screenIdx] = ScreenState()
+        screenStates[screenIdx]?.firstFrameSettleGeneration = loadGeneration
         screenStates[screenIdx]?.pendingCompletion = completion
+        screenStates[screenIdx]?.isOffscreen = offscreen
 
-        // 超时安全网：30 秒后如果 pendingCompletion 仍在，强制回调防止 IPC 响应永远不发回
-        // （与 App 侧 WallpaperEngineXBridge 的 30s 超时对齐）
+        // 超时安全网：30 秒后如果本代 load 的 pendingCompletion 仍在，强制回调防止 IPC 卡死。
+        // 必须比对 firstFrameSettleGeneration：否则前一次 set 的 30s 定时器会误杀下一次 set。
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-            guard let self, let state = self.screenStates[screenIdx],
-                  state.pendingCompletion != nil else { return }
-            dlog("[WebRendererBridge] ⚠️ loadWallpaper 30s timeout, forcing completion for screen \(screenIdx)")
-            state.pendingCompletion?(false)
+            guard let self else { return }
+            guard let state = self.screenStates[screenIdx],
+                  state.firstFrameSettleGeneration == loadGeneration,
+                  let pending = state.pendingCompletion else { return }
+            let alreadyLoaded = state.isLoaded
+            dlog("[WebRendererBridge] ⚠️ loadWallpaper 30s timeout screen=\(screenIdx) gen=\(loadGeneration) isLoaded=\(alreadyLoaded)")
+            // 页面已 didFinish 但首帧 settle 过慢：仍视为成功，避免大体积 Web 壁纸误报 exit=1
+            pending(alreadyLoaded)
             self.screenStates[screenIdx]?.pendingCompletion = nil
+            if !alreadyLoaded {
+                self.screenStates[screenIdx]?.firstFrameSettleGeneration &+= 1
+            }
         }
 
         guard let (baseURL, indexFile) = resolveWebWallpaperEntry(path: path) else {
             dlog("[WebRendererBridge] Failed to resolve web wallpaper entry for \(path)")
+            screenStates[screenIdx]?.pendingCompletion = nil
             completion?(false)
             return
         }
 
-        screenStates[screenIdx]?.injectedPropertiesJSON = readWebWallpaperUserPropertiesJSON(contentDir: baseURL)
+        screenStates[screenIdx]?.injectedPropertiesJSON = userPropertiesJSON
+            ?? readWebWallpaperUserPropertiesJSON(contentDir: baseURL)
         if screenStates[screenIdx]?.injectedPropertiesJSON != nil {
-            dlog("[WebRendererBridge] Loaded user properties from project.json for injection")
+            dlog("[WebRendererBridge] Loaded user properties for injection")
         }
 
         // 记录临时目录以便 stop 时清理
@@ -800,6 +1301,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         } else if let main = NSScreen.main {
             targetScreen = main
         } else {
+            screenStates[screenIdx]?.pendingCompletion = nil
             completion?(false)
             return
         }
@@ -812,14 +1314,21 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             defer: false
         )
         let desktopLevel = CGWindowLevelForKey(.desktopWindow)
-        w.level = .init(rawValue: Int(desktopLevel))
+        w.level = .init(rawValue: Int(desktopLevel) + (offscreen ? 1 : 0))
         w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         w.isOpaque = false
         w.backgroundColor = .clear
         w.hasShadow = false
-        w.setFrame(targetScreen.frame, display: true)
+        if offscreen {
+            // WebGL needs a display-backed surface. Keep it fully transparent
+            // above the desktop so Finder's desktop contents are never replaced.
+            w.setFrame(targetScreen.frame, display: false)
+            w.alphaValue = 0
+        } else {
+            w.setFrame(targetScreen.frame, display: true)
+        }
         w.acceptsMouseMovedEvents = true
-        w.ignoresMouseEvents = false
+        w.ignoresMouseEvents = offscreen
         w.isReleasedWhenClosed = false
 
         // 配置 WKWebView
@@ -830,6 +1339,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         ucc.addUserScript(Self.localFileCompatScript)
         ucc.addUserScript(Self.mouseEventBridgeScript)
         ucc.addUserScript(Self.audioWrapperScript)
+        // Offline bake: virtual content clock so sparse wall-clock snapshots still yield dense animation frames.
+        if offscreen {
+            ucc.addUserScript(Self.offlineBakeClockScript)
+        }
         config.userContentController = ucc
         if #available(macOS 14.0, *) {
             config.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -857,7 +1370,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         web.loadFileURL(fileURL, allowingReadAccessTo: readAccessURL)
         w.orderBack(nil)
 
-        dlog("[WebRendererBridge] Loading web wallpaper: \(fileURL.path) on screen \(screenIdx) (\(targetScreen.localizedName))")
+        let destination = offscreen ? "offscreen bake surface" : "screen \(screenIdx) (\(targetScreen.localizedName))"
+        dlog("[WebRendererBridge] Loading web wallpaper: \(fileURL.path) on \(destination)")
     }
 
     /// 自动检测并修复 Spine 动画壁纸缺失的 .config.json。
@@ -921,7 +1435,11 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         runWebWallpaperBootstrap(screen: s) { [weak self] in
             guard let self = self else { return }
             self.beginSettlingFirstFrame(screen: s)
-            self.startMouseEventBridge(for: s)
+            // Offline bake surfaces are full-screen transparent windows; never bridge
+            // mouse into them or the bake will follow the cursor / parallax props.
+            if self.screenStates[s]?.isOffscreen != true {
+                self.startMouseEventBridge(for: s)
+            }
         }
         NSApp.setActivationPolicy(.prohibited)
     }
@@ -975,7 +1493,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             });
             window.dispatchEvent(new Event('resize'));
         """) { _, _ in }
-        startMouseEventBridge(for: screen)
+        if state.isOffscreen != true {
+            startMouseEventBridge(for: screen)
+        }
         NSApp.setActivationPolicy(.prohibited)
     }
 
@@ -1014,6 +1534,124 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 webView?.evaluateJavaScript(js) { _, error in
                     if let error { dlog("[WebRendererBridge] pushAudioFrame JS error: \(error)") }
                 }
+            }
+        }
+    }
+
+    /// 推送 Now Playing 元数据到所有已加载的 Web 壁纸。
+    /// 参数与 WE Media Integration 对齐；JSON 经 base64 注入避免转义问题。
+    func pushMediaUpdate(
+        enabled: Bool,
+        title: String,
+        artist: String,
+        albumTitle: String,
+        state: Int,
+        position: Double,
+        duration: Double,
+        rate: Double
+    ) {
+        let payload: [String: Any] = [
+            "enabled": enabled,
+            "title": title,
+            "artist": artist,
+            "albumTitle": albumTitle,
+            "state": state,
+            "position": position,
+            "duration": duration,
+            "rate": rate
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              case let b64 = data.base64EncodedString() else { return }
+        // 必须走 __wxParseB64JSON：裸 atob+JSON.parse 会把中文 title 解成 Latin-1 乱码
+        let js = "(function(){try{var o=(window.__wxParseB64JSON?window.__wxParseB64JSON('\(b64)'):JSON.parse(atob('\(b64)')));if(o&&window.__wxPushMediaUpdate)window.__wxPushMediaUpdate(o);}catch(e){}})();"
+        for (_, st) in screenStates where st.isLoaded {
+            guard let webView = st.webView else { continue }
+            DispatchQueue.main.async { [weak webView] in
+                webView?.evaluateJavaScript(js, completionHandler: nil)
+            }
+        }
+    }
+
+    func pushMediaThumbnail(_ thumbnail: String) {
+        let payload: [String: Any] = ["thumbnail": thumbnail]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              case let b64 = data.base64EncodedString() else { return }
+        let js = "(function(){try{var o=(window.__wxParseB64JSON?window.__wxParseB64JSON('\(b64)'):JSON.parse(atob('\(b64)')));if(o&&window.__wxPushMediaThumbnail)window.__wxPushMediaThumbnail(o);}catch(e){}})();"
+        for (_, st) in screenStates where st.isLoaded {
+            guard let webView = st.webView else { continue }
+            DispatchQueue.main.async { [weak webView] in
+                webView?.evaluateJavaScript(js, completionHandler: nil)
+            }
+        }
+    }
+
+
+    func pushMediaLyrics(
+        hasLyrics: Bool,
+        title: String,
+        artist: String,
+        songId: String,
+        storefront: String,
+        source: String,
+        lines: [IPCLyricLine]
+    ) {
+        var lineArr: [[String: Any]] = []
+        lineArr.reserveCapacity(lines.count)
+        for ln in lines {
+            var d: [String: Any] = ["start": ln.start, "text": ln.text]
+            if let end = ln.end { d["end"] = end }
+            lineArr.append(d)
+        }
+        let payload: [String: Any] = [
+            "hasLyrics": hasLyrics,
+            "title": title,
+            "artist": artist,
+            "songId": songId,
+            "storefront": storefront,
+            "source": source,
+            "lineCount": lines.count,
+            "lines": lineArr
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              case let b64 = data.base64EncodedString() else { return }
+        let js = "(function(){try{var o=(window.__wxParseB64JSON?window.__wxParseB64JSON('\(b64)'):JSON.parse(atob('\(b64)')));if(o&&window.__wxPushMediaLyrics)window.__wxPushMediaLyrics(o);}catch(e){}})();"
+        for (_, st) in screenStates where st.isLoaded {
+            guard let webView = st.webView else { continue }
+            DispatchQueue.main.async { [weak webView] in
+                webView?.evaluateJavaScript(js, completionHandler: nil)
+            }
+        }
+    }
+
+    func pushMediaLyricsLine(
+        index: Int,
+        text: String,
+        nextText: String,
+        previousText: String,
+        start: Double,
+        end: Double?,
+        progress: Double,
+        elapsedTime: Double,
+        hasLine: Bool
+    ) {
+        var payload: [String: Any] = [
+            "index": index,
+            "text": text,
+            "nextText": nextText,
+            "previousText": previousText,
+            "start": start,
+            "progress": progress,
+            "elapsedTime": elapsedTime,
+            "hasLine": hasLine
+        ]
+        if let end { payload["end"] = end }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              case let b64 = data.base64EncodedString() else { return }
+        let js = "(function(){try{var o=(window.__wxParseB64JSON?window.__wxParseB64JSON('\(b64)'):JSON.parse(atob('\(b64)')));if(o&&window.__wxPushMediaLyricsLine)window.__wxPushMediaLyricsLine(o);}catch(e){}})();"
+        for (_, st) in screenStates where st.isLoaded {
+            guard let webView = st.webView else { continue }
+            DispatchQueue.main.async { [weak webView] in
+                webView?.evaluateJavaScript(js, completionHandler: nil)
             }
         }
     }
@@ -1065,6 +1703,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     private func startMouseEventBridge(for screen: Int) {
         guard screenStates[screen]?.window != nil, screenStates[screen]?.webView != nil else { return }
+        // Bake / offscreen surfaces must not receive cursor parallax or click injection.
+        guard screenStates[screen]?.isOffscreen != true else { return }
         if !globalMouseMonitors.isEmpty { return }
         let eventTypes: [(NSEvent.EventTypeMask, String)] = [
             (.leftMouseDown, "mousedown"), (.leftMouseUp, "mouseup"),
@@ -1095,6 +1735,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         }
         let mouseLocation = NSEvent.mouseLocation
         for (_, state) in screenStates {
+            // Offline bake uses a full-screen transparent window; never inject into it.
+            guard !state.isOffscreen else { continue }
             guard state.isLoaded, let window = state.window, let webView = state.webView else { continue }
             guard window.frame.contains(mouseLocation) else { continue }
             let relX = mouseLocation.x - window.frame.origin.x
@@ -1146,14 +1788,22 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     }
 
     private func beginSettlingFirstFrame(screen: Int) {
-        screenStates[screen]?.firstFrameSettleGeneration &+= 1
+        // 不递增 generation：loadWallpaper 已为本次 set 分配 loadGeneration；
+        // settle 复用同一 gen，便于 30s 超时与 stop 统一取消。
         let gen = screenStates[screen]?.firstFrameSettleGeneration ?? 0
         let t0 = Date()
         final class SettleState { var lastThumb: [UInt8]?; var stablePasses = 0; var lastImage: NSImage? }
         let ss = SettleState()
         func finish(_ image: NSImage?, reason: String) {
             guard self.screenStates[screen]?.firstFrameSettleGeneration == gen else { return }
-            let ok = image.map { self.saveImage($0, screen: screen) } ?? false
+            var ok = image.map { self.saveImage($0, screen: screen) } ?? false
+            // 页面已加载但截图失败/始终空白：仍返回成功，动态窗口已在渲染
+            if !ok, self.screenStates[screen]?.isLoaded == true {
+                dlog("[WebRendererBridge] first-frame capture weak path screen=\(screen) reason=\(reason); treating as success")
+                ok = true
+            } else {
+                dlog("[WebRendererBridge] first-frame settle screen=\(screen) reason=\(reason) ok=\(ok)")
+            }
             self.screenStates[screen]?.pendingCompletion?(ok)
             self.screenStates[screen]?.pendingCompletion = nil
         }
@@ -1240,6 +1890,444 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             completion?(self?.saveImage(image, screen: screen) ?? false)
         }
     }
+
+    func captureImage(screen: Int, completion: @escaping (NSImage?) -> Void) {
+        snapshotWebView(screen: screen, completion: completion)
+    }
+
+    /// Enable offline-bake virtual clock (no-op if script missing).
+    func enableOfflineBakeClock(screen: Int, completion: (() -> Void)? = nil) {
+        guard let webView = screenStates[screen]?.webView else {
+            completion?()
+            return
+        }
+        webView.evaluateJavaScript(
+            "(function(){try{if(window.__wxBakeClock){window.__wxBakeClock.enable();return true;}return false;}catch(e){return false;}})();"
+        ) { _, _ in
+            DispatchQueue.main.async { completion?() }
+        }
+    }
+
+    /// Advance wallpaper content time to `seconds`, then wait for real rAF paints.
+    /// Real rAF keeps Spine/WebGL loops alive; virtual `performance.now` makes dt match content step.
+    func setOfflineBakeContentTime(
+        screen: Int,
+        seconds: Double,
+        paintFrames: Int = 2,
+        completion: (() -> Void)? = nil
+    ) {
+        guard let webView = screenStates[screen]?.webView else {
+            completion?()
+            return
+        }
+        let ms = max(0, seconds) * 1000.0
+        let frames = max(1, paintFrames)
+        // setContentTime then wait N real animation frames so the pose is painted before snapshot.
+        let js = String(
+            format: """
+            (function(){
+              try {
+                if (!window.__wxBakeClock) return Promise.resolve(-1);
+                window.__wxBakeClock.setContentTime(%.3f);
+                if (typeof window.__wxBakeClock.afterFrames === 'function') {
+                  return window.__wxBakeClock.afterFrames(%d, 1);
+                }
+                return Promise.resolve(0);
+              } catch (e) { return Promise.resolve(-2); }
+            })();
+            """,
+            ms,
+            frames
+        )
+        webView.evaluateJavaScript(js) { _, _ in
+            DispatchQueue.main.async { completion?() }
+        }
+    }
+
+}
+
+// MARK: - Offline Web Bake
+
+private enum WebOfflineBakeError: LocalizedError {
+    case invalidArguments(String)
+    case rendererFailed(String)
+    case writerFailed(String)
+    case captureFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidArguments(let message): return message
+        case .rendererFailed(let message): return message
+        case .writerFailed(let message): return message
+        case .captureFailed: return "无法从 Web 渲染器捕获画面"
+        }
+    }
+}
+
+private final class WebOfflineBakeRunner {
+    struct Options {
+        let path: String
+        let width: Int
+        let height: Int
+        let fps: Int
+        let duration: TimeInterval
+        let outputURL: URL
+        let userPropertiesJSON: String?
+    }
+
+    private let options: Options
+    private let completion: (Result<Void, Error>) -> Void
+    private let renderer = WebRendererBridge.shared
+    /// 目标成片帧数（固定 PTS = index/fps，保证均匀帧间隔）。
+    private let totalFrameCount: Int
+    /// 内容时间步长（秒）。虚拟时钟按此推进，与墙钟无关。
+    private let contentFrameInterval: TimeInterval
+
+    private var writer: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var temporaryOutputURL: URL?
+    private var captureStartedAt: Date?
+    private var nextFrameIndex = 0
+    private var writtenFrameCount = 0
+    private var isFinishing = false
+    private var didComplete = false
+    private var bakeClockEnabled = false
+
+    /// 4K60 下约 50Mbps（~0.1 bpp），明显优于旧的 width×height×3（~25Mbps）。
+    private static func averageBitRate(width: Int, height: Int, fps: Int) -> Int {
+        let pixels = max(1, width) * max(1, height)
+        let safeFPS = max(15, fps)
+        // ~0.10 bit/pixel/frame，并按分辨率夹紧，避免 1080p 过低或 5K 失控。
+        let raw = Double(pixels) * Double(safeFPS) * 0.10
+        return Int(min(max(raw, 8_000_000), 100_000_000))
+    }
+
+    init(options: Options, completion: @escaping (Result<Void, Error>) -> Void) {
+        self.options = options
+        self.completion = completion
+        self.totalFrameCount = max(1, Int((options.duration * Double(options.fps)).rounded(.up)))
+        self.contentFrameInterval = 1.0 / Double(max(1, options.fps))
+    }
+
+    func start() {
+        guard options.width >= 2, options.height >= 2, options.fps >= 1, options.duration > 0 else {
+            finish(.failure(WebOfflineBakeError.invalidArguments("烘焙尺寸、帧率或时长无效")))
+            return
+        }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: options.outputURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let temporaryURL = options.outputURL.deletingLastPathComponent()
+                .appendingPathComponent(".\(options.outputURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).tmp.mp4")
+            try? FileManager.default.removeItem(at: temporaryURL)
+            temporaryOutputURL = temporaryURL
+
+            let bitrate = Self.averageBitRate(width: options.width, height: options.height, fps: options.fps)
+            let writer = try AVAssetWriter(outputURL: temporaryURL, fileType: .mp4)
+            let input = AVAssetWriterInput(
+                mediaType: .video,
+                outputSettings: [
+                    AVVideoCodecKey: AVVideoCodecType.h264,
+                    AVVideoWidthKey: options.width,
+                    AVVideoHeightKey: options.height,
+                    AVVideoCompressionPropertiesKey: [
+                        AVVideoAverageBitRateKey: bitrate,
+                        AVVideoExpectedSourceFrameRateKey: options.fps,
+                        AVVideoMaxKeyFrameIntervalKey: options.fps * 2,
+                        AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                        AVVideoAllowFrameReorderingKey: false
+                    ] as [String: Any]
+                ]
+            )
+            // Offline bake is not a live capture pipeline: accept frames as soon as
+            // snapshots are ready. Content timing is driven by the virtual clock.
+            input.expectsMediaDataInRealTime = false
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: input,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferWidthKey as String: options.width,
+                    kCVPixelBufferHeightKey as String: options.height
+                ]
+            )
+            guard writer.canAdd(input) else {
+                throw WebOfflineBakeError.writerFailed("无法添加视频编码输入")
+            }
+            writer.add(input)
+            guard writer.startWriting() else {
+                throw WebOfflineBakeError.writerFailed(writer.error?.localizedDescription ?? "无法启动视频编码")
+            }
+            writer.startSession(atSourceTime: .zero)
+
+            self.writer = writer
+            videoInput = input
+            pixelBufferAdaptor = adaptor
+            emitProgress(phase: "准备", progress: 0)
+            fputs(
+                String(
+                    format: "[web-bake] encoder bitrate=%d target=%dx%d@%dfps duration=%.1fs dense+virtual-clock\n",
+                    bitrate,
+                    options.width,
+                    options.height,
+                    options.fps,
+                    options.duration
+                ),
+                stderr
+            )
+            fflush(stderr)
+
+            renderer.loadWallpaper(
+                path: options.path,
+                width: options.width,
+                height: options.height,
+                screen: nil,
+                offscreen: true,
+                userPropertiesJSON: options.userPropertiesJSON
+            ) { [weak self] success in
+                guard let self else { return }
+                guard success else {
+                    self.finish(.failure(WebOfflineBakeError.rendererFailed("Web 壁纸加载失败")))
+                    return
+                }
+                // Wait for Spine/WebGL init + property reapply (bootstrap uses ~0.5s reapply).
+                // Wait for Spine/WebGL init + property reapply (~0.5s in bootstrap).
+                // Then enable virtual clock and allow one real rAF turn so the page
+                // re-registers its loop under the hooked requestAnimationFrame.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                    guard let self, !self.isFinishing else { return }
+                    self.renderer.enableOfflineBakeClock(screen: WebRendererBridge.offlineBakeScreen) { [weak self] in
+                        guard let self, !self.isFinishing else { return }
+                        self.bakeClockEnabled = true
+                        fputs("[web-bake] virtual clock enabled; waiting for loop rebind\n", stderr)
+                        fflush(stderr)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                            guard let self, !self.isFinishing else { return }
+                            self.renderer.setOfflineBakeContentTime(
+                                screen: WebRendererBridge.offlineBakeScreen,
+                                seconds: 0
+                            ) { [weak self] in
+                                guard let self, !self.isFinishing else { return }
+                                self.captureStartedAt = Date()
+                                fputs("[web-bake] capturing dense frames (virtual content clock)\n", stderr)
+                                fflush(stderr)
+                                self.captureNextFrame()
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            finish(.failure(error))
+        }
+    }
+
+    private func captureNextFrame() {
+        guard !isFinishing else { return }
+        if nextFrameIndex >= totalFrameCount {
+            finishWriting()
+            return
+        }
+
+        let contentSeconds = Double(nextFrameIndex) * contentFrameInterval
+        // Advance virtual clock, wait for real rAF paints, then snapshot.
+        // paintFrames=2: one frame consumes the content dt, second ensures GL presents.
+        renderer.setOfflineBakeContentTime(
+            screen: WebRendererBridge.offlineBakeScreen,
+            seconds: contentSeconds,
+            paintFrames: 2
+        ) { [weak self] in
+            guard let self, !self.isFinishing else { return }
+            self.renderer.captureImage(screen: WebRendererBridge.offlineBakeScreen) { [weak self] image in
+                guard let self, !self.isFinishing else { return }
+                guard let image else {
+                    self.finish(.failure(WebOfflineBakeError.captureFailed))
+                    return
+                }
+                self.append(image: image)
+            }
+        }
+    }
+
+    private func append(image: NSImage) {
+        guard let writer,
+              let videoInput,
+              let pixelBufferAdaptor,
+              let pool = pixelBufferAdaptor.pixelBufferPool else {
+            finish(.failure(WebOfflineBakeError.writerFailed("视频编码器未准备好")))
+            return
+        }
+        guard writer.status == .writing else {
+            finish(.failure(WebOfflineBakeError.writerFailed(writer.error?.localizedDescription ?? "视频编码器异常退出")))
+            return
+        }
+
+        guard videoInput.isReadyForMoreMediaData else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+                self?.append(image: image)
+            }
+            return
+        }
+
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer)
+        guard status == kCVReturnSuccess, let pixelBuffer,
+              draw(image: image, into: pixelBuffer) else {
+            finish(.failure(WebOfflineBakeError.writerFailed("无法转换 Web 帧为视频像素缓冲区")))
+            return
+        }
+
+        // Dense capture: every index is written. Content time is virtual-clock driven,
+        // so wall-clock snapshot lag no longer drops intermediate frames.
+        let writtenIndex = nextFrameIndex
+        let timescale = CMTimeScale(options.fps * 100)
+        let presentationTime = CMTime(
+            value: CMTimeValue(writtenIndex * 100),
+            timescale: timescale
+        )
+        guard pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: presentationTime) else {
+            finish(.failure(WebOfflineBakeError.writerFailed(writer.error?.localizedDescription ?? "写入视频帧失败")))
+            return
+        }
+
+        writtenFrameCount += 1
+        nextFrameIndex = writtenIndex + 1
+
+        let wallElapsed = captureStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        emitProgress(
+            phase: "录制",
+            progress: min(0.99, Double(nextFrameIndex) / Double(totalFrameCount))
+        )
+        if writtenFrameCount == 1 || writtenFrameCount % max(1, options.fps) == 0 || nextFrameIndex >= totalFrameCount {
+            fputs(
+                String(
+                    format: "[web-bake] dense frame %d/%d content=%.3fs wall=%.1fs\n",
+                    writtenFrameCount,
+                    totalFrameCount,
+                    Double(writtenIndex) * contentFrameInterval,
+                    wallElapsed
+                ),
+                stderr
+            )
+            fflush(stderr)
+        }
+        captureNextFrame()
+    }
+
+    private func draw(image: NSImage, into pixelBuffer: CVPixelBuffer) -> Bool {
+        guard let cgImage = image.cgImage(
+            forProposedRect: nil,
+            context: nil,
+            hints: nil
+        ) else {
+            return false
+        }
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer),
+              let context = CGContext(
+                data: baseAddress,
+                width: options.width,
+                height: options.height,
+                bitsPerComponent: 8,
+                bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                    | CGBitmapInfo.byteOrder32Little.rawValue
+              ) else {
+            return false
+        }
+
+        context.setFillColor(NSColor.black.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: options.width, height: options.height))
+        context.interpolationQuality = .high
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: options.width, height: options.height))
+        return true
+    }
+
+    private func finishWriting() {
+        guard !isFinishing else { return }
+        isFinishing = true
+        emitProgress(phase: "编码", progress: 0.99)
+        guard let writer, let videoInput else {
+            finish(.failure(WebOfflineBakeError.writerFailed("视频编码器未初始化")))
+            return
+        }
+        videoInput.markAsFinished()
+        writer.finishWriting { [weak self] in
+            guard let self else { return }
+            let result: Result<Void, Error>
+            if writer.status == .completed {
+                let wall = self.captureStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+                fputs(
+                    String(
+                        format: "[web-bake] finished frames=%d expected=%d wall=%.1fs\n",
+                        self.writtenFrameCount,
+                        self.totalFrameCount,
+                        wall
+                    ),
+                    stderr
+                )
+                fflush(stderr)
+                result = .success(())
+            } else {
+                result = .failure(
+                    WebOfflineBakeError.writerFailed(
+                        writer.error?.localizedDescription ?? "完成视频编码失败"
+                    )
+                )
+            }
+            DispatchQueue.main.async {
+                self.finish(result)
+            }
+        }
+    }
+
+    private func finish(_ result: Result<Void, Error>) {
+        guard !didComplete else { return }
+        didComplete = true
+        isFinishing = true
+        renderer.stop(screen: WebRendererBridge.offlineBakeScreen)
+
+        switch result {
+        case .success:
+            guard let temporaryOutputURL else {
+                completion(.failure(WebOfflineBakeError.writerFailed("烘焙临时文件丢失")))
+                return
+            }
+            do {
+                try? FileManager.default.removeItem(at: options.outputURL)
+                try FileManager.default.moveItem(at: temporaryOutputURL, to: options.outputURL)
+                emitProgress(phase: "完成", progress: 1)
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        case .failure(let error):
+            writer?.cancelWriting()
+            if let temporaryOutputURL {
+                try? FileManager.default.removeItem(at: temporaryOutputURL)
+            }
+            completion(.failure(error))
+        }
+    }
+
+    private func emitProgress(phase: String, progress: Double) {
+        let currentFrame = min(totalFrameCount, max(0, nextFrameIndex))
+        let line = String(
+            format: "[web-bake] %@ %d/%d [%.1f%%]\n",
+            phase,
+            currentFrame,
+            totalFrameCount,
+            min(100, max(0, progress * 100))
+        )
+        fputs(line, stderr)
+        fflush(stderr)
+    }
 }
 
 // MARK: - Desktop Wallpaper Manager (Web renderer)
@@ -1263,8 +2351,42 @@ private final class DesktopWallpaperManager {
 
     private let originalWallpaperKey = "renderer_original_wallpaper_v1"
     private(set) var lastErrorMessage: String?
+    private var screenChangeObserver: NSObjectProtocol?
 
-    private init() {}
+    private init() {
+        // 外接屏拔插：回收 index 已越界 / 窗口 frame 不再对应任何屏的 web 渲染
+        screenChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.cleanupOrphanedScreensAfterDisplayChange()
+        }
+    }
+
+    deinit {
+        if let screenChangeObserver {
+            NotificationCenter.default.removeObserver(screenChangeObserver)
+        }
+    }
+
+    /// 停掉已不对应任何 NSScreen 的 web 槽位（断线后 index 越界，或窗口落在虚空）。
+    private func cleanupOrphanedScreensAfterDisplayChange() {
+        let screens = NSScreen.screensOrderedForDisplay
+        let screenCount = screens.count
+        let orphanIndices = screenStates.keys.filter { idx in
+            if idx < 0 { return true }
+            if idx >= screenCount { return true }
+            // 索引仍合法但窗口 frame 已不与该屏匹配（排列变化 / 短暂错位）时不主动停，
+            // 由后续 set/resize 路径处理；此处只清明确越界的槽。
+            return false
+        }
+        guard !orphanIndices.isEmpty else { return }
+        dlog("[DesktopWallpaperManager] cleaning orphaned web screens after display change: \(orphanIndices.sorted()) (screenCount=\(screenCount))")
+        for idx in orphanIndices.sorted(by: >) {
+            stopWallpaper(screen: idx)
+        }
+    }
 
     func setWallpaper(path: String, width: Int = 1920, height: Int = 1080, screen: Int? = nil, completion: ((Bool) -> Void)? = nil) {
         let path = resolveSteamWorkshopDirectoryIfNeeded(path)
@@ -1386,6 +2508,78 @@ private final class DesktopWallpaperManager {
         WebRendererBridge.shared.pushAudioFrame(spectrum)
     }
 
+    /// 透传系统 Now Playing 元数据到 Web Media Integration。
+    func pushWebMediaUpdate(
+        enabled: Bool,
+        title: String,
+        artist: String,
+        albumTitle: String,
+        state: Int,
+        position: Double,
+        duration: Double,
+        rate: Double
+    ) {
+        WebRendererBridge.shared.pushMediaUpdate(
+            enabled: enabled,
+            title: title,
+            artist: artist,
+            albumTitle: albumTitle,
+            state: state,
+            position: position,
+            duration: duration,
+            rate: rate
+        )
+    }
+
+    func pushWebMediaThumbnail(_ thumbnail: String) {
+        WebRendererBridge.shared.pushMediaThumbnail(thumbnail)
+    }
+
+
+    func pushWebMediaLyrics(
+        hasLyrics: Bool,
+        title: String,
+        artist: String,
+        songId: String,
+        storefront: String,
+        source: String,
+        lines: [IPCLyricLine]
+    ) {
+        WebRendererBridge.shared.pushMediaLyrics(
+            hasLyrics: hasLyrics,
+            title: title,
+            artist: artist,
+            songId: songId,
+            storefront: storefront,
+            source: source,
+            lines: lines
+        )
+    }
+
+    func pushWebMediaLyricsLine(
+        index: Int,
+        text: String,
+        nextText: String,
+        previousText: String,
+        start: Double,
+        end: Double?,
+        progress: Double,
+        elapsedTime: Double,
+        hasLine: Bool
+    ) {
+        WebRendererBridge.shared.pushMediaLyricsLine(
+            index: index,
+            text: text,
+            nextText: nextText,
+            previousText: previousText,
+            start: start,
+            end: end,
+            progress: progress,
+            elapsedTime: elapsedTime,
+            hasLine: hasLine
+        )
+    }
+
     func stopWallpaper(screen: Int = 0) {
         guard screenStates[screen] != nil else { return }
         WebRendererBridge.shared.stop(screen: screen)
@@ -1417,6 +2611,10 @@ private final class DesktopWallpaperManager {
             dlog("[DesktopWallpaperManager] Dynamic lock screen enabled; skip static capture desktop apply")
             return
         }
+        guard isSystemWallpaperSyncEnabledForCurrentLaunch() else {
+            dlog("[DesktopWallpaperManager] System wallpaper sync disabled; skip static capture desktop apply")
+            return
+        }
         let src = URL(fileURLWithPath: capPath)
         // 交替 slot 避免系统缓存
         let currentSlot = screenStates[screen]?.desktopCaptureSlot ?? 0
@@ -1434,7 +2632,7 @@ private final class DesktopWallpaperManager {
         }
 
         let workspace = NSWorkspace.shared
-        let screens = NSScreen.screens
+        let screens = NSScreen.screensOrderedForDisplay
         guard screen >= 0, screen < screens.count else { return }
         let targetScreen = screens[screen]
 
@@ -1809,7 +3007,12 @@ private final class Daemon: NSObject, NSApplicationDelegate {
             guard lenRead == MemoryLayout<UInt32>.size else { close(fd); return }
 
             let length = lengthBuf.withUnsafeBytes { $0.load(as: UInt32.self) }
-            guard length > 0, length < 1024 * 1024 else { close(fd); return }
+            // mediaThumbnail 可能带 data URL，放宽到 8MB
+            guard length > 0, length < 8 * 1024 * 1024 else {
+                dlog("[Daemon] IPC length rejected: \(length)")
+                close(fd)
+                return
+            }
 
             var data = Data()
             while data.count < Int(length) {
@@ -1820,7 +3023,12 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                 data.append(chunk.prefix(n))
             }
 
-            guard let msg = try? JSONDecoder().decode(IPCMessage.self, from: data) else {
+            let msg: IPCMessage
+            do {
+                msg = try JSONDecoder().decode(IPCMessage.self, from: data)
+            } catch {
+                let preview = String(data: data.prefix(200), encoding: .utf8) ?? "<bin>"
+                dlog("[Daemon] IPC decode failed: \(error) body=\(preview)")
                 _ = "INVALID".data(using: .utf8)?.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
                 close(fd)
                 return
@@ -1837,7 +3045,7 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                 case .set:
                     if let path = msg.path {
                         let targetSize: (Int, Int)
-                        let screens = NSScreen.screens
+                        let screens = NSScreen.screensOrderedForDisplay
                         if let s = msg.screen, s >= 0, s < screens.count {
                             let frame = screens[s].frame
                             targetSize = (Int(frame.width), Int(frame.height))
@@ -1899,6 +3107,51 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                     // 不发响应：30fps 高频命令，sendResponse 会塞爆缓冲且让 App 侧每帧都要 recv。
                     // 必须显式关闭 fd，否则每帧泄漏一个文件描述符，~8s 后耗尽（256/30fps）导致 daemon 完全停止接收 IPC。
                     close(fd)
+                case .mediaUpdate:
+                    dlog("[Daemon] mediaUpdate enabled=\(msg.enabled ?? false) title=\(msg.title ?? "") state=\(msg.state ?? 0)")
+                    DesktopWallpaperManager.shared.pushWebMediaUpdate(
+                        enabled: msg.enabled ?? false,
+                        title: msg.title ?? "",
+                        artist: msg.artist ?? "",
+                        albumTitle: msg.albumTitle ?? "",
+                        state: msg.state ?? 0,
+                        position: msg.position ?? 0,
+                        duration: msg.duration ?? 0,
+                        rate: msg.rate ?? 1
+                    )
+                    // 低频；仍 fire-and-forget，避免阻塞 Host 主线程
+                    close(fd)
+                case .mediaThumbnail:
+                    let thumbLen = (msg.thumbnail ?? "").count
+                    dlog("[Daemon] mediaThumbnail len=\(thumbLen)")
+                    DesktopWallpaperManager.shared.pushWebMediaThumbnail(msg.thumbnail ?? "")
+                    close(fd)
+                case .mediaLyrics:
+                    let n = msg.lines?.count ?? 0
+                    dlog("[Daemon] mediaLyrics has=\(msg.hasLyrics ?? false) lines=\(n) songId=\(msg.songId ?? "")")
+                    DesktopWallpaperManager.shared.pushWebMediaLyrics(
+                        hasLyrics: msg.hasLyrics ?? false,
+                        title: msg.title ?? "",
+                        artist: msg.artist ?? "",
+                        songId: msg.songId ?? "",
+                        storefront: msg.storefront ?? "",
+                        source: msg.source ?? "",
+                        lines: msg.lines ?? []
+                    )
+                    close(fd)
+                case .mediaLyricsLine:
+                    DesktopWallpaperManager.shared.pushWebMediaLyricsLine(
+                        index: msg.index ?? -1,
+                        text: msg.text ?? "",
+                        nextText: msg.nextText ?? "",
+                        previousText: msg.previousText ?? "",
+                        start: msg.start ?? 0,
+                        end: msg.end,
+                        progress: msg.progress ?? 0,
+                        elapsedTime: msg.elapsedTime ?? 0,
+                        hasLine: msg.hasLine ?? false
+                    )
+                    close(fd)
                 }
             }
         }
@@ -1933,7 +3186,10 @@ struct WallpaperEngineCLI {
         }
 
         switch command {
-        case "set", "pause", "resume", "stop", "exit", "apply-properties":
+        case "bake":
+            runOfflineBake(arguments: Array(remainingArgs.dropFirst()))
+
+        case "set", "pause", "resume", "stop", "stop-screen", "exit", "apply-properties":
             if command == "stop" || command == "exit" {
                 stopDaemonIfRunning()
                 exit(0)
@@ -1953,7 +3209,12 @@ struct WallpaperEngineCLI {
                         exit(1)
                     }
                 }
-            } else {
+            } else if !isDaemonRunning() {
+                // Per-screen stop is idempotent: the target daemon may already
+                // have exited while the App was completing a display switch.
+                if command == "stop-screen" {
+                    exit(0)
+                }
                 guard isDaemonRunning() else {
                     print("Daemon not responding")
                     exit(1)
@@ -2002,6 +3263,15 @@ struct WallpaperEngineCLI {
                     resumeScreen = screenIdx
                 }
                 msg = IPCMessage(command: .resume, path: nil, screen: resumeScreen)
+            case "stop-screen":
+                let stopArgs = Array(remainingArgs.dropFirst())
+                guard stopArgs.count == 1,
+                      let stopScreen = Int(stopArgs[0]),
+                      stopScreen >= 0 else {
+                    print("Usage: wallpaperengine-cli stop-screen <screen_index>")
+                    exit(1)
+                }
+                msg = IPCMessage(command: .stop, path: nil, screen: stopScreen)
             case "stop", "exit":
                 let stopArgs = Array(remainingArgs.dropFirst())
                 var stopScreen: Int? = nil
@@ -2048,6 +3318,98 @@ struct WallpaperEngineCLI {
         let delegate = Daemon.shared
         app.delegate = delegate
         app.run()
+    }
+
+    private static var offlineBakeRunner: WebOfflineBakeRunner?
+
+    private static func runOfflineBake(arguments: [String]) {
+        guard let options = parseOfflineBakeOptions(arguments) else {
+            printUsage()
+            exit(1)
+        }
+
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        offlineBakeRunner = WebOfflineBakeRunner(options: options) { result in
+            switch result {
+            case .success:
+                exit(0)
+            case .failure(let error):
+                fputs("Web bake failed: \(error.localizedDescription)\n", stderr)
+                exit(1)
+            }
+        }
+        offlineBakeRunner?.start()
+        app.run()
+    }
+
+    private static func parseOfflineBakeOptions(_ arguments: [String]) -> WebOfflineBakeRunner.Options? {
+        guard let path = arguments.first, !path.hasPrefix("--") else {
+            fputs("Usage: wallpaperengine-cli bake <path> --size WxH --fps N --duration S --out <path> [--properties-base64 <base64>]\n", stderr)
+            return nil
+        }
+
+        var width: Int?
+        var height: Int?
+        var fps: Int?
+        var duration: TimeInterval?
+        var outputPath: String?
+        var userPropertiesJSON: String?
+        var index = 1
+
+        while index < arguments.count {
+            let argument = arguments[index]
+            guard index + 1 < arguments.count else {
+                fputs("Missing value for \(argument)\n", stderr)
+                return nil
+            }
+            let value = arguments[index + 1]
+            switch argument {
+            case "--size":
+                let parts = value.lowercased().split(separator: "x")
+                guard parts.count == 2,
+                      let parsedWidth = Int(parts[0]),
+                      let parsedHeight = Int(parts[1]) else {
+                    fputs("Invalid --size value: \(value)\n", stderr)
+                    return nil
+                }
+                width = max(2, parsedWidth - (parsedWidth % 2))
+                height = max(2, parsedHeight - (parsedHeight % 2))
+            case "--fps":
+                fps = Int(value)
+            case "--duration":
+                duration = Double(value)
+            case "--out":
+                outputPath = value
+            case "--properties-base64":
+                guard let data = Data(base64Encoded: value),
+                      let json = String(data: data, encoding: .utf8) else {
+                    fputs("Invalid --properties-base64 value\n", stderr)
+                    return nil
+                }
+                userPropertiesJSON = json
+            default:
+                fputs("Unknown bake option: \(argument)\n", stderr)
+                return nil
+            }
+            index += 2
+        }
+
+        guard let width, let height, let fps, fps > 0,
+              let duration, duration > 0,
+              let outputPath, !outputPath.isEmpty else {
+            fputs("Usage: wallpaperengine-cli bake <path> --size WxH --fps N --duration S --out <path> [--properties-base64 <base64>]\n", stderr)
+            return nil
+        }
+        return WebOfflineBakeRunner.Options(
+            path: path,
+            width: width,
+            height: height,
+            fps: fps,
+            duration: duration,
+            outputURL: URL(fileURLWithPath: outputPath),
+            userPropertiesJSON: userPropertiesJSON
+        )
     }
 
     private static func swizzleActivateIgnoringOtherApps() {
@@ -2114,8 +3476,12 @@ struct WallpaperEngineCLI {
         Usage: wallpaperengine-cli <command>
         Commands:
           set <path> [screen_index]   Set wallpaper
+          bake <path> --size WxH --fps N --duration S --out <path>
+                                     Export a Web wallpaper as dense H.264 MP4
+                                     (virtual content clock; no wall-clock frame drops)
           pause                       Pause wallpaper
           resume                      Resume wallpaper
+          stop-screen <screen_index>  Stop wallpaper on one display
           stop                        Stop wallpaper
           exit                        Alias for stop
         """)

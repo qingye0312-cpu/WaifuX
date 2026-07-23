@@ -9,85 +9,89 @@ import WebKit
 // 3. 场景高级设置 (sceneConfig) → SceneConfigOverrideService
 
 @MainActor
-final class WebPropertyEditorPanelController {
+final class WebPropertyEditorPanelController: NSObject, NSPopoverDelegate {
     static let shared = WebPropertyEditorPanelController()
 
-    private var windowController: NSWindowController?
+    private var popover: NSPopover?
+    private var contentViewController: NSViewController?
     private var webView: WKWebView?
     private var currentPath: String?
     private var currentType: WallpaperEditorType = .scene
     private var currentTitle: String = "设计场景"
     private var applyTask: Task<Void, Never>?
     private var pendingInject: String?
+    private var navigationDelegate: PropertyEditorNavigationDelegate?
+    private var pageIsReady = false
+    private var activeLoadID = UUID()
 
-    private init() {}
+    private override init() {
+        super.init()
+    }
 
     // MARK: - Public API
 
     /// 场景壁纸设计弹窗
-    func presentScene(for wallpaperPath: String) {
-        present(for: wallpaperPath, type: .scene, title: "设计场景")
+    func presentScene(for wallpaperPath: String, from anchorView: NSView) {
+        present(for: wallpaperPath, type: .scene, title: "设计场景", from: anchorView)
     }
 
     /// Web 壁纸设计弹窗
-    func presentWeb(for wallpaperPath: String) {
-        present(for: wallpaperPath, type: .web, title: "设计壁纸")
+    func presentWeb(for wallpaperPath: String, from anchorView: NSView) {
+        present(for: wallpaperPath, type: .web, title: "设计壁纸", from: anchorView)
     }
 
     /// 场景高级设置弹窗（SceneConfigOverride）
-    func presentSceneConfig(for wallpaperPath: String) {
-        present(for: wallpaperPath, type: .sceneConfig, title: "场景高级设置")
+    func presentSceneConfig(for wallpaperPath: String, from anchorView: NSView) {
+        present(for: wallpaperPath, type: .sceneConfig, title: "场景高级设置", from: anchorView)
     }
 
     /// 桌面动态元素设计弹窗（烘焙视频的文本覆盖编辑）
-    func presentSceneDesign(for wallpaperPath: String) {
-        present(for: wallpaperPath, type: .sceneDesign, title: "设计壁纸")
+    func presentSceneDesign(for wallpaperPath: String, from anchorView: NSView) {
+        present(for: wallpaperPath, type: .sceneDesign, title: "设计壁纸", from: anchorView)
     }
 
     /// 自动检测类型并呈现（兼容旧调用方式）
-    func present(for wallpaperPath: String, title: String = "设计场景") {
+    func present(for wallpaperPath: String, title: String = "设计场景", from anchorView: NSView) {
         let type = detectType(for: wallpaperPath)
         let autoTitle = type == .scene ? "设计场景" : "设计壁纸"
-        present(for: wallpaperPath, type: type, title: title == "设计场景" ? autoTitle : title)
+        present(for: wallpaperPath, type: type, title: title == "设计场景" ? autoTitle : title, from: anchorView)
     }
 
     func closePanel() {
+        let activePopover = popover
+        activePopover?.delegate = nil
+        activePopover?.performClose(nil)
+        resetPanelState()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        resetPanelState()
+    }
+
+    private func resetPanelState() {
+        activeLoadID = UUID()
+        pendingInject = nil
+        pageIsReady = false
+        webView?.stopLoading()
+        webView?.navigationDelegate = nil
+        navigationDelegate = nil
         webView = nil
-        windowController?.close()
-        windowController = nil
+        popover?.contentViewController = nil
+        contentViewController = nil
+        popover = nil
         currentPath = nil
     }
 
     // MARK: - Internal Present
 
-    private func present(for wallpaperPath: String, type: WallpaperEditorType, title: String) {
-        if currentPath == wallpaperPath, let window = windowController?.window {
-            anchorWindow(window)
-            window.makeKeyAndOrderFront(nil)
+    private func present(for wallpaperPath: String, type: WallpaperEditorType, title: String, from anchorView: NSView) {
+        if currentPath == wallpaperPath, currentType == type, popover?.isShown == true {
             return
         }
 
         closePanel()
 
-        let window = KeyableBorderlessWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 620),
-            styleMask: [.borderless, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = title
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
-        window.isMovableByWindowBackground = true
-        window.isOpaque = false
-        window.hasShadow = true
-        window.backgroundColor = .clear
-        window.setContentSize(NSSize(width: 380, height: 620))
-        window.minSize = NSSize(width: 360, height: 500)
-        window.maxSize = NSSize(width: 500, height: 800)
-        window.isReleasedWhenClosed = false
-        window.tabbingMode = .disallowed
-        window.level = .floating
+        let contentSize = NSSize(width: 400, height: 620)
 
         // WKWebView configuration
         let config = WKWebViewConfiguration()
@@ -104,26 +108,47 @@ final class WebPropertyEditorPanelController {
 
         config.userContentController = userContentController
 
-        let webView = WKWebView(frame: window.contentView!.bounds, configuration: config)
+        let materialView = NSVisualEffectView(frame: NSRect(origin: .zero, size: contentSize))
+        materialView.material = .popover
+        materialView.blendingMode = .behindWindow
+        materialView.state = .active
+
+        let webView = WKWebView(frame: materialView.bounds, configuration: config)
         webView.autoresizingMask = [.width, .height]
         webView.setValue(false, forKey: "drawsBackground")
+        webView.wantsLayer = true
+        webView.layer?.cornerRadius = 10
+        webView.layer?.masksToBounds = true
+        let navigationDelegate = PropertyEditorNavigationDelegate(target: self)
+        webView.navigationDelegate = navigationDelegate
+        materialView.addSubview(webView)
 
-        window.contentView = webView
-        // Round corners to match the existing panel style
-        window.contentView?.wantsLayer = true
-        window.contentView?.layer?.cornerRadius = 20
-        window.contentView?.layer?.masksToBounds = true
+        let contentViewController = NSViewController()
+        contentViewController.view = materialView
+        let popover = NSPopover()
+        popover.behavior = .semitransient
+        popover.contentSize = contentSize
+        popover.contentViewController = contentViewController
+        popover.delegate = self
 
-        anchorWindow(window)
-
-        let controller = NSWindowController(window: window)
-        windowController = controller
         currentPath = wallpaperPath
         currentType = type
         currentTitle = title
         self.webView = webView
-        controller.showWindow(nil)
-        window.makeKeyAndOrderFront(nil)
+        self.navigationDelegate = navigationDelegate
+        self.contentViewController = contentViewController
+        self.popover = popover
+
+        // Menu item actions run while the status menu is tracking. Defer until
+        // it has dismissed, otherwise AppKit closes a newly shown popover.
+        DispatchQueue.main.async { [weak self, weak anchorView] in
+            guard let self,
+                  let anchorView,
+                  self.popover === popover else {
+                return
+            }
+            popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .minY)
+        }
 
         Task { await loadAndInjectData() }
     }
@@ -132,8 +157,13 @@ final class WebPropertyEditorPanelController {
 
     private func loadAndInjectData() async {
         guard let webView = webView, let wallpaperPath = currentPath else { return }
+        let loadID = UUID()
+        activeLoadID = loadID
+        pageIsReady = false
+        pendingInject = nil
 
         let htmlContent = loadHTMLEditorContent()
+        let rewardQRCodeDataURL = rewardQRCodeDataURL().jsEscaped
 
         // Scene design uses a completely different data model (dynamic text entries)
         if currentType == .sceneDesign {
@@ -149,6 +179,7 @@ final class WebPropertyEditorPanelController {
             window.sceneDesignData = \(designJS);
             window.wallpaperTitle = "\(escapedWallpaperTitle)";
             window.accentColor = "\(accentHex)";
+            window.rewardQRCodeDataURL = "\(rewardQRCodeDataURL)";
             document.getElementById('panelTitle').textContent = "\(escapedTitle)";
             if (typeof initSceneDesign === 'function') initSceneDesign();
             """
@@ -156,17 +187,10 @@ final class WebPropertyEditorPanelController {
             pendingInject = injectScript
             webView.loadHTMLString(htmlContent, baseURL: nil)
 
-            // Safety timeout
+            // Safety timeout if the navigation callback is not delivered.
             try? await Task.sleep(nanoseconds: 3_000_000_000)
-            guard !Task.isCancelled else { return }
-            if let script = pendingInject {
-                pendingInject = nil
-                webView.evaluateJavaScript(script) { _, error in
-                    if let error = error {
-                        print("[WebPropertyEditor] JS fallback inject failed: \(error)")
-                    }
-                }
-            }
+            guard !Task.isCancelled, activeLoadID == loadID, self.webView === webView else { return }
+            injectPendingDataIfPossible(force: true)
             return
         }
 
@@ -204,6 +228,7 @@ final class WebPropertyEditorPanelController {
         window.currentValues = \(valuesJS);
         window.wallpaperTitle = "\(escapedWallpaperTitle)";
         window.accentColor = "\(accentHex)";
+        window.rewardQRCodeDataURL = "\(rewardQRCodeDataURL)";
         document.getElementById('panelTitle').textContent = "\(escapedTitle)";
         if (typeof initFromData === 'function') initFromData();
         """
@@ -213,26 +238,29 @@ final class WebPropertyEditorPanelController {
         // Load HTML — the page will post "editorReady" when DOM is ready
         webView.loadHTMLString(htmlContent, baseURL: nil)
 
-        // Safety timeout: if editorReady never arrives (e.g. JS error), inject after 3s
+        // Safety timeout if the navigation callback is not delivered.
         try? await Task.sleep(nanoseconds: 3_000_000_000)
-        guard !Task.isCancelled else { return }
-        if let script = pendingInject {
-            pendingInject = nil
-            webView.evaluateJavaScript(script) { _, error in
-                if let error = error {
-                    print("[WebPropertyEditor] JS fallback inject failed: \(error)")
-                }
-            }
-        }
+        guard !Task.isCancelled, activeLoadID == loadID, self.webView === webView else { return }
+        injectPendingDataIfPossible(force: true)
     }
 
     /// Called when HTML page signals DOM is ready
     func handleEditorReady() {
-        guard let webView = webView, let script = pendingInject else { return }
+        injectPendingDataIfPossible()
+    }
+
+    func handlePageFinishedLoading(_ webView: WKWebView) {
+        guard self.webView === webView else { return }
+        pageIsReady = true
+        injectPendingDataIfPossible()
+    }
+
+    private func injectPendingDataIfPossible(force: Bool = false) {
+        guard (pageIsReady || force), let webView = webView, let script = pendingInject else { return }
         pendingInject = nil
         webView.evaluateJavaScript(script) { _, error in
             if let error = error {
-                print("[WebPropertyEditor] JS inject failed: \(error)")
+                print("[WebPropertyEditor] JS inject failed: \(error.localizedDescription)")
             }
         }
     }
@@ -253,6 +281,17 @@ final class WebPropertyEditorPanelController {
             }
         }
         return Self.fallbackHTML
+    }
+
+    private func rewardQRCodeDataURL() -> String {
+        guard let image = NSImage(named: "RewardQRCode"),
+              let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData),
+              let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.92]) else {
+            return ""
+        }
+
+        return "data:image/jpeg;base64,\(jpegData.base64EncodedString())"
     }
 
     // MARK: - Message Handlers
@@ -408,26 +447,14 @@ final class WebPropertyEditorPanelController {
         return type.lowercased() == "web" ? .web : .scene
     }
 
-    // MARK: - Anchor
-
-    private func anchorWindow(_ window: NSWindow) {
-        guard let visibleFrame = NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame else {
-            window.center()
-            return
-        }
-        let origin = NSPoint(
-            x: visibleFrame.minX + 20,
-            y: visibleFrame.maxY - window.frame.height - 52
-        )
-        window.setFrameOrigin(origin)
-    }
-
     // MARK: - Value Conversion Helpers
 
     private static func toAnyCodableValue(_ value: Any) -> AnyCodableValue {
-        if let b = value as? Bool { return .bool(b) }
+        // NSNumber(0) 来自 JavaScript 可以转成 Bool(false) 或 Double(0.0)，
+        // 先判数字类型避免 0/1 被错误转成 bool
         if let n = value as? Double { return .number(n) }
         if let n = value as? Int { return .number(Double(n)) }
+        if let b = value as? Bool { return .bool(b) }
         if let s = value as? String { return .string(s) }
         return .string(String(describing: value))
     }
@@ -495,6 +522,13 @@ final class WebPropertyEditorPanelController {
         for (key, prop) in rawProperties {
             let rawType = prop["type"] as? String ?? "text"
             let text = prop["text"] as? String
+            guard SceneWallpaperPropertiesService.presentation(
+                rawType: rawType,
+                key: key,
+                text: text
+            ) != .decoration else {
+                continue
+            }
             let options = parseOptions(prop["options"])
             let min = prop["min"] as? Double
             let max = prop["max"] as? Double
@@ -512,7 +546,7 @@ final class WebPropertyEditorPanelController {
             let item = PropertyEditorItem(
                 key: key,
                 type: normalizedType,
-                text: text,
+                text: text.map { WallpaperEnginePropertyLocalizer.label(for: $0) },
                 defaultValue: defaultValue,
                 options: options,
                 min: min,
@@ -948,11 +982,11 @@ final class WebPropertyEditorPanelController {
         if let array = raw as? [[String: Any]] {
             return array.compactMap { item in
                 guard let value = item["value"], let label = item["label"] as? String else { return nil }
-                return ["value": String(describing: value), "label": label]
+                return ["value": String(describing: value), "label": WallpaperEnginePropertyLocalizer.label(for: label)]
             }
         }
         if let dict = raw as? [String: String] {
-            return dict.map { ["value": $0.key, "label": $0.value] }
+            return dict.map { ["value": $0.key, "label": WallpaperEnginePropertyLocalizer.label(for: $0.value)] }
         }
         return []
     }
@@ -975,7 +1009,7 @@ final class WebPropertyEditorPanelController {
     private static let fallbackHTML = """
     <!DOCTYPE html>
     <html><head><meta charset="UTF-8"><style>
-    body { background: #1a1d2e; color: #e2e8f0; font-family: system-ui; padding: 20px; }
+    body { background: transparent; color: #e2e8f0; font-family: system-ui; padding: 20px; }
     </style></head><body><p>Loading editor...</p></body></html>
     """
 }
@@ -1018,6 +1052,21 @@ struct PropertyEditorItem {
         if fraction { dict["fraction"] = true }
         if let precision = precision { dict["precision"] = precision }
         return dict
+    }
+}
+
+private final class PropertyEditorNavigationDelegate: NSObject, WKNavigationDelegate {
+    weak var target: WebPropertyEditorPanelController?
+
+    init(target: WebPropertyEditorPanelController) {
+        self.target = target
+        super.init()
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        Task { @MainActor [weak self] in
+            self?.target?.handlePageFinishedLoading(webView)
+        }
     }
 }
 

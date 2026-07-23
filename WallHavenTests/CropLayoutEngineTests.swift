@@ -1,7 +1,100 @@
 import XCTest
+import ImageIO
 @testable import WaifuX
 
 final class CropLayoutEngineTests: XCTestCase {
+
+    func testPortraitBlurFillCreatesAndReusesMappedArtifact() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PortraitBlurFillTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let sourceURL = root.appendingPathComponent("source.png")
+        try writeSolidImage(width: 300, height: 600, to: sourceURL)
+
+        let derivedRoot = root.appendingPathComponent("DerivedWallpapers", isDirectory: true)
+        let targetSize = CGSize(width: 1600, height: 900)
+        let first = try await PortraitBlurFillWallpaperService.shared.preparedWallpaperURL(
+            for: sourceURL,
+            targetPixelSize: targetSize,
+            derivedWallpapersDirectory: derivedRoot
+        )
+        let second = try await PortraitBlurFillWallpaperService.shared.preparedWallpaperURL(
+            for: sourceURL,
+            targetPixelSize: targetSize,
+            derivedWallpapersDirectory: derivedRoot
+        )
+
+        XCTAssertNotEqual(first.standardizedFileURL, sourceURL.standardizedFileURL)
+        XCTAssertEqual(first.standardizedFileURL, second.standardizedFileURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: first.path))
+        XCTAssertEqual(try imageSize(at: first), targetSize)
+
+        let mappingURL = derivedRoot
+            .appendingPathComponent("PortraitBlurFill", isDirectory: true)
+            .appendingPathComponent("mapping.json")
+        let mapping = try String(contentsOf: mappingURL, encoding: .utf8)
+        XCTAssertTrue(mapping.contains(sourceURL.standardizedFileURL.path))
+    }
+
+    func testPortraitBlurFillLeavesLandscapeSourceUntouched() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PortraitBlurFillLandscapeTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let sourceURL = root.appendingPathComponent("source.png")
+        try writeSolidImage(width: 600, height: 300, to: sourceURL)
+
+        let result = try await PortraitBlurFillWallpaperService.shared.preparedWallpaperURL(
+            for: sourceURL,
+            targetPixelSize: CGSize(width: 1600, height: 900),
+            derivedWallpapersDirectory: root.appendingPathComponent("DerivedWallpapers", isDirectory: true)
+        )
+
+        XCTAssertEqual(result.standardizedFileURL, sourceURL.standardizedFileURL)
+    }
+
+    private func writeSolidImage(width: Int, height: Int, to url: URL) throws {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw NSError(domain: "CropLayoutEngineTests", code: 1)
+        }
+        context.setFillColor(CGColor(red: 0.15, green: 0.32, blue: 0.78, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = context.makeImage(),
+              let destination = CGImageDestinationCreateWithURL(
+                  url as CFURL,
+                  "public.png" as CFString,
+                  1,
+                  nil
+              ) else {
+            throw NSError(domain: "CropLayoutEngineTests", code: 2)
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw NSError(domain: "CropLayoutEngineTests", code: 3)
+        }
+    }
+
+    private func imageSize(at url: URL) throws -> CGSize {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else {
+            throw NSError(domain: "CropLayoutEngineTests", code: 4)
+        }
+        return CGSize(width: width.doubleValue, height: height.doubleValue)
+    }
 
     private func assertRect(_ actual: UnitRect, _ x: Double, _ y: Double, _ w: Double, _ h: Double, _ file: StaticString = #filePath, _ line: UInt = #line) {
         XCTAssertEqual(actual.x, x, accuracy: 1e-9, file: file, line: line)

@@ -179,15 +179,13 @@ struct WaifuXApp {
 
     /// 配置 Kingfisher 高性能图片加载
     private static func configureKingfisher() {
-        // 内存缓存配置：256MB / 300 张 / 10 分钟过期 / 60 秒一次清理。
-        // 壁纸探索页瀑布流可能滚出几百张缩略图，仅靠 totalCostLimit 不够：
-        // 没有 expiration + cleanInterval 时，长期不访问的条目仍然驻留，
-        // RSS 会持续增长直至触发 macOS 内存压力 → 全量 clearMemoryCache()。
-        // 主动 expiration 让长尾图片自然落到磁盘缓存，缓解抖动。
-        ImageCache.default.memoryStorage.config.totalCostLimit = 256 * 1024 * 1024 // 256MB
-        ImageCache.default.memoryStorage.config.countLimit = 300
-        ImageCache.default.memoryStorage.config.expiration = .seconds(10 * 60) // 10 min
-        ImageCache.default.memoryStorage.config.cleanInterval = 60             // 60s
+        // 内存缓存配置：128MB / 180 张 / 5 分钟过期 / 30 秒一次清理。
+        // 探索页只显示缩略图；过高的 totalCostLimit 会让 RSS 长期顶在高位。
+        // 主动 expiration 让长尾图片落到磁盘缓存，滚动时再回填。
+        ImageCache.default.memoryStorage.config.totalCostLimit = 128 * 1024 * 1024 // 128MB
+        ImageCache.default.memoryStorage.config.countLimit = 180
+        ImageCache.default.memoryStorage.config.expiration = .seconds(5 * 60) // 5 min
+        ImageCache.default.memoryStorage.config.cleanInterval = 30             // 30s
 
         // 磁盘缓存配置
         ImageCache.default.diskStorage.config.sizeLimit = 500 * 1024 * 1024 // 500MB
@@ -200,6 +198,9 @@ struct WaifuXApp {
         configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 60
         configuration.timeoutIntervalForResource = 180
+        configuration.httpCookieStorage = HTTPCookieStorage.shared
+        configuration.httpCookieAcceptPolicy = .always
+        configuration.httpShouldSetCookies = true
         downloader.sessionConfiguration = configuration
         downloader.downloadTimeout = 60.0
         // ⚠️ 不设置全局 .backgroundDecode：
@@ -224,6 +225,8 @@ struct WaifuXApp {
             ImageCache.default.clearMemoryCache()
             Task { @MainActor in
                 VideoThumbnailCache.shared.clearMemoryCache()
+                LocalImageThumbnailCache.shared.clearMemoryHints()
+                WorkshopLibraryPreviewCache.shared.clearAll()
                 NotificationCenter.default.post(name: .appDidReceiveMemoryPressure, object: nil)
             }
         }
@@ -265,8 +268,11 @@ struct WaifuXApp {
     private static func applyImageRequestHeaders(to request: inout URLRequest) {
         guard let host = request.url?.host?.lowercased() else { return }
 
+        let isKonachan = host.contains("konachan.net") || host.contains("konachan.com")
         request.setValue(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            isKonachan
+                ? KonachanRequestConfiguration.browserUserAgent
+                : "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             forHTTPHeaderField: "User-Agent"
         )
         request.setValue("image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
@@ -278,12 +284,14 @@ struct WaifuXApp {
             request.setValue("https://wallhaven.cc/", forHTTPHeaderField: "Referer")
         } else if host.contains("pximg.net") {
             request.setValue("https://www.pixiv.net/", forHTTPHeaderField: "Referer")
+        } else if isKonachan {
+            request.setValue("\(KonachanRequestConfiguration.siteURL.absoluteString)/", forHTTPHeaderField: "Referer")
         }
     }
 }
 
 @MainActor
-class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcurrency SPUStandardUserDriverDelegate {
     var window: NSWindow?
     // ⚠️ 延迟初始化 SettingsViewModel，不在 AppDelegate 属性初始化阶段创建
     // 避免其 @Published didSet 在 applicationDidFinishLaunching 之前写 UserDefaults
@@ -293,9 +301,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var delayedReleaseTask: Task<Void, Never>?
     /// Sparkle 自动更新控制器（检测 + 内置弹窗 + 自动安装）
     private var updaterController: SPUStandardUpdaterController!
-    /// 仅手动退出/显式重启路径会设置；用于拦截外部工具误发的 Quit AppleEvent。
-    private var intentionalTerminationReason: String?
-    private var intentionalTerminationDeadline: Date?
+    /// 更新检查期间暂时隐藏设置窗口，避免其浮动层级遮挡 Sparkle 的状态或结果窗口。
+    private var shouldRestoreSettingsWindowAfterUpdateCheck = false
     /// 静态访问器，供 Settings 等外部触发更新检查
     static var shared: AppDelegate?
 
@@ -354,7 +361,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updaterController = SPUStandardUpdaterController(
             startingUpdater: true,
             updaterDelegate: nil,
-            userDriverDelegate: nil
+            userDriverDelegate: self
         )
 
         // 1. 初始化状态栏控制器（轻量级，不阻塞）
@@ -459,7 +466,45 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// 触发 Sparkle 更新检查（供 Settings "检查更新" 按钮调用）
     func checkForUpdates() {
+        if let settingsWindow = settingsWindowController?.window, settingsWindow.isVisible {
+            shouldRestoreSettingsWindowAfterUpdateCheck = true
+            settingsWindow.orderOut(nil)
+        }
         updaterController.checkForUpdates(nil)
+    }
+
+    func standardUserDriverWillShowModalAlert() {
+        hideSettingsWindowForUpdateCheck()
+    }
+
+    func standardUserDriverDidShowModalAlert() {
+        restoreSettingsWindowAfterUpdateCheck()
+    }
+
+    func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool,
+        forUpdate update: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        guard handleShowingUpdate else { return }
+        hideSettingsWindowForUpdateCheck()
+    }
+
+    func standardUserDriverWillFinishUpdateSession() {
+        restoreSettingsWindowAfterUpdateCheck()
+    }
+
+    private func hideSettingsWindowForUpdateCheck() {
+        guard let settingsWindow = settingsWindowController?.window, settingsWindow.isVisible else { return }
+        shouldRestoreSettingsWindowAfterUpdateCheck = true
+        settingsWindow.orderOut(nil)
+    }
+
+    private func restoreSettingsWindowAfterUpdateCheck() {
+        guard shouldRestoreSettingsWindowAfterUpdateCheck else { return }
+        shouldRestoreSettingsWindowAfterUpdateCheck = false
+        guard let settingsWindow = settingsWindowController?.window else { return }
+        settingsWindow.makeKeyAndOrderFront(nil)
     }
 
     // MARK: - 异步恢复所有数据（在窗口显示后执行，避免阻塞主线程）
@@ -476,6 +521,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
             LocalizationService.shared.restoreSavedSettings()
             ThemeManager.shared.restoreSavedSettings()
+            // 探索排序需尽早恢复，赶在 ContentView 首次 initialLoad 之前
+            self?.wallpaperViewModel.restoreExploreSortPreferences()
+            self?.mediaViewModel.restoreExploreSortPreferences()
 
             // 第2帧：权限和库数据
             DispatchQueue.main.async {
@@ -488,6 +536,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 // 第3帧：媒体库
                 DispatchQueue.main.async {
                     MediaLibraryService.shared.restoreSavedData()
+                    // 壁纸库 + 文件夹 + 媒体库都已就位，清理空字符串 / 孤儿 / 跨集合 folderID
+                    LibraryFolderStore.shared.sanitizeLibraryFolderMemberships()
 
                     // 第4帧：动漫数据
                     DispatchQueue.main.async {
@@ -506,6 +556,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         DispatchQueue.main.async {
                             PlaybackProgressCache.shared.restoreSavedData()
                             DownloadTaskService.shared.restoreSavedTasks()
+                            if let self {
+                                PersistentDownloadQueueService.shared.configure(
+                                    wallpaperViewModel: self.wallpaperViewModel,
+                                    mediaViewModel: self.mediaViewModel
+                                )
+                            }
                             WallpaperSchedulerService.shared.restoreSavedConfig()
                             ExternalDisplayConnectionCoordinator.shared.start()
 
@@ -600,32 +656,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let now = Date()
-        let intentional = intentionalTerminationReason != nil
-            && (intentionalTerminationDeadline.map { now <= $0 } ?? false)
-        let dynamicRendering = isDynamicWallpaperRendering
         let frontmost = NSWorkspace.shared.frontmostApplication
-        var metadata: [String: Any] = [
-            "intentional": intentional,
-            "intentionalReason": intentionalTerminationReason ?? "nil",
-            "dynamicRendering": dynamicRendering,
+        let metadata: [String: Any] = [
+            "dynamicRendering": isDynamicWallpaperRendering,
             "frontmostApp": frontmost?.localizedName ?? "nil",
             "frontmostBundle": frontmost?.bundleIdentifier ?? "nil",
             "appActive": NSApp.isActive,
             "appHidden": NSApp.isHidden,
             "mainWindowVisible": window?.isVisible ?? false,
-            "settingsWindowVisible": settingsWindowController?.window?.isVisible ?? false
+            "settingsWindowVisible": settingsWindowController?.window?.isVisible ?? false,
+            "decision": "allow"
         ]
-
-        if intentional || !dynamicRendering {
-            metadata["decision"] = "allow"
-            AppExitDiagnostics.record("applicationShouldTerminate", metadata: metadata)
-            return .terminateNow
-        }
-
-        metadata["decision"] = "cancelExternalQuit"
         AppExitDiagnostics.record("applicationShouldTerminate", metadata: metadata)
-        return .terminateCancel
+        // Dynamic renderers belong to the main app and are stopped in applicationWillTerminate.
+        return .terminateNow
     }
 
     func showMainWindow() {
@@ -752,6 +796,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             KingfisherManager.shared.downloader.cancelAll()
             ImageCache.default.clearMemoryCache()
             VideoThumbnailCache.shared.clearMemoryCache()
+            LocalImageThumbnailCache.shared.clearMemoryHints()
+            WorkshopLibraryPreviewCache.shared.clearAll()
             VideoPreloader.shared.clearCache()
             URLCache.shared.removeAllCachedResponses()
             clearWebKitForegroundCaches()
@@ -800,6 +846,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         PreviewWindowManager.shared.closePreview()
         ImageCache.default.clearMemoryCache()
         VideoThumbnailCache.shared.clearMemoryCache()
+        LocalImageThumbnailCache.shared.clearMemoryHints()
+        WorkshopLibraryPreviewCache.shared.clearAll()
         VideoPreloader.shared.clearCache()
         LocalWallpaperScanner.shared.clearInMemoryCache()
         WorkshopService.shared.clearForegroundState()
@@ -849,9 +897,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.terminate(nil)
     }
 
+    /// Records application-controlled exits for diagnostics without altering termination policy.
     func markIntentionalTermination(reason: String) {
-        intentionalTerminationReason = reason
-        intentionalTerminationDeadline = Date().addingTimeInterval(20)
         AppExitDiagnostics.record("intentionalTerminationMarked", metadata: [
             "reason": reason
         ])
@@ -1269,7 +1316,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let settingsWindow = settingsWindowController?.window {
             centerWindow(settingsWindow, relativeTo: window)
             settingsWindow.makeKeyAndOrderFront(nil)
-            settingsWindow.orderFrontRegardless()
             NSApp.activate(ignoringOtherApps: true)
             return
         }
@@ -1292,22 +1338,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func createAndShowSettingsWindow() {
         let settingsWindow = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 680, height: 520),
-            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         settingsWindow.title = "设置"
         settingsWindow.titlebarAppearsTransparent = true
         settingsWindow.titleVisibility = .hidden
-        settingsWindow.standardWindowButton(.closeButton)?.isHidden = true
-        settingsWindow.standardWindowButton(.miniaturizeButton)?.isHidden = true
-        settingsWindow.standardWindowButton(.zoomButton)?.isHidden = true
         settingsWindow.isMovableByWindowBackground = false
         settingsWindow.backgroundColor = NSColor(Color(hex: "1C1C1E"))
         settingsWindow.setContentSize(NSSize(width: 680, height: 520))
         settingsWindow.minSize = NSSize(width: 680, height: 520)
         settingsWindow.maxSize = NSSize(width: 680, height: 520)
         settingsWindow.isReleasedWhenClosed = false
+        settingsWindow.level = .floating
         centerWindow(settingsWindow, relativeTo: window)
         settingsWindow.tabbingMode = .disallowed
         // 设置窗口复用 AppDelegate 作为 delegate，windowShouldClose 据此区分处理
@@ -1322,7 +1366,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let windowController = NSWindowController(window: settingsWindow)
         settingsWindowController = windowController
         windowController.showWindow(nil)
-        settingsWindow.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
     }
 

@@ -1,6 +1,4 @@
 import Foundation
-import AppKit
-import AVFoundation
 
 /// 本地壁纸扫描服务
 /// 自动检测用户复制到下载目录的壁纸和媒体文件，生成基本元数据
@@ -117,243 +115,167 @@ final class LocalWallpaperScanner {
 
         let startTime = Date()
         print("[LocalWallpaperScanner] Starting local file scan...")
-        
-        var wallpapers: [LocalWallpaperItem] = []
-        var mediaItems: [LocalMediaItem] = []
-        
-        // 扫描壁纸目录
+
+        // 路径在 MainActor 解析（security-scoped）；目录枚举/轻量元数据放到后台，避免卡 UI。
         let wallpapersFolder = downloadPathManager.wallpapersFolderURL
-        if fileManager.fileExists(atPath: wallpapersFolder.path) {
-            do {
-                let contents = try fileManager.contentsOfDirectory(
-                    at: wallpapersFolder,
-                    includingPropertiesForKeys: [.contentTypeKey, .fileSizeKey],
-                    options: .skipsHiddenFiles
-                )
-                
-                for fileURL in contents {
-                    if isImageFile(fileURL) {
-                        if let item = createWallpaperItem(from: fileURL) {
+        let mediaFolder = downloadPathManager.mediaFolderURL
+
+        let (wallpapers, mediaItems) = await Task.detached(priority: .utility) {
+            var wallpapers: [LocalWallpaperItem] = []
+            var mediaItems: [LocalMediaItem] = []
+            let fm = FileManager.default
+
+            if fm.fileExists(atPath: wallpapersFolder.path) {
+                do {
+                    let contents = try fm.contentsOfDirectory(
+                        at: wallpapersFolder,
+                        includingPropertiesForKeys: [
+                            .fileSizeKey,
+                            .creationDateKey,
+                            .contentModificationDateKey
+                        ],
+                        options: .skipsHiddenFiles
+                    )
+                    for fileURL in contents where Self.isImageFileStatic(fileURL) {
+                        if let item = Self.createWallpaperItemLightweight(from: fileURL) {
                             wallpapers.append(item)
                         }
                     }
+                } catch {
+                    print("[LocalWallpaperScanner] Failed to scan wallpapers folder: \(error)")
                 }
-            } catch {
-                print("[LocalWallpaperScanner] Failed to scan wallpapers folder: \(error)")
             }
-        }
-        
-        // 扫描媒体目录
-        let mediaFolder = downloadPathManager.mediaFolderURL
-        if fileManager.fileExists(atPath: mediaFolder.path) {
-            do {
-                let contents = try fileManager.contentsOfDirectory(
-                    at: mediaFolder,
-                    includingPropertiesForKeys: [.contentTypeKey, .fileSizeKey],
-                    options: .skipsHiddenFiles
-                )
-                
-                for fileURL in contents {
-                    if isVideoFile(fileURL) {
-                        if let item = await createMediaItem(from: fileURL) {
+
+            if fm.fileExists(atPath: mediaFolder.path) {
+                do {
+                    let contents = try fm.contentsOfDirectory(
+                        at: mediaFolder,
+                        includingPropertiesForKeys: [
+                            .fileSizeKey,
+                            .creationDateKey,
+                            .contentModificationDateKey
+                        ],
+                        options: .skipsHiddenFiles
+                    )
+                    for fileURL in contents where Self.isVideoFileStatic(fileURL) {
+                        if let item = Self.createMediaItemLightweight(from: fileURL) {
                             mediaItems.append(item)
                         }
                     }
+                } catch {
+                    print("[LocalWallpaperScanner] Failed to scan media folder: \(error)")
                 }
-            } catch {
-                print("[LocalWallpaperScanner] Failed to scan media folder: \(error)")
             }
+
+            return (wallpapers, mediaItems)
+        }.value
+
+        // 预热存在性缓存，列表 isDownloaded / localFileURL 不再 stat 外置卷
+        for item in wallpapers {
+            FileExistenceCache.shared.markExisting(atPath: item.fileURL.path)
         }
-        
+        for item in mediaItems {
+            FileExistenceCache.shared.markExisting(atPath: item.fileURL.path)
+        }
+
         scannedWallpapers = wallpapers
         scannedMediaItems = mediaItems
         lastScanTime = Date()
         scanRevision &+= 1
-        
+
         print("[LocalWallpaperScanner] Scan completed in \(Date().timeIntervalSince(startTime))s, found \(wallpapers.count) wallpapers, \(mediaItems.count) media files")
+
+        // 列表缩略图在可见卡片 onAppear 时按需生成；扫描阶段不读全图、不抽视频帧
     }
-    
+
     // MARK: - 创建元数据
-    
-    private func createWallpaperItem(from fileURL: URL) -> LocalWallpaperItem? {
+
+    /// 列表扫描用：只读目录项 resourceValues，不打开 ImageIO/AVAsset（外置卡上极慢）。
+    nonisolated private static func createWallpaperItemLightweight(from fileURL: URL) -> LocalWallpaperItem? {
         let fileName = fileURL.deletingPathExtension().lastPathComponent
         let fileExtension = fileURL.pathExtension.lowercased()
-        
-        // 尝试从文件读取分辨率
-        let dimensions = getImageDimensions(fileURL)
-        let resolution = dimensions.map { "\($0.width)x\($0.height)" } ?? "Unknown"
-        let ratio = dimensions.map { String(format: "%.2f", Double($0.width) / Double($0.height)) } ?? "1.78"
-        
-        // 生成唯一 ID
         let id = "local_\(fileName)_\(fileExtension)"
-        
+        let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .creationDateKey, .contentModificationDateKey])
+        let created = values?.creationDate ?? values?.contentModificationDate
+        let createdAt = created.map { ISO8601DateFormatter().string(from: $0) }
+
         return LocalWallpaperItem(
             id: id,
             fileURL: fileURL,
             fileName: fileName,
             title: fileName.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " "),
-            resolution: resolution,
-            dimensionX: dimensions?.width ?? 1920,
-            dimensionY: dimensions?.height ?? 1080,
-            ratio: ratio,
-            fileSize: getFileSize(fileURL),
-            fileType: getMimeType(fileExtension),
-            createdAt: getCreationDate(fileURL)
+            // 分辨率延后到详情/需要筛选时再读；列表滚动不依赖精确像素
+            resolution: "Unknown",
+            dimensionX: 1920,
+            dimensionY: 1080,
+            ratio: "1.78",
+            fileSize: values?.fileSize,
+            fileType: mimeTypeStatic(fileExtension),
+            createdAt: createdAt
         )
     }
-    
-    private func createMediaItem(from fileURL: URL) async -> LocalMediaItem? {
+
+    nonisolated private static func createMediaItemLightweight(from fileURL: URL) -> LocalMediaItem? {
         let fileName = fileURL.deletingPathExtension().lastPathComponent
         let fileExtension = fileURL.pathExtension.lowercased()
-        
-        // 尝试解析文件名获取信息
-        let (parsedTitle, parsedResolution) = parseMediaFileName(fileName)
-        
-        // 尝试从视频文件读取分辨率（使用新的异步 API）
-        let videoDimensions = await getVideoDimensions(fileURL)
-        let finalResolution = videoDimensions.map { "\($0.width)x\($0.height)" } ?? parsedResolution
-        
-        // 获取视频时长（使用新的异步 API）
-        let duration = await getVideoDuration(fileURL)
-        
+        let (parsedTitle, parsedResolution) = parseMediaFileNameStatic(fileName)
         let id = "local_\(fileName)_\(fileExtension)"
-        
-        // 确保视频缩略图已生成（新导入和已有文件都会处理）
-        _ = await VideoThumbnailCache.shared.thumbnailImage(for: fileURL)
-        
+        let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .creationDateKey, .contentModificationDateKey])
+        let created = values?.creationDate ?? values?.contentModificationDate
+        let createdAt = created.map { ISO8601DateFormatter().string(from: $0) }
+
         return LocalMediaItem(
             id: id,
             fileURL: fileURL,
             fileName: fileName,
             title: parsedTitle,
-            resolution: finalResolution,
-            duration: duration,
-            fileSize: getFileSize(fileURL),
-            fileType: getMimeType(fileExtension),
-            createdAt: getCreationDate(fileURL)
+            resolution: parsedResolution,
+            duration: nil,
+            fileSize: values?.fileSize,
+            fileType: mimeTypeStatic(fileExtension),
+            createdAt: createdAt
         )
     }
-    
-    // MARK: - 文件类型检查
-    
-    private func isImageFile(_ url: URL) -> Bool {
+
+    private func createWallpaperItem(from fileURL: URL) -> LocalWallpaperItem? {
+        Self.createWallpaperItemLightweight(from: fileURL)
+    }
+
+    private func createMediaItem(from fileURL: URL) async -> LocalMediaItem? {
+        Self.createMediaItemLightweight(from: fileURL)
+    }
+
+    nonisolated private static func isImageFileStatic(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
         return ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "heic"].contains(ext)
     }
-    
-    private func isVideoFile(_ url: URL) -> Bool {
+
+    nonisolated private static func isVideoFileStatic(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
         return ["mp4", "mov", "avi", "mkv", "webm", "m4v", "flv"].contains(ext)
     }
-    
-    // MARK: - 元数据提取
-    
-    /// 获取图片尺寸
-    private func getImageDimensions(_ url: URL) -> (width: Int, height: Int)? {
-        guard let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-            return nil
-        }
-        
-        guard let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [String: Any],
-              let width = properties[kCGImagePropertyPixelWidth as String] as? Int,
-              let height = properties[kCGImagePropertyPixelHeight as String] as? Int else {
-            return nil
-        }
-        
-        // 检查方向，可能需要交换宽高
-        if let orientation = properties[kCGImagePropertyOrientation as String] as? UInt32 {
-            switch orientation {
-            case 5, 6, 7, 8: // 需要交换宽高
-                return (height, width)
-            default:
-                break
-            }
-        }
-        
-        return (width, height)
-    }
-    
-    /// 获取视频尺寸
-    private func getVideoDimensions(_ url: URL) async -> (width: Int, height: Int)? {
-        let asset = AVAsset(url: url)
-        
-        do {
-            // 使用新的异步 API 加载视频轨道
-            let tracks = try await asset.loadTracks(withMediaType: .video)
-            guard let track = tracks.first else {
-                return nil
-            }
-            
-            // 使用新的异步 API 加载尺寸和变换
-            let naturalSize = try await track.load(.naturalSize)
-            let preferredTransform = try await track.load(.preferredTransform)
-            
-            let size = naturalSize.applying(preferredTransform)
-            let width = abs(Int(size.width))
-            let height = abs(Int(size.height))
-            
-            return (width, height)
-        } catch {
-            print("[LocalWallpaperScanner] Failed to get video dimensions: \(error)")
-            return nil
-        }
-    }
-    
-    /// 获取视频时长
-    private func getVideoDuration(_ url: URL) async -> Double? {
-        let asset = AVAsset(url: url)
-        
-        do {
-            // 使用新的异步 API 加载时长
-            let duration = try await asset.load(.duration)
-            guard duration.isValid, duration != CMTime.indefinite else {
-                return nil
-            }
-            return CMTimeGetSeconds(duration)
-        } catch {
-            print("[LocalWallpaperScanner] Failed to get video duration: \(error)")
-            return nil
-        }
-    }
-    
-    /// 获取文件大小
-    private func getFileSize(_ url: URL) -> Int? {
-        do {
-            let attributes = try fileManager.attributesOfItem(atPath: url.path)
-            return attributes[.size] as? Int
-        } catch {
-            return nil
-        }
-    }
-    
-    /// 获取文件创建日期
-    private func getCreationDate(_ url: URL) -> String? {
-        do {
-            let attributes = try fileManager.attributesOfItem(atPath: url.path)
-            if let date = attributes[.creationDate] as? Date {
-                let formatter = ISO8601DateFormatter()
-                return formatter.string(from: date)
-            }
-        } catch {
-            print("[LocalWallpaperScanner] Failed to get creation date: \(error)")
-        }
-        return nil
-    }
-    
-    /// 解析媒体文件名
-    /// 格式示例: "motionbgs-video-name-4k.mp4" 或 "My Video 1080p"
-    private func parseMediaFileName(_ fileName: String) -> (title: String, resolution: String?) {
-        // 尝试提取分辨率
-        let patterns = [
-            ("(\\d{3,4})p", 1),           // 1080p, 720p
-            ("(\\d{4})x(\\d{3,4})", 0),   // 1920x1080
-            ("(4k|8k|2k)", 1),            // 4K, 8K (case insensitive)
-            ("(hd|fullhd|fhd)", 1),       // HD, FullHD
+
+    nonisolated private static func mimeTypeStatic(_ ext: String) -> String? {
+        let typeMap: [String: String] = [
+            "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+            "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp",
+            "tiff": "image/tiff", "heic": "image/heic",
+            "mp4": "video/mp4", "mov": "video/quicktime", "avi": "video/x-msvideo",
+            "mkv": "video/x-matroska", "webm": "video/webm", "m4v": "video/x-m4v",
+            "flv": "video/x-flv"
         ]
-        
+        return typeMap[ext]
+    }
+
+    nonisolated private static func parseMediaFileNameStatic(_ fileName: String) -> (title: String, resolution: String?) {
+        let patterns = [
+            ("(\\d{3,4})p", 1),
+            ("(\\d{4})x(\\d{3,4})", 0),
+            ("(4k|8k|2k)", 1),
+            ("(hd|fullhd|fhd)", 1),
+        ]
         var foundResolution: String?
         var modifiedName = fileName
-        
         for (pattern, group) in patterns {
             if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
                 let range = NSRange(modifiedName.startIndex..., in: modifiedName)
@@ -361,7 +283,6 @@ final class LocalWallpaperScanner {
                     if let resolutionRange = Range(match.range(at: group), in: modifiedName) {
                         foundResolution = String(modifiedName[resolutionRange]).uppercased()
                     }
-                    // 从标题中移除分辨率部分
                     modifiedName = regex.stringByReplacingMatches(
                         in: modifiedName,
                         options: [],
@@ -371,39 +292,17 @@ final class LocalWallpaperScanner {
                 }
             }
         }
-        
-        // 清理标题
         let cleanTitle = modifiedName
             .replacingOccurrences(of: "motionbgs-", with: "", options: .caseInsensitive)
             .replacingOccurrences(of: "wallhaven-", with: "", options: .caseInsensitive)
             .replacingOccurrences(of: "_", with: " ")
             .replacingOccurrences(of: "-", with: " ")
             .trimmingCharacters(in: .whitespaces)
-        
         return (cleanTitle.isEmpty ? fileName : cleanTitle, foundResolution)
     }
     
-    /// 获取 MIME 类型
-    private func getMimeType(_ ext: String) -> String? {
-        let typeMap: [String: String] = [
-            "jpg": "image/jpeg",
-            "jpeg": "image/jpeg",
-            "png": "image/png",
-            "webp": "image/webp",
-            "gif": "image/gif",
-            "bmp": "image/bmp",
-            "tiff": "image/tiff",
-            "heic": "image/heic",
-            "mp4": "video/mp4",
-            "mov": "video/quicktime",
-            "avi": "video/x-msvideo",
-            "mkv": "video/x-matroska",
-            "webm": "video/webm",
-            "m4v": "video/mp4",
-            "flv": "video/x-flv"
-        ]
-        return typeMap[ext.lowercased()]
-    }
+    // 图片/视频像素与时长改由详情页/设壁纸路径按需读取；
+    // 列表扫描只保留目录项 resourceValues，避免外置卡上 ImageIO/AVAsset 全量 I/O。
 }
 
 // MARK: - 本地壁纸项目
@@ -472,19 +371,20 @@ struct LocalMediaItem: Identifiable, Hashable {
     func toMediaItem() -> MediaItem {
         let resolutionLabel = resolution ?? "HD"
         
-        // 获取缩略图 URL（如果有缓存则使用缓存，否则使用视频 URL 让 Kingfisher 生成）
-        let thumbnailURL = VideoThumbnailCache.shared.thumbnailURL(for: fileURL)
+        // 列表缩略图（800×600）；锁屏/桌面请用 posterJPEG / existingWallpaperPoster，不得复用列表小图
+        let listThumbnailURL = VideoThumbnailCache.shared.thumbnailURL(for: fileURL)
+        let hdPosterURL = VideoThumbnailCache.shared.cachedPosterJPEGFileURLIfExists(forLocalVideo: fileURL)
         
         return MediaItem(
             slug: id,
             title: title,
             pageURL: fileURL,
-            thumbnailURL: thumbnailURL,
+            thumbnailURL: listThumbnailURL,
             resolutionLabel: resolutionLabel,
             collectionTitle: t("local.files"),
             summary: t("local.imported.video"),
             previewVideoURL: fileURL,
-            posterURL: thumbnailURL,
+            posterURL: hdPosterURL,
             tags: ["local", fileURL.pathExtension.lowercased()],
             exactResolution: resolution,
             durationSeconds: duration,

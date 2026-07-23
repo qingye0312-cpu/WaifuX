@@ -9,12 +9,21 @@ class SettingsViewModel: ObservableObject {
     // 直接读 UserDefaults，如果 SettingsViewModel 在 AppDelegate 属性初始化阶段被创建，
     // 会触发 _CFXPreferences 递归栈溢出（EXC_BAD_ACCESS SIGSEGV）。
     // 改用 @Published + 手动 UserDefaults 同步 + restoreSavedSettings() 延迟恢复。
+    private var systemWallpaperSyncTransitionGeneration: UInt64 = 0
 
     @Published var saveToDownloads = true {
         didSet { UserDefaults.standard.set(saveToDownloads, forKey: DownloadPathManager.persistDownloadsToAppLibraryDefaultsKey) }
     }
     @Published private var themeModeRawValue: String = ThemeMode.system.rawValue { didSet { UserDefaults.standard.set(themeModeRawValue, forKey: "theme_mode") } }
     @Published var launchAtLogin = false { didSet { UserDefaults.standard.set(launchAtLogin, forKey: "launch_at_login") } }
+    /// 永不休眠：持有 IOPM assertion，阻止空闲息屏 / 系统睡眠，锁屏时桌面可继续显示。
+    @Published var preventSystemSleep = false {
+        didSet {
+            guard !isBatchUpdating else { return }
+            UserDefaults.standard.set(preventSystemSleep, forKey: "prevent_system_sleep")
+            SleepPreventer.shared.setPreventingSleep(preventSystemSleep, reason: .userSetting)
+        }
+    }
     @Published var grainTextureEnabled = false {
         didSet {
             guard !isBatchUpdating else { return }
@@ -42,11 +51,14 @@ class SettingsViewModel: ObservableObject {
         }
     }
     @Published var pauseWhenOtherAppForeground = false { didSet { UserDefaults.standard.set(pauseWhenOtherAppForeground, forKey: "pause_when_other_app_foreground") } }
+    @Published var pauseInactiveDisplays = false { didSet { UserDefaults.standard.set(pauseInactiveDisplays, forKey: "pause_inactive_displays") } }
     @Published var pauseWhenFullscreenCovers = false { didSet { UserDefaults.standard.set(pauseWhenFullscreenCovers, forKey: "pause_when_fullscreen_covers") } }
     @Published var pauseOnBatteryPower = false { didSet { UserDefaults.standard.set(pauseOnBatteryPower, forKey: "pause_on_battery_power") } }
     @Published var pauseWhenWindowCoverage = false { didSet { UserDefaults.standard.set(pauseWhenWindowCoverage, forKey: "pause_when_window_coverage") } }
     @Published var windowCoveragePauseThreshold: Double = 50 { didSet { UserDefaults.standard.set(windowCoveragePauseThreshold, forKey: "window_coverage_pause_threshold") } }
-    @Published var hdrEnabled = true { didSet { UserDefaults.standard.set(hdrEnabled, forKey: "hdr_enabled") } }
+    /// 默认关闭：桌面 AVPlayerLayer 开启逐帧 HDR 元数据时，在部分 15.x + XDR 上会偶发整层 tone-map 闪暗。
+    /// 用户仍可在设置里手动打开；仅影响新创建的 AVPlayerItem。
+    @Published var hdrEnabled = false { didSet { UserDefaults.standard.set(hdrEnabled, forKey: "hdr_enabled") } }
     @Published var autoRemoveVideoLetterbox = false {
         didSet {
             guard !isBatchUpdating else { return }
@@ -55,14 +67,11 @@ class SettingsViewModel: ObservableObject {
             StaticImageWallpaperOverlayManager.shared.refreshAutoRemoveImageLetterbox()
         }
     }
-    @Published var frameInterpolationEnabled = false {
+    /// 为竖向静态图生成适配显示器比例的模糊延伸版本；原图保持不变。
+    @Published var portraitBlurFillEnabled = false {
         didSet {
             guard !isBatchUpdating else { return }
-            if !frameInterpolationEnabled, frameInterpolationAutoEnqueue {
-                frameInterpolationAutoEnqueue = false
-            }
-            UserDefaults.standard.set(frameInterpolationEnabled, forKey: "frame_interpolation_enabled")
-            VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
+            UserDefaults.standard.set(portraitBlurFillEnabled, forKey: "portrait_blur_fill_enabled")
         }
     }
     @Published var frameInterpolationTargetFPS: Double = 60 {
@@ -75,13 +84,23 @@ class SettingsViewModel: ObservableObject {
             }
             UserDefaults.standard.set(frameInterpolationTargetFPS, forKey: "frame_interpolation_target_fps")
             VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
+            applyVideoOptimizationSettings()
         }
     }
-    @Published var frameInterpolationAutoEnqueue = false {
+    /// 视频下载或烘焙完成后，自动「优化视频」（先循环分析再补帧）。
+    /// 与详情页 / 我的库手动「优化视频」同一流水线；手动入口不依赖此开关。
+    @Published var autoOptimizeVideosAfterDownload = false {
         didSet {
             guard !isBatchUpdating else { return }
-            UserDefaults.standard.set(frameInterpolationAutoEnqueue, forKey: "frame_interpolation_auto_enqueue")
-            FrameInterpolationQueueService.shared.autoEnqueueEnabled = frameInterpolationAutoEnqueue
+            UserDefaults.standard.set(autoOptimizeVideosAfterDownload, forKey: "frame_interpolation_auto_on_download")
+            // 旧双开关一并同步，避免分叉。
+            UserDefaults.standard.set(autoOptimizeVideosAfterDownload, forKey: "auto_analyze_loop_point")
+            // 旧 key 清理，防止被当成「切换时自动补帧」读回。
+            UserDefaults.standard.set(false, forKey: "frame_interpolation_auto_enqueue")
+            // 清理已废弃的总开关，避免其它路径误读。
+            UserDefaults.standard.set(true, forKey: "frame_interpolation_enabled")
+            UserDefaults.standard.set(true, forKey: "loop_point_analysis_enabled")
+            applyVideoOptimizationSettings()
         }
     }
     @Published var showAllWorkshopContent = false { didSet { UserDefaults.standard.set(showAllWorkshopContent, forKey: "show_all_workshop_content") } }
@@ -121,7 +140,7 @@ class SettingsViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(wallpaperEngineFPS, forKey: "wallpaper_engine_fps") }
     }
 
-    /// 壁纸引擎离线烘焙帧率 (15 ~ 60)
+    /// 壁纸引擎离线烘焙帧率 (15 ~ 显示器最高刷新率)
     @Published var sceneBakeFPS: Double = 30 {
         didSet { UserDefaults.standard.set(sceneBakeFPS, forKey: "scene_bake_fps") }
     }
@@ -164,6 +183,8 @@ class SettingsViewModel: ObservableObject {
             // 批量恢复期间抑制联动副作用，避免启动时误清实例
             guard !isBatchUpdating else { return }
             UserDefaults.standard.set(systemWallpaperSyncEnabled, forKey: "system_wallpaper_sync_enabled")
+            // 通知 web daemon：关同步后不得再 setDesktopImageURL
+            VideoWallpaperManager.shared.publishSystemWallpaperSyncControlToWebDaemon()
             // 单向联动：关闭系统壁纸同步时，强制关闭动态锁屏并清理锁屏实例
             if !systemWallpaperSyncEnabled && dynamicLockScreenEnabled {
                 dynamicLockScreenEnabled = false
@@ -173,9 +194,101 @@ class SettingsViewModel: ObservableObject {
                     }
                 }
             }
-            // 重新开启系统壁纸同步时，关闭并清除静态图 overlay（下次设壁纸走系统壁纸路径）
-            if systemWallpaperSyncEnabled {
-                StaticImageWallpaperOverlayManager.shared.clearState()
+            systemWallpaperSyncTransitionGeneration &+= 1
+            let transitionGeneration = systemWallpaperSyncTransitionGeneration
+            let enabled = systemWallpaperSyncEnabled
+            Task { @MainActor [weak self] in
+                await self?.migrateStaticWallpaperPresentation(
+                    systemSyncEnabled: enabled,
+                    generation: transitionGeneration
+                )
+            }
+        }
+    }
+
+    /// Preserves each display's visible static image when the presentation
+    /// backend changes between the system desktop and the in-app overlay.
+    private func migrateStaticWallpaperPresentation(
+        systemSyncEnabled: Bool,
+        generation: UInt64
+    ) async {
+        guard systemWallpaperSyncTransitionGeneration == generation,
+              self.systemWallpaperSyncEnabled == systemSyncEnabled else {
+            return
+        }
+
+        let screens = NSScreen.screens
+        let overlay = StaticImageWallpaperOverlayManager.shared
+
+        if !systemSyncEnabled {
+            for screen in screens {
+                guard systemWallpaperSyncTransitionGeneration == generation,
+                      !VideoWallpaperManager.shared.hasActiveWallpaper(on: screen),
+                      !WallpaperEngineXBridge.shared.isManaging(screen: screen),
+                      overlay.imageURL(for: screen) == nil,
+                      let imageURL = DesktopWallpaperSyncManager.shared.imageURL(for: screen),
+                      FileManager.default.fileExists(atPath: imageURL.path) else {
+                    continue
+                }
+                await overlay.showPrepared(imageURL: imageURL, for: screen)
+                guard systemWallpaperSyncTransitionGeneration == generation,
+                      !self.systemWallpaperSyncEnabled else {
+                    if overlay.imageURL(for: screen)?.standardizedFileURL == imageURL.standardizedFileURL {
+                        overlay.clearState(for: screen)
+                    }
+                    return
+                }
+            }
+            return
+        }
+
+        let staticEntries = screens.compactMap { screen -> (NSScreen, URL)? in
+            guard let imageURL = overlay.imageURL(for: screen),
+                  FileManager.default.fileExists(atPath: imageURL.path) else {
+                return nil
+            }
+            return (screen, imageURL)
+        }
+        guard !staticEntries.isEmpty else { return }
+
+        let workspace = NSWorkspace.shared
+        let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
+            .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
+            .allowClipping: true
+        ]
+
+        for (screen, imageURL) in staticEntries {
+            guard systemWallpaperSyncTransitionGeneration == generation,
+                  self.systemWallpaperSyncEnabled else {
+                return
+            }
+
+            let preparedURL = await overlay.preparedSystemWallpaperURL(for: imageURL)
+            guard systemWallpaperSyncTransitionGeneration == generation,
+                  self.systemWallpaperSyncEnabled else {
+                return
+            }
+            do {
+                try workspace.setDesktopImageURLForAllSpaces(
+                    preparedURL,
+                    for: screen,
+                    options: fillOptions
+                )
+                DesktopWallpaperSyncManager.shared.registerWallpaperSet(
+                    preparedURL,
+                    for: screen,
+                    options: fillOptions
+                )
+            } catch {
+                AppLogger.error(.wallpaper, "Failed to migrate static overlay into system wallpaper", metadata: [
+                    "screen": screen.localizedName,
+                    "error": error.localizedDescription
+                ])
+                continue
+            }
+
+            if overlay.imageURL(for: screen)?.standardizedFileURL == imageURL.standardizedFileURL {
+                overlay.clearState(for: screen)
             }
         }
     }
@@ -247,11 +360,15 @@ class SettingsViewModel: ObservableObject {
         UserDefaults.standard.set(grainIntensity, forKey: "arc_grain_intensity")
         UserDefaults.standard.set(hideNotch, forKey: "hide_notch")
         UserDefaults.standard.set(autoRemoveVideoLetterbox, forKey: "auto_remove_video_letterbox")
-        UserDefaults.standard.set(frameInterpolationEnabled, forKey: "frame_interpolation_enabled")
+        UserDefaults.standard.set(portraitBlurFillEnabled, forKey: "portrait_blur_fill_enabled")
         UserDefaults.standard.set(frameInterpolationTargetFPS, forKey: "frame_interpolation_target_fps")
-        let effectiveFrameInterpolationAutoEnqueue = frameInterpolationEnabled && frameInterpolationAutoEnqueue
-        frameInterpolationAutoEnqueue = effectiveFrameInterpolationAutoEnqueue
-        UserDefaults.standard.set(effectiveFrameInterpolationAutoEnqueue, forKey: "frame_interpolation_auto_enqueue")
+        // 手动优化始终可用；总开关已废弃，写 true 以免旧代码路径误判为关闭。
+        UserDefaults.standard.set(true, forKey: "frame_interpolation_enabled")
+        UserDefaults.standard.set(true, forKey: "loop_point_analysis_enabled")
+        UserDefaults.standard.set(autoOptimizeVideosAfterDownload, forKey: "auto_analyze_loop_point")
+        applyVideoOptimizationSettings()
+        UserDefaults.standard.set(autoOptimizeVideosAfterDownload, forKey: "frame_interpolation_auto_on_download")
+        UserDefaults.standard.set(false, forKey: "frame_interpolation_auto_enqueue")
         UserDefaults.standard.set(sceneRealtimeRenderingEnabled, forKey: "scene_realtime_rendering_enabled")
         UserDefaults.standard.set(proxyEnabled, forKey: "proxy_enabled")
         UserDefaults.standard.set(proxyHost, forKey: "proxy_host")
@@ -264,7 +381,7 @@ class SettingsViewModel: ObservableObject {
         VideoWallpaperManager.shared.refreshAutoRemoveVideoLetterbox()
         StaticImageWallpaperOverlayManager.shared.refreshAutoRemoveImageLetterbox()
         VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
-        FrameInterpolationQueueService.shared.autoEnqueueEnabled = effectiveFrameInterpolationAutoEnqueue
+        VideoOptimizationQueueService.shared.applySettings(autoOnDownload: autoOptimizeVideosAfterDownload)
         NotchOverlayManager.shared.setEnabled(hideNotch)
         if sceneRealtimeRenderingEnabled {
             LiquidGlassClockSettings.shared.update { $0.enabled = false }
@@ -274,6 +391,11 @@ class SettingsViewModel: ObservableObject {
         // 纯 UserDefaults 属性（批量期间 didSet 被跳过，统一补写）
         UserDefaults.standard.set(autoBakeScene, forKey: "auto_bake_scene")
         UserDefaults.standard.set(systemWallpaperSyncEnabled, forKey: "system_wallpaper_sync_enabled")
+        UserDefaults.standard.set(preventSystemSleep, forKey: "prevent_system_sleep")
+        // 启动恢复后同步给 web daemon，避免旧 daemon 仍按默认写系统桌面
+        VideoWallpaperManager.shared.publishSystemWallpaperSyncControlToWebDaemon()
+        // 恢复「永不休眠」电源 assertion（批量期间 didSet 被抑制）
+        SleepPreventer.shared.setPreventingSleep(preventSystemSleep, reason: .userSetting)
     }
 
     // MARK: - 调度器相关（延迟初始化，避免启动时阻塞）
@@ -340,24 +462,37 @@ class SettingsViewModel: ObservableObject {
                 themeModeRawValue = raw
             }
             launchAtLogin = defaults.bool(forKey: "launch_at_login")
+            preventSystemSleep = defaults.bool(forKey: "prevent_system_sleep")
             grainTextureEnabled = defaults.object(forKey: "grain_texture_enabled") as? Bool ?? false
             grainTextureQuality = defaults.string(forKey: "grain_texture_quality") ?? "high"
             let savedGrainIntensity = defaults.double(forKey: "arc_grain_intensity")
             grainIntensity = savedGrainIntensity > 0 ? savedGrainIntensity : 0.5
             hideNotch = defaults.bool(forKey: "hide_notch")
             pauseWhenOtherAppForeground = defaults.bool(forKey: "pause_when_other_app_foreground")
+            pauseInactiveDisplays = defaults.bool(forKey: "pause_inactive_displays")
             pauseWhenFullscreenCovers = defaults.bool(forKey: "pause_when_fullscreen_covers")
             pauseOnBatteryPower = defaults.bool(forKey: "pause_on_battery_power")
             pauseWhenWindowCoverage = defaults.bool(forKey: "pause_when_window_coverage")
             let savedThreshold = defaults.double(forKey: "window_coverage_pause_threshold")
             windowCoveragePauseThreshold = savedThreshold > 0 ? savedThreshold : 50
-            hdrEnabled = defaults.object(forKey: "hdr_enabled") as? Bool ?? true
+            hdrEnabled = defaults.object(forKey: "hdr_enabled") as? Bool ?? false
             autoRemoveVideoLetterbox = defaults.object(forKey: "auto_remove_video_letterbox") as? Bool ?? false
-            frameInterpolationEnabled = defaults.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
+            portraitBlurFillEnabled = defaults.object(forKey: "portrait_blur_fill_enabled") as? Bool ?? false
             frameInterpolationTargetFPS = Double(FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(Int((defaults.object(forKey: "frame_interpolation_target_fps") as? Double ?? 60.0).rounded())))
-            frameInterpolationAutoEnqueue = frameInterpolationEnabled && (defaults.object(forKey: "frame_interpolation_auto_enqueue") as? Bool ?? false)
+            // 统一为「下载后自动优化视频」。任一旧自动开关为 true 即迁移为开启。
+            // 旧 key「切换时自动」不再迁移为开启。
+            let legacyAutoInterpolate = defaults.object(forKey: "frame_interpolation_auto_on_download") as? Bool ?? false
+            let legacyAutoLoop = defaults.object(forKey: "auto_analyze_loop_point") as? Bool ?? false
+            autoOptimizeVideosAfterDownload = legacyAutoInterpolate || legacyAutoLoop
+            defaults.set(true, forKey: "frame_interpolation_enabled")
+            defaults.set(true, forKey: "loop_point_analysis_enabled")
+            defaults.set(false, forKey: "frame_interpolation_auto_enqueue")
+            defaults.set(autoOptimizeVideosAfterDownload, forKey: "frame_interpolation_auto_on_download")
+            defaults.set(autoOptimizeVideosAfterDownload, forKey: "auto_analyze_loop_point")
+            applyVideoOptimizationSettings()
             showAllWorkshopContent = defaults.bool(forKey: "show_all_workshop_content")
-            sceneRealtimeRenderingEnabled = defaults.bool(forKey: "scene_realtime_rendering_enabled")
+            // 未写过 key 时默认 true（与属性初始值一致）；bool(forKey:) 会把缺失当成 false
+            sceneRealtimeRenderingEnabled = defaults.object(forKey: "scene_realtime_rendering_enabled") as? Bool ?? true
             upscalingEnabled = defaults.object(forKey: "upscaling_enabled") as? Bool ?? true
             upscalingPercent = defaults.object(forKey: "upscaling_percent") as? Double ?? 70
             effectReductionEnabled = defaults.object(forKey: "effect_reduction_enabled") as? Bool ?? false
@@ -400,8 +535,18 @@ class SettingsViewModel: ObservableObject {
     }
 
     /// 同步自动暂停设置到 DynamicWallpaperAutoPauseManager
+    private func applyVideoOptimizationSettings() {
+        VideoOptimizationQueueService.shared.applySettings(
+            automaticPolicy: VideoOptimizationAutomaticPolicy(
+                automaticallyOptimizeVideos: autoOptimizeVideosAfterDownload,
+                targetFPS: FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(Int(frameInterpolationTargetFPS.rounded()))
+            )
+        )
+    }
+
     func syncAutoPauseSettings() {
         DynamicWallpaperAutoPauseManager.shared.pauseWhenOtherAppForeground = pauseWhenOtherAppForeground
+        DynamicWallpaperAutoPauseManager.shared.pauseInactiveDisplays = pauseInactiveDisplays
         DynamicWallpaperAutoPauseManager.shared.pauseWhenFullscreenCovers = pauseWhenFullscreenCovers
         DynamicWallpaperAutoPauseManager.shared.pauseOnBatteryPower = pauseOnBatteryPower
         DynamicWallpaperAutoPauseManager.shared.pauseWhenWindowCoverage = pauseWhenWindowCoverage

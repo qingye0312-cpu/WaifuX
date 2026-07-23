@@ -1,5 +1,78 @@
 import SwiftUI
 import Kingfisher
+import AppKit
+
+// MARK: - 光标追踪视图（不阻塞滚动）
+/// 替代 .onContinuousHover：通过 NSTrackingArea 追踪光标位置，
+/// 同时将 scrollWheel 事件转发给父级 NSScrollView，避免卡片拦截滚动。
+private struct CursorTrackingView: NSViewRepresentable {
+    let onCursorMove: (CGPoint) -> Void
+    let onCursorEnter: () -> Void
+    let onCursorExit: () -> Void
+
+    func makeNSView(context: Context) -> CursorTrackingNSView {
+        let view = CursorTrackingNSView()
+        view.onCursorMove = onCursorMove
+        view.onCursorEnter = onCursorEnter
+        view.onCursorExit = onCursorExit
+        return view
+    }
+
+    func updateNSView(_ nsView: CursorTrackingNSView, context: Context) {
+        nsView.onCursorMove = onCursorMove
+        nsView.onCursorEnter = onCursorEnter
+        nsView.onCursorExit = onCursorExit
+    }
+}
+
+private class CursorTrackingNSView: NSView {
+    var onCursorMove: ((CGPoint) -> Void)?
+    var onCursorEnter: (() -> Void)?
+    var onCursorExit: (() -> Void)?
+    private var trackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingArea { removeTrackingArea(existing) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        onCursorEnter?()
+        onCursorMove?(local)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        onCursorMove?(local)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onCursorExit?()
+    }
+
+    /// 将滚动事件转发给父级 NSScrollView，避免卡片拦截滚动
+    override func scrollWheel(with event: NSEvent) {
+        var view: NSView? = superview
+        while let v = view {
+            if let scrollView = v as? NSScrollView {
+                scrollView.scrollWheel(with: event)
+                return
+            }
+            view = v.superview
+        }
+        // 找不到 ScrollView 时走默认路径
+        super.scrollWheel(with: event)
+    }
+}
 
 // MARK: - 猜你喜欢单张卡片
 
@@ -10,53 +83,49 @@ struct GuessYouLikeCardView: View {
 
     @State private var hoverLocation: CGPoint = .zero
     @State private var isHovering: Bool = false
-    // 记录 hover 开始时间，用于滚动时过滤误触发
-    @State private var hoverStartTime: Date?
 
     private let maxTiltAngle: CGFloat = 6
-    private let hoverDebounce: TimeInterval = 0.05
     // 固定卡片尺寸
     private let cardW: CGFloat = 260
     private let cardH: CGFloat = 360
 
     var body: some View {
-        RoundedRectangle(cornerRadius: 28, style: .continuous)
-            .fill(Color.black.opacity(0.6))
-            .overlay(coverImage)
-            .overlay(contentOverlay)
-            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 28, style: .continuous)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-            .onContinuousHover { phase in
-                switch phase {
-                case .active(let location):
-                    // 防抖：首次进入 hover 时记录时间，短时间内不响应
-                    if hoverStartTime == nil {
-                        hoverStartTime = Date()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + hoverDebounce) {
-                            guard hoverStartTime != nil else { return }
-                            isHovering = true
-                            hoverLocation = location
-                        }
-                    } else {
-                        hoverLocation = location
-                    }
-                case .ended:
-                    hoverStartTime = nil
+        ZStack {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(Color.black.opacity(0.6))
+                .overlay(coverImage)
+                .overlay(contentOverlay)
+                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+                )
+
+            // ⚡ 光标追踪层：替代 .onContinuousHover，转发滚动事件给 ScrollView
+            CursorTrackingView(
+                onCursorMove: { location in
+                    // NSView 坐标系左下角原点 → 转换为 SwiftUI 左上角原点
+                    let converted = CGPoint(x: location.x, y: cardH - location.y)
+                    hoverLocation = converted
+                },
+                onCursorEnter: {
+                    isHovering = true
+                },
+                onCursorExit: {
                     isHovering = false
                     withAnimation(.easeOut(duration: 0.15)) {
                         hoverLocation = .zero
                     }
                 }
-            }
-            .rotation3DEffect(rotationY, axis: (x: 0, y: 1, z: 0), perspective: 0.3)
-            .rotation3DEffect(rotationX, axis: (x: 1, y: 0, z: 0), perspective: 0.3)
-            .scaleEffect(isHovering ? 1.02 : 1.0)
-            .animation(.easeOut(duration: 0.15), value: isHovering)
-            .shadow(color: .black.opacity(0.2), radius: 6, y: 3)
+            )
+        }
+        .frame(width: cardW, height: cardH)
+        .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .rotation3DEffect(rotationY, axis: (x: 0, y: 1, z: 0), perspective: 0.3)
+        .rotation3DEffect(rotationX, axis: (x: 1, y: 0, z: 0), perspective: 0.3)
+        .scaleEffect(isHovering ? 1.02 : 1.0)
+        .animation(.easeOut(duration: 0.15), value: isHovering)
+        .shadow(color: .black.opacity(0.2), radius: 6, y: 3)
     }
 
     // MARK: - 内容层

@@ -46,7 +46,9 @@ class WallpaperSchedulerViewModel: ObservableObject {
                 order: config.order,
                 includeWallpapers: config.includeWallpapers,
                 includeMedia: config.includeMedia,
-                displayConfigs: config.displayConfigs
+                displayConfigs: config.displayConfigs,
+                isGlobalDisplaySyncEnabled: config.isGlobalDisplaySyncEnabled,
+                globalDisplayConfig: config.globalDisplayConfig
             )
         )
     }
@@ -59,7 +61,9 @@ class WallpaperSchedulerViewModel: ObservableObject {
                 order: order,
                 includeWallpapers: config.includeWallpapers,
                 includeMedia: config.includeMedia,
-                displayConfigs: config.displayConfigs
+                displayConfigs: config.displayConfigs,
+                isGlobalDisplaySyncEnabled: config.isGlobalDisplaySyncEnabled,
+                globalDisplayConfig: config.globalDisplayConfig
             )
         )
     }
@@ -72,7 +76,9 @@ class WallpaperSchedulerViewModel: ObservableObject {
                 order: config.order,
                 includeWallpapers: include,
                 includeMedia: config.includeMedia,
-                displayConfigs: config.displayConfigs
+                displayConfigs: config.displayConfigs,
+                isGlobalDisplaySyncEnabled: config.isGlobalDisplaySyncEnabled,
+                globalDisplayConfig: config.globalDisplayConfig
             )
         )
     }
@@ -85,7 +91,9 @@ class WallpaperSchedulerViewModel: ObservableObject {
                 order: config.order,
                 includeWallpapers: config.includeWallpapers,
                 includeMedia: include,
-                displayConfigs: config.displayConfigs
+                displayConfigs: config.displayConfigs,
+                isGlobalDisplaySyncEnabled: config.isGlobalDisplaySyncEnabled,
+                globalDisplayConfig: config.globalDisplayConfig
             )
         )
     }
@@ -98,6 +106,11 @@ class WallpaperSchedulerViewModel: ObservableObject {
 
     func displayConfig(for screen: NSScreen) -> DisplaySchedulerConfig {
         schedulerService.resolvedDisplayConfig(for: screen)
+    }
+
+    /// 返回写入配置时使用的 screenID；必要时先把旧 NSScreenNumber 下的配置迁移过来。
+    func displayConfigScreenID(for screen: NSScreen) -> String {
+        schedulerService.displayConfigScreenID(for: screen)
     }
 
     func updateDisplayEnabled(_ enabled: Bool, for screenID: String) {
@@ -128,12 +141,46 @@ class WallpaperSchedulerViewModel: ObservableObject {
         schedulerService.updateDisplayWebSceneSwitchSeconds(seconds, for: screenID)
     }
 
-    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screenID: String) {
-        schedulerService.updateDisplayAutoChangeOnExternalConnect(enabled, for: screenID)
+    // MARK: - Global Display Sync
+
+    var isGlobalDisplaySyncEnabled: Bool {
+        config.isGlobalDisplaySyncEnabled
     }
 
-    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screen: NSScreen) {
-        schedulerService.updateDisplayAutoChangeOnExternalConnect(enabled, for: screen)
+    var globalDisplayConfig: DisplaySchedulerConfig {
+        config.globalDisplayConfig
+    }
+
+    func updateGlobalDisplaySyncEnabled(_ enabled: Bool) {
+        schedulerService.updateGlobalDisplaySyncEnabled(enabled)
+    }
+
+    func updateGlobalDisplayEnabled(_ enabled: Bool) {
+        schedulerService.updateGlobalDisplayEnabled(enabled)
+    }
+
+    func updateGlobalDisplayInterval(_ minutes: Int) {
+        schedulerService.updateGlobalDisplayInterval(minutes)
+    }
+
+    func updateGlobalDisplayOrder(_ order: ScheduleOrder) {
+        schedulerService.updateGlobalDisplayOrder(order)
+    }
+
+    func updateGlobalDisplayIncludeWallpapers(_ include: Bool) {
+        schedulerService.updateGlobalDisplayIncludeWallpapers(include)
+    }
+
+    func updateGlobalDisplayIncludeMedia(_ include: Bool) {
+        schedulerService.updateGlobalDisplayIncludeMedia(include)
+    }
+
+    func updateGlobalDisplayFolderIDs(_ folderIDs: [String]?) {
+        schedulerService.updateGlobalDisplayFolderIDs(folderIDs)
+    }
+
+    func updateGlobalDisplayWebSceneSwitchSeconds(_ seconds: Int?) {
+        schedulerService.updateGlobalDisplayWebSceneSwitchSeconds(seconds)
     }
 
     // MARK: - Computed Properties

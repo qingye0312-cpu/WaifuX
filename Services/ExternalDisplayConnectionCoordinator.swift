@@ -1,17 +1,28 @@
 import AppKit
 import Foundation
 
+/// Owns only external-display connection policy. Each wallpaper service keeps
+/// ownership of its renderer and persisted state; the scheduler only receives
+/// scheduler configuration requests from this coordinator.
 @MainActor
 final class ExternalDisplayConnectionCoordinator: NSObject {
     static let shared = ExternalDisplayConnectionCoordinator()
 
     private struct PendingDisplay {
         let screenID: String
+        let fingerprint: String
         let name: String
     }
 
+    private struct ExternalDisplaySnapshot {
+        let screenID: String
+        let fingerprint: String
+    }
+
+    private let knownDisplayFingerprintsKey = "external_display_known_fingerprints_v1"
+    private let legacyRetainedDisplayFingerprintsKey = "external_display_retained_fingerprints_v1"
     private var isStarted = false
-    private var previousExternalFingerprints = Set<String>()
+    private var previousExternalDisplays: [String: ExternalDisplaySnapshot] = [:]
     private var pendingWorkItem: DispatchWorkItem?
     private var pendingDisplays: [PendingDisplay] = []
     private var isPresentingPrompt = false
@@ -23,8 +34,9 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
     func start() {
         guard !isStarted else { return }
         isStarted = true
-        previousExternalFingerprints = Set(Self.currentExternalScreensByFingerprint().keys)
-
+        migrateLegacyRetainedDisplayFingerprintsIfNeeded()
+        previousExternalDisplays = Self.currentExternalDisplaySnapshots()
+        markDisplaysAsKnown(previousExternalDisplays.keys)
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleScreenParametersChanged),
@@ -35,7 +47,7 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
 
     @objc private func handleScreenParametersChanged() {
         AppLogger.error(.wallpaper, "ExternalDisplay screen parameters changed", metadata: [
-            "previousExternalFingerprints": previousExternalFingerprints.count,
+            "previousExternalFingerprints": previousExternalDisplays.count,
             "currentScreens": NSScreen.screens.map(\.wallpaperScreenIdentifier).joined(separator: ",")
         ])
         pendingWorkItem?.cancel()
@@ -49,66 +61,70 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
     }
 
     private func processCurrentDisplays() {
-        WallpaperSchedulerService.shared.relinkDisplayConfigsForCurrentScreens()
+        let scheduler = WallpaperSchedulerService.shared
+        scheduler.relinkDisplayConfigsForCurrentScreens()
 
-        let screensByFingerprint = Self.currentExternalScreensByFingerprint()
-        let currentFingerprints = Set(screensByFingerprint.keys)
-        let connectedFingerprints = currentFingerprints.subtracting(previousExternalFingerprints)
-        let disconnectedFingerprints = previousExternalFingerprints.subtracting(currentFingerprints)
+        let current = Self.currentExternalScreensByFingerprint()
+        let currentFingerprints = Set(current.keys)
+        let previousFingerprints = Set(previousExternalDisplays.keys)
+        let connectedFingerprints = currentFingerprints.subtracting(previousFingerprints)
+
         AppLogger.error(.wallpaper, "ExternalDisplay processed display change", metadata: [
             "currentExternal": currentFingerprints.count,
             "connected": connectedFingerprints.count,
-            "disconnected": disconnectedFingerprints.count,
-            "connectedFingerprints": connectedFingerprints.joined(separator: ","),
-            "disconnectedFingerprints": disconnectedFingerprints.joined(separator: ",")
+            "known": knownDisplayFingerprints.count,
+            "connectedFingerprints": connectedFingerprints.joined(separator: ",")
         ])
-        previousExternalFingerprints = currentFingerprints
 
-        guard !connectedFingerprints.isEmpty else { return }
+        previousExternalDisplays = Self.currentExternalDisplaySnapshots()
 
         for fingerprint in connectedFingerprints {
-            guard let screen = screensByFingerprint[fingerprint] else { continue }
+            guard let screen = current[fingerprint] else { continue }
             handleConnectedExternalDisplay(screen)
         }
     }
 
     private func handleConnectedExternalDisplay(_ screen: NSScreen) {
         Task { @MainActor in
-            if await restorePreviousDisplayStateIfAvailable(for: screen) {
+            if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+                // A synchronized display has no independent connect decision.
+                markDisplayAsKnown(screen.externalConnectionFingerprint)
+                WallpaperSchedulerService.shared.synchronizeCurrentGlobalWallpaperToConnectedDisplays()
                 return
             }
-            continueHandlingConnectedExternalDisplay(screen)
+
+            if knownDisplayFingerprints.contains(screen.externalConnectionFingerprint) {
+                if await restorePreviousDisplayStateIfAvailable(for: screen) {
+                    return
+                }
+                if WallpaperSchedulerService.shared.resolvedDisplayConfig(for: screen).isEnabled,
+                   WallpaperSchedulerService.shared.hasSchedulableItems(for: screen.wallpaperScreenIdentifier) {
+                    WallpaperSchedulerService.shared.triggerNextWallpaperNow(for: screen.wallpaperScreenIdentifier)
+                }
+                return
+            }
+
+            pendingDisplays.append(PendingDisplay(
+                screenID: screen.wallpaperScreenIdentifier,
+                fingerprint: screen.externalConnectionFingerprint,
+                name: screen.localizedName
+            ))
+            presentNextPromptIfNeeded()
         }
-    }
-
-    private func continueHandlingConnectedExternalDisplay(_ screen: NSScreen) {
-        let screenID = screen.wallpaperScreenIdentifier
-        let config = WallpaperSchedulerService.shared.resolvedDisplayConfig(for: screen)
-
-        if config.autoChangeOnExternalConnect {
-            WallpaperSchedulerService.shared.triggerRandomWallpaperNow(for: screenID)
-            print("[ExternalDisplay] Auto-applied random wallpaper for connected display: \(screen.localizedName)")
-            return
-        }
-
-        pendingDisplays.append(PendingDisplay(screenID: screenID, name: screen.localizedName))
-        presentNextPromptIfNeeded()
     }
 
     private func restorePreviousDisplayStateIfAvailable(for screen: NSScreen) async -> Bool {
         if VideoWallpaperManager.shared.restorePreviousVideoWallpaperIfAvailable(for: screen) {
             return true
         }
-
         if await WallpaperEngineXBridge.shared.restorePreviousWallpaperIfAvailable(for: screen) {
             return true
         }
-
         if StaticImageWallpaperOverlayManager.shared.restorePreviousImageIfAvailable(for: screen) {
             return true
         }
-
-        return false
+        // Fallback: system-native static wallpaper (including video posters).
+        return DesktopWallpaperSyncManager.shared.hasPersistedWallpaperForFingerprint(screen.wallpaperScreenFingerprint)
     }
 
     private func presentNextPromptIfNeeded() {
@@ -120,59 +136,78 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         alert.alertStyle = .informational
         alert.messageText = t("externalDisplay.connected.title")
         alert.informativeText = String(format: t("externalDisplay.connected.message"), display.name)
-        alert.addButton(withTitle: t("externalDisplay.useRandomWallpaper"))
-        alert.addButton(withTitle: t("externalDisplay.chooseWallpaper"))
-        alert.addButton(withTitle: t("externalDisplay.doNotUseWallpaper"))
-
-        let autoSwitchCheckbox = NSButton(checkboxWithTitle: t("externalDisplay.autoSwitchOnConnect"), target: nil, action: nil)
-        let displayScreen = NSScreen.screens.first { $0.wallpaperScreenIdentifier == display.screenID }
-        let displayConfig = displayScreen.map {
-            WallpaperSchedulerService.shared.resolvedDisplayConfig(for: $0)
-        } ?? WallpaperSchedulerService.shared.config.resolvedDisplayConfig(for: display.screenID)
-        autoSwitchCheckbox.state = displayConfig.autoChangeOnExternalConnect ? .on : .off
-        autoSwitchCheckbox.translatesAutoresizingMaskIntoConstraints = false
-
-        let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        accessoryView.addSubview(autoSwitchCheckbox)
-        NSLayoutConstraint.activate([
-            autoSwitchCheckbox.leadingAnchor.constraint(equalTo: accessoryView.leadingAnchor),
-            autoSwitchCheckbox.trailingAnchor.constraint(lessThanOrEqualTo: accessoryView.trailingAnchor),
-            autoSwitchCheckbox.centerYAnchor.constraint(equalTo: accessoryView.centerYAnchor),
-        ])
-        alert.accessoryView = accessoryView
+        alert.addButton(withTitle: t("externalDisplay.randomAllWallpapers"))
+        alert.addButton(withTitle: t("externalDisplay.openSchedulerSettings"))
+        alert.addButton(withTitle: t("externalDisplay.openLibraryWithoutAuto"))
+        alert.addButton(withTitle: t("externalDisplay.doNotUseAnyWallpaper"))
 
         NSApp.activate(ignoringOtherApps: true)
         let response = alert.runModal()
-        if let displayScreen {
-            WallpaperSchedulerService.shared.updateDisplayAutoChangeOnExternalConnect(
-                autoSwitchCheckbox.state == .on,
-                for: displayScreen
-            )
-        } else {
-            WallpaperSchedulerService.shared.updateDisplayAutoChangeOnExternalConnect(
-                autoSwitchCheckbox.state == .on,
-                for: display.screenID
-            )
-        }
+        markDisplayAsKnown(display.fingerprint)
 
-        switch response {
-        case .alertFirstButtonReturn:
-            WallpaperSchedulerService.shared.triggerRandomWallpaperNow(for: display.screenID)
-        case .alertSecondButtonReturn:
-            openLibrary()
-        default:
-            break
+        if let screen = NSScreen.screens.first(where: {
+            $0.wallpaperScreenIdentifier == display.screenID
+                || $0.externalConnectionFingerprint == display.fingerprint
+        }) {
+            switch response {
+            case .alertFirstButtonReturn:
+                WallpaperSchedulerService.shared.configureExternalDisplayForRandomAllWallpapers(screen)
+            case .alertSecondButtonReturn:
+                WallpaperSchedulerService.shared.configureExternalDisplayWithoutAutoSwitch(screen)
+                openSchedulerSettings()
+            case .alertThirdButtonReturn:
+                WallpaperSchedulerService.shared.configureExternalDisplayWithoutAutoSwitch(screen)
+                openLibrary()
+            default:
+                WallpaperSchedulerService.shared.configureExternalDisplayWithoutAutoSwitch(screen)
+            }
         }
 
         isPresentingPrompt = false
         presentNextPromptIfNeeded()
     }
 
+    private var knownDisplayFingerprints: Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: knownDisplayFingerprintsKey) ?? [])
+    }
+
+    private func markDisplayAsKnown(_ fingerprint: String) {
+        var fingerprints = knownDisplayFingerprints
+        guard fingerprints.insert(fingerprint).inserted else { return }
+        UserDefaults.standard.set(fingerprints.sorted(), forKey: knownDisplayFingerprintsKey)
+    }
+
+    private func markDisplaysAsKnown(_ fingerprints: Dictionary<String, ExternalDisplaySnapshot>.Keys) {
+        var known = knownDisplayFingerprints
+        let originalCount = known.count
+        known.formUnion(fingerprints)
+        guard known.count != originalCount else { return }
+        UserDefaults.standard.set(known.sorted(), forKey: knownDisplayFingerprintsKey)
+    }
+
+    private func migrateLegacyRetainedDisplayFingerprintsIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: knownDisplayFingerprintsKey) == nil else { return }
+
+        let retained = Set(defaults.stringArray(forKey: legacyRetainedDisplayFingerprintsKey) ?? [])
+        guard !retained.isEmpty else { return }
+        defaults.set(retained.sorted(), forKey: knownDisplayFingerprintsKey)
+    }
+
     private func openLibrary() {
         MainNavigationRequestStore.requestLibraryTab()
-
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.showMainWindow()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    private func openSchedulerSettings() {
+        UserDefaults.standard.set(true, forKey: "settings.openSchedulerOnNextAppearance")
+        NotificationCenter.default.post(name: .openSchedulerSettings, object: nil)
+        if let appDelegate = NSApp.delegate as? AppDelegate {
+            appDelegate.showSettingsWindow(nil)
         } else {
             NSApp.activate(ignoringOtherApps: true)
         }
@@ -185,4 +220,20 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         }
         return result
     }
+
+    private static func currentExternalDisplaySnapshots() -> [String: ExternalDisplaySnapshot] {
+        Dictionary(uniqueKeysWithValues: currentExternalScreensByFingerprint().map { fingerprint, screen in
+            (
+                fingerprint,
+                ExternalDisplaySnapshot(
+                    screenID: screen.wallpaperScreenIdentifier,
+                    fingerprint: fingerprint
+                )
+            )
+        })
+    }
+}
+
+extension Notification.Name {
+    static let openSchedulerSettings = Notification.Name("com.waifux.openSchedulerSettings")
 }

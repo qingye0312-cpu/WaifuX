@@ -46,6 +46,9 @@ class DownloadTaskService: ObservableObject {
     static let shared = DownloadTaskService()
 
     @Published var tasks: [DownloadTask] = []
+    /// Presentation-only revision used when toast suppression changes without a
+    /// transfer-state mutation.
+    @Published private(set) var toastPresentationRevision = 0
 
     private let userDefaultsKey = "download_tasks"
     private var saveTask: Task<Void, Never>?
@@ -113,6 +116,8 @@ class DownloadTaskService: ObservableObject {
     func pauseTask(id: String) {
         guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
 
+        PersistentDownloadQueueService.shared.pause(jobID: id)
+
         // 取消正在进行的下载任务（但保留进度）
         Task {
             await taskStorage.cancel(id: id)
@@ -128,20 +133,22 @@ class DownloadTaskService: ObservableObject {
 
     func resumeTask(id: String) {
         guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
-        guard tasks[index].status == .paused else { return }
+        guard tasks[index].status == .paused || tasks[index].status == .failed else { return }
 
         objectWillChange.send()
-        tasks[index].status = .downloading
+        tasks[index].status = .pending
+        tasks[index].completedAt = nil
         tasks[index].lastUpdatedAt = .now
         persistTasks()
 
-        // 注意：实际的下载恢复需要由调用方（如 WallpaperViewModel）重新启动下载
-        // 这里只是更新状态，实际的下载逻辑在调用方处理
-        print("[DownloadTaskService] Task \(id) marked for resume")
+        PersistentDownloadQueueService.shared.resume(jobID: id)
+        print("[DownloadTaskService] Task \(id) resumed")
     }
 
     func cancelTask(id: String) {
         guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
+
+        PersistentDownloadQueueService.shared.cancel(jobID: id)
 
         // 取消正在进行的下载任务
         Task {
@@ -153,7 +160,9 @@ class DownloadTaskService: ObservableObject {
         tasks[index].completedAt = Date()
         tasks[index].lastUpdatedAt = .now
         lastProgressUpdateTimes.removeValue(forKey: id)
+        let removedSuppression = suppressedToastTaskIDs.remove(id) != nil
         persistTasks()
+        if removedSuppression { publishToastPresentationChange() }
 
         print("[DownloadTaskService] Task \(id) cancelled")
     }
@@ -225,30 +234,49 @@ class DownloadTaskService: ObservableObject {
     }
 
     func markToastSuppressed(for id: String) {
-        suppressedToastTaskIDs.insert(id)
+        guard suppressedToastTaskIDs.insert(id).inserted else { return }
+        publishToastPresentationChange()
     }
 
     /// 批量抑制所有正在运行的下载任务的 toast（"后台继续"按钮使用）
     func suppressAllRunningToasts() {
+        var changed = false
         for task in tasks where task.isRunning {
-            suppressedToastTaskIDs.insert(task.id)
+            changed = suppressedToastTaskIDs.insert(task.id).inserted || changed
         }
+        if changed { publishToastPresentationChange() }
     }
 
     func clearToastSuppression(for id: String) {
-        suppressedToastTaskIDs.remove(id)
+        guard suppressedToastTaskIDs.remove(id) != nil else { return }
+        publishToastPresentationChange()
+    }
+
+    func restoreAllRunningToasts() {
+        let runningIDs = Set(tasks.filter(\.isRunning).map(\.id))
+        guard !runningIDs.isEmpty else { return }
+        let before = suppressedToastTaskIDs.count
+        suppressedToastTaskIDs.subtract(runningIDs)
+        if suppressedToastTaskIDs.count != before {
+            publishToastPresentationChange()
+        }
     }
 
     func isToastSuppressed(for id: String) -> Bool {
         suppressedToastTaskIDs.contains(id)
     }
 
+    private func publishToastPresentationChange() {
+        toastPresentationRevision &+= 1
+    }
+
     func updateProgress(id: String, progress: Double) {
         guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
-        let clampedProgress = min(max(progress, 0.0), 1.0)
+        let currentProgress = tasks[index].progress
+        // 一个 Job 内的多阶段回调可能延迟到达，UI 进度只能单调递增。
+        let clampedProgress = max(currentProgress, min(max(progress, 0.0), 1.0))
 
         // 防抖优化：如果进度变化小于 0.5% 且不是开始/结束，跳过更新
-        let currentProgress = tasks[index].progress
         let isStart = currentProgress == 0 && clampedProgress > 0
         let isComplete = clampedProgress >= 1.0
         if abs(clampedProgress - currentProgress) < 0.005 && !isStart && !isComplete {
@@ -281,8 +309,9 @@ class DownloadTaskService: ObservableObject {
         tasks[index].completedAt = Date()
         tasks[index].lastUpdatedAt = .now
         lastProgressUpdateTimes.removeValue(forKey: id)
-        suppressedToastTaskIDs.remove(id)
+        let removedSuppression = suppressedToastTaskIDs.remove(id) != nil
         persistTasks()
+        if removedSuppression { publishToastPresentationChange() }
         scheduleVisibilityRefresh()
     }
 
@@ -294,6 +323,23 @@ class DownloadTaskService: ObservableObject {
         persistTasks()
     }
 
+    func markPending(id: String) {
+        guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
+        objectWillChange.send()
+        tasks[index].status = .pending
+        tasks[index].completedAt = nil
+        tasks[index].lastUpdatedAt = .now
+        persistTasks()
+    }
+
+    func markPaused(id: String) {
+        guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
+        objectWillChange.send()
+        tasks[index].status = .paused
+        tasks[index].lastUpdatedAt = .now
+        persistTasks()
+    }
+
     func markFailed(id: String) {
         guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
         objectWillChange.send()
@@ -301,8 +347,9 @@ class DownloadTaskService: ObservableObject {
         tasks[index].completedAt = Date()
         tasks[index].lastUpdatedAt = .now
         lastProgressUpdateTimes.removeValue(forKey: id)
-        suppressedToastTaskIDs.remove(id)
+        let removedSuppression = suppressedToastTaskIDs.remove(id) != nil
         persistTasks()
+        if removedSuppression { publishToastPresentationChange() }
     }
 
     // MARK: - Persistence
@@ -382,6 +429,16 @@ class DownloadTaskService: ObservableObject {
             .first(where: { Date().timeIntervalSince($0.lastUpdatedAt) < 1.8 })
     }
 
+    var compactOverlayTask: DownloadTask? {
+        tasks
+            .filter { $0.isRunning && suppressedToastTaskIDs.contains($0.id) }
+            .sorted { lhs, rhs in
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                return lhs.id < rhs.id
+            }
+            .first
+    }
+
     var completedTasks: [DownloadTask] {
         tasks.filter { $0.status == .completed }
     }
@@ -392,5 +449,673 @@ class DownloadTaskService: ObservableObject {
 
     var latestTask: DownloadTask? {
         tasks.max(by: { $0.lastUpdatedAt < $1.lastUpdatedAt })
+    }
+}
+
+// MARK: - 统一可恢复下载执行队列
+
+/// 所有下载入口共用的可执行事实源。`DownloadTaskService` 仅保留 UI 快照和历史；
+/// 是否能在重启后恢复、当前是否占用下载槽位，一律以这里的 Job 为准。
+@MainActor
+final class PersistentDownloadQueueService {
+    static let shared = PersistentDownloadQueueService()
+
+    private enum Payload: Codable {
+        case wallpaper(Wallpaper)
+        case media(MediaItem, MediaDownloadOption?, saveToLibrary: Bool)
+        case workshop(MediaItem)
+
+        var taskID: String {
+            switch self {
+            case .wallpaper(let wallpaper):
+                return "wallpaper.\(wallpaper.id)"
+            case .media(let item, _, _):
+                return "media.\(item.id)"
+            case .workshop(let item):
+                return "workshop.\(item.id)"
+            }
+        }
+
+        var itemID: String {
+            switch self {
+            case .wallpaper(let wallpaper): return wallpaper.id
+            case .media(let item, _, _), .workshop(let item): return item.id
+            }
+        }
+
+        @MainActor
+        var isAlreadyDownloaded: Bool {
+            switch self {
+            case .wallpaper(let wallpaper):
+                return WallpaperLibraryService.shared.isDownloaded(wallpaper)
+            case .media(let item, _, _), .workshop(let item):
+                return MediaLibraryService.shared.isDownloaded(item)
+            }
+        }
+    }
+
+    private enum State: String, Codable {
+        case queued
+        case running
+        case paused
+        case failed
+    }
+
+    private enum Source: String, Codable {
+        case manual
+        case folderRedownload
+        case legacyMigration
+    }
+
+    private struct Job: Codable, Identifiable {
+        let id: String
+        var payload: Payload
+        var folderID: String?
+        var state: State
+        var source: Source
+        let addedAt: Date
+        var updatedAt: Date
+        var attemptCount: Int
+        var lastError: String?
+    }
+
+    private struct Snapshot: Codable {
+        let version: Int
+        let jobs: [Job]
+    }
+
+    private struct ActiveWorker {
+        let token: UUID
+        let task: Task<Void, Error>
+    }
+
+    /// 兼容上一版仅服务于“文件夹重新下载”的 UserDefaults Job。
+    private struct LegacyMediaJob: Codable {
+        let id: String
+        let item: MediaItem
+        let folderID: String
+        let addedAt: Date
+    }
+
+    private enum QueueError: LocalizedError {
+        case notConfigured
+        case missingResult
+        case persistenceFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .notConfigured: return "下载队列尚未完成启动配置"
+            case .missingResult: return "下载完成但没有返回本地文件"
+            case .persistenceFailed: return "无法将下载队列保存到本地"
+            }
+        }
+    }
+
+    private let maxConcurrentDownloads = 2
+    private let legacyDefaultsKey = "persistent_media_download_queue_v1"
+    private var jobs: [Job] = []
+    private var activeWorkers: [String: ActiveWorker] = [:]
+    private var completionWaiters: [String: [CheckedContinuation<URL?, Error>]] = [:]
+    /// 覆盖“共享 Job 刚结束，新调用方尚未来得及挂起”的竞态窗口。
+    private var terminalResults: [String: Result<URL?, Error>] = [:]
+    private var terminalResultOrder: [String] = []
+    /// Steam Guard 码只存内存，不写入持久化队列。
+    private var workshopGuardCodes: [String: String] = [:]
+    private var didRestore = false
+    private weak var wallpaperViewModel: WallpaperViewModel?
+    private weak var mediaViewModel: MediaExploreViewModel?
+
+    private init() {}
+
+    /// 应用启动时注入长期存活的执行器，并恢复所有未完成 Job。
+    func configure(
+        wallpaperViewModel: WallpaperViewModel,
+        mediaViewModel: MediaExploreViewModel
+    ) {
+        self.wallpaperViewModel = wallpaperViewModel
+        self.mediaViewModel = mediaViewModel
+
+        guard !didRestore else {
+            pump()
+            return
+        }
+        didRestore = true
+        restoreAndMigrateJobs()
+        pump()
+    }
+
+    func enqueueWallpaperAndWait(
+        _ wallpaper: Wallpaper,
+        folderID: String?,
+        using viewModel: WallpaperViewModel
+    ) async throws {
+        wallpaperViewModel = viewModel
+        let id = try upsert(
+            payload: .wallpaper(wallpaper),
+            folderID: folderID,
+            source: .manual,
+            persistImmediately: true
+        )
+        _ = try await waitForCompletion(of: id)
+    }
+
+    func enqueueMediaAndWait(
+        _ item: MediaItem,
+        option: MediaDownloadOption?,
+        saveToLibrary: Bool,
+        folderID: String?,
+        using viewModel: MediaExploreViewModel
+    ) async throws -> URL {
+        mediaViewModel = viewModel
+        let payload: Payload = item.id.hasPrefix("workshop_")
+            ? .workshop(item)
+            : .media(item, option, saveToLibrary: saveToLibrary)
+        let id = try upsert(
+            payload: payload,
+            folderID: folderID,
+            source: .manual,
+            persistImmediately: true
+        )
+        guard let result = try await waitForCompletion(of: id) else {
+            throw QueueError.missingResult
+        }
+        return result
+    }
+
+    func enqueueWorkshopAndWait(
+        _ item: MediaItem,
+        guardCode: String?,
+        folderID: String?,
+        using viewModel: MediaExploreViewModel
+    ) async throws {
+        mediaViewModel = viewModel
+        let id = try upsert(
+            payload: .workshop(item),
+            folderID: folderID,
+            source: .manual,
+            persistImmediately: true
+        )
+        if let guardCode, !guardCode.isEmpty {
+            workshopGuardCodes[id] = guardCode
+        }
+        _ = try await waitForCompletion(of: id)
+    }
+
+    /// 重新下载必须先完整落盘 Job，再允许调用方删除旧文件。
+    /// `folderID` 为 nil 或空时，下载完成后回到库根目录。
+    @discardableResult
+    func stage(_ items: [MediaItem], folderID: String?) -> Bool {
+        guard !items.isEmpty else { return false }
+        let originalJobs = jobs
+        var presentationPayloads: [Payload] = []
+        let normalizedFolderID = folderID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedFolderID = (normalizedFolderID?.isEmpty == false) ? normalizedFolderID : nil
+        for item in items {
+            let payload: Payload = item.id.hasPrefix("workshop_")
+                ? .workshop(item)
+                : .media(item, nil, saveToLibrary: true)
+            if let existing = jobs.first(where: { $0.id == payload.taskID }) {
+                if existing.state == .failed || existing.state == .paused {
+                    presentationPayloads.append(payload)
+                }
+            } else {
+                presentationPayloads.append(payload)
+            }
+            do {
+                _ = try upsert(
+                    payload: payload,
+                    folderID: resolvedFolderID,
+                    source: .folderRedownload,
+                    persistImmediately: false,
+                    updatePresentation: false
+                )
+            } catch {
+                jobs = originalJobs
+                return false
+            }
+        }
+        guard persistJobs() else {
+            jobs = originalJobs
+            return false
+        }
+        for payload in presentationPayloads {
+            addPresentationTask(for: payload)
+            DownloadTaskService.shared.markPending(id: payload.taskID)
+        }
+        return true
+    }
+
+    /// 兼容旧调用；新调度器始终滚动补齐两个槽位，不再按固定批次等待。
+    func start(using viewModel: MediaExploreViewModel) {
+        mediaViewModel = viewModel
+        pump()
+    }
+
+    func pause(jobID: String) {
+        guard let index = jobs.firstIndex(where: { $0.id == jobID }) else { return }
+        jobs[index].state = .paused
+        jobs[index].updatedAt = .now
+        activeWorkers[jobID]?.task.cancel()
+        persistJobs()
+    }
+
+    func resume(jobID: String) {
+        guard let index = jobs.firstIndex(where: { $0.id == jobID }),
+              jobs[index].state == .paused || jobs[index].state == .failed else {
+            return
+        }
+        jobs[index].state = .queued
+        jobs[index].updatedAt = .now
+        jobs[index].lastError = nil
+        clearTerminalResult(for: jobID)
+        DownloadTaskService.shared.markPending(id: jobID)
+        persistJobs()
+        pump()
+    }
+
+    func cancel(jobID: String) {
+        activeWorkers[jobID]?.task.cancel()
+        activeWorkers.removeValue(forKey: jobID)
+        workshopGuardCodes.removeValue(forKey: jobID)
+        jobs.removeAll { $0.id == jobID }
+        let result: Result<URL?, Error> = .failure(CancellationError())
+        storeTerminalResult(result, for: jobID)
+        resumeWaiters(for: jobID, with: result)
+        persistJobs()
+        pump()
+    }
+
+    func retry(_ task: DownloadTask) {
+        if jobs.contains(where: { $0.id == task.id }) {
+            resume(jobID: task.id)
+            return
+        }
+
+        let payload: Payload?
+        switch task.kind {
+        case .wallpaper:
+            payload = task.wallpaper.map(Payload.wallpaper)
+        case .media:
+            payload = task.mediaItem.map { .media($0, nil, saveToLibrary: true) }
+        case .workshop:
+            payload = (task.workshopItem ?? task.mediaItem).map(Payload.workshop)
+        }
+        guard let payload else { return }
+        do {
+            _ = try upsert(
+                payload: payload,
+                folderID: nil,
+                source: .manual,
+                persistImmediately: true
+            )
+        } catch {
+            DownloadTaskService.shared.markFailed(id: task.id)
+            return
+        }
+        pump()
+    }
+
+    func retryAndWait(_ task: DownloadTask) async throws {
+        retry(task)
+        guard jobs.contains(where: { $0.id == task.id }) else {
+            throw QueueError.missingResult
+        }
+        _ = try await waitForCompletion(of: task.id)
+    }
+
+    private func waitForCompletion(of jobID: String) async throws -> URL? {
+        if let result = terminalResults[jobID] {
+            return try result.get()
+        }
+        guard jobs.contains(where: { $0.id == jobID }) else {
+            throw QueueError.missingResult
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            completionWaiters[jobID, default: []].append(continuation)
+            pump()
+        }
+    }
+
+    @discardableResult
+    private func upsert(
+        payload: Payload,
+        folderID: String?,
+        source: Source,
+        persistImmediately: Bool,
+        updatePresentation: Bool = true
+    ) throws -> String {
+        let originalJobs = jobs
+        let id = payload.taskID
+        let normalizedFolderID = folderID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var shouldResetPresentation = false
+        if let index = jobs.firstIndex(where: { $0.id == id }) {
+            // 已运行的 worker 持有当时的 Job 快照，不在中途改写路径/参数。
+            if jobs[index].state != .running {
+                jobs[index].payload = payload
+                jobs[index].folderID = normalizedFolderID?.isEmpty == false ? normalizedFolderID : nil
+                jobs[index].source = source
+            }
+            if jobs[index].state == .failed || jobs[index].state == .paused {
+                jobs[index].state = .queued
+                jobs[index].lastError = nil
+                shouldResetPresentation = true
+            }
+            jobs[index].updatedAt = .now
+        } else {
+            jobs.append(
+                Job(
+                    id: id,
+                    payload: payload,
+                    folderID: normalizedFolderID?.isEmpty == false ? normalizedFolderID : nil,
+                    state: .queued,
+                    source: source,
+                    addedAt: .now,
+                    updatedAt: .now,
+                    attemptCount: 0,
+                    lastError: nil
+                )
+            )
+            shouldResetPresentation = true
+        }
+        jobs.sort { $0.addedAt < $1.addedAt }
+        // 相同下载的多个调用方共享一个 Job；不覆盖正在进展的 UI 快照，
+        // 否则进度会被重置为 0 并表现为数字乱跳。
+        if persistImmediately && !persistJobs() {
+            jobs = originalJobs
+            throw QueueError.persistenceFailed
+        }
+        if shouldResetPresentation {
+            clearTerminalResult(for: id)
+        }
+        if updatePresentation && shouldResetPresentation {
+            addPresentationTask(for: payload)
+            DownloadTaskService.shared.markPending(id: id)
+        }
+        return id
+    }
+
+    /// 动态 worker pool：任意槽位结束后立即取下一个 FIFO Job。
+    private func pump() {
+        while activeWorkers.count < maxConcurrentDownloads,
+              let index = jobs.firstIndex(where: { $0.state == .queued }) {
+            jobs[index].state = .running
+            jobs[index].updatedAt = .now
+            jobs[index].attemptCount += 1
+            let job = jobs[index]
+            DownloadTaskService.shared.markDownloading(id: job.id)
+            persistJobs()
+
+            let workerToken = UUID()
+            let worker = Task<Void, Error> { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let result = try await self.execute(job)
+                    try Task.checkCancellation()
+                    self.finish(jobID: job.id, workerToken: workerToken, result: result)
+                } catch {
+                    self.fail(jobID: job.id, workerToken: workerToken, error: error)
+                    throw error
+                }
+            }
+            activeWorkers[job.id] = ActiveWorker(token: workerToken, task: worker)
+            DownloadTaskService.shared.registerDownloadTask(id: job.id, task: worker)
+        }
+    }
+
+    private func execute(_ job: Job) async throws -> URL? {
+        switch job.payload {
+        case .wallpaper(let wallpaper):
+            guard let wallpaperViewModel else { throw QueueError.notConfigured }
+            try await wallpaperViewModel.executeQueuedWallpaperDownload(
+                wallpaper,
+                folderID: job.folderID,
+                taskID: job.id
+            )
+            return nil
+        case .media(let item, let option, let saveToLibrary):
+            guard let mediaViewModel else { throw QueueError.notConfigured }
+            return try await mediaViewModel.executeQueuedMediaDownload(
+                item,
+                option: option,
+                saveToLibrary: saveToLibrary,
+                folderID: job.folderID,
+                taskID: job.id
+            )
+        case .workshop(let item):
+            guard let mediaViewModel else { throw QueueError.notConfigured }
+            return try await mediaViewModel.executeQueuedWorkshopDownload(
+                item,
+                guardCode: workshopGuardCodes[job.id],
+                folderID: job.folderID,
+                taskID: job.id
+            )
+        }
+    }
+
+    private func finish(jobID: String, workerToken: UUID, result: URL?) {
+        guard activeWorkers[jobID]?.token == workerToken else { return }
+        activeWorkers.removeValue(forKey: jobID)
+        workshopGuardCodes.removeValue(forKey: jobID)
+        DownloadTaskService.shared.unregisterDownloadTask(id: jobID)
+        DownloadTaskService.shared.markCompleted(id: jobID)
+        jobs.removeAll { $0.id == jobID }
+        persistJobs()
+        let terminalResult: Result<URL?, Error> = .success(result)
+        storeTerminalResult(terminalResult, for: jobID)
+        resumeWaiters(for: jobID, with: terminalResult)
+        pump()
+    }
+
+    private func fail(jobID: String, workerToken: UUID, error: Error) {
+        // 取消后同 ID 可能已经重新入队；旧 worker 绝不能删掉新 Job/worker。
+        guard activeWorkers[jobID]?.token == workerToken else { return }
+        activeWorkers.removeValue(forKey: jobID)
+        workshopGuardCodes.removeValue(forKey: jobID)
+        DownloadTaskService.shared.unregisterDownloadTask(id: jobID)
+
+        guard let index = jobs.firstIndex(where: { $0.id == jobID }) else {
+            let result: Result<URL?, Error> = .failure(error)
+            storeTerminalResult(result, for: jobID)
+            resumeWaiters(for: jobID, with: result)
+            pump()
+            return
+        }
+
+        if jobs[index].state == .paused {
+            let result: Result<URL?, Error> = .failure(CancellationError())
+            storeTerminalResult(result, for: jobID)
+            resumeWaiters(for: jobID, with: result)
+        } else if error is CancellationError {
+            // 用户可能在旧 worker 退出前已点了“继续”。此时 Job 已回到
+            // queued，必须保留并由 pump 立即重启，不能被旧 worker 删掉。
+            if jobs[index].state != .queued {
+                jobs.remove(at: index)
+                let result: Result<URL?, Error> = .failure(error)
+                storeTerminalResult(result, for: jobID)
+                resumeWaiters(for: jobID, with: result)
+            }
+        } else {
+            jobs[index].state = .failed
+            jobs[index].updatedAt = .now
+            jobs[index].lastError = error.localizedDescription
+            DownloadTaskService.shared.markFailed(id: jobID)
+            let result: Result<URL?, Error> = .failure(error)
+            storeTerminalResult(result, for: jobID)
+            resumeWaiters(for: jobID, with: result)
+        }
+        persistJobs()
+        pump()
+    }
+
+    private func resumeWaiters(
+        for jobID: String,
+        with result: Result<URL?, Error>
+    ) {
+        let waiters = completionWaiters.removeValue(forKey: jobID) ?? []
+        for waiter in waiters {
+            switch result {
+            case .success(let url): waiter.resume(returning: url)
+            case .failure(let error): waiter.resume(throwing: error)
+            }
+        }
+    }
+
+    private func storeTerminalResult(_ result: Result<URL?, Error>, for jobID: String) {
+        terminalResults[jobID] = result
+        terminalResultOrder.removeAll { $0 == jobID }
+        terminalResultOrder.append(jobID)
+        while terminalResultOrder.count > 100 {
+            let expiredID = terminalResultOrder.removeFirst()
+            terminalResults.removeValue(forKey: expiredID)
+        }
+    }
+
+    private func clearTerminalResult(for jobID: String) {
+        terminalResults.removeValue(forKey: jobID)
+        terminalResultOrder.removeAll { $0 == jobID }
+    }
+
+    private func addPresentationTask(for payload: Payload) {
+        switch payload {
+        case .wallpaper(let wallpaper):
+            _ = DownloadTaskService.shared.addTask(wallpaper: wallpaper)
+        case .media(let item, _, _):
+            _ = DownloadTaskService.shared.addTask(mediaItem: item)
+        case .workshop(let item):
+            _ = DownloadTaskService.shared.addTask(workshopWallpaper: item)
+        }
+    }
+
+    private func restoreAndMigrateJobs() {
+        jobs = loadSnapshotJobs()
+        mergeLegacyMediaJobs()
+        mergeLegacyPresentationTasks()
+
+        var seen = Set<String>()
+        jobs = jobs
+            .sorted { $0.addedAt < $1.addedAt }
+            .filter { seen.insert($0.id).inserted && !$0.payload.isAlreadyDownloaded }
+            .map { job in
+                var restored = job
+                if restored.state == .running {
+                    restored.state = .queued
+                    restored.updatedAt = .now
+                }
+                return restored
+            }
+
+        for job in jobs {
+            addPresentationTask(for: job.payload)
+            switch job.state {
+            case .queued, .running:
+                DownloadTaskService.shared.markPending(id: job.id)
+            case .paused:
+                DownloadTaskService.shared.markPaused(id: job.id)
+            case .failed:
+                DownloadTaskService.shared.markFailed(id: job.id)
+            }
+        }
+        if persistJobs() {
+            UserDefaults.standard.removeObject(forKey: legacyDefaultsKey)
+        }
+    }
+
+    private func loadSnapshotJobs() -> [Job] {
+        guard let data = try? Data(contentsOf: checkpointURL) else { return [] }
+        do {
+            return try JSONDecoder().decode(Snapshot.self, from: data).jobs
+        } catch {
+            AppLogger.error(.download, "下载队列快照解码失败", metadata: [
+                "path": checkpointURL.path,
+                "error": error.localizedDescription
+            ])
+            return []
+        }
+    }
+
+    private func mergeLegacyMediaJobs() {
+        guard let data = UserDefaults.standard.data(forKey: legacyDefaultsKey),
+              let legacyJobs = try? JSONDecoder().decode([LegacyMediaJob].self, from: data) else {
+            return
+        }
+        for legacy in legacyJobs where !jobs.contains(where: { $0.id == legacy.id }) {
+            let payload: Payload = legacy.item.id.hasPrefix("workshop_")
+                ? .workshop(legacy.item)
+                : .media(legacy.item, nil, saveToLibrary: true)
+            jobs.append(
+                Job(
+                    id: payload.taskID,
+                    payload: payload,
+                    folderID: legacy.folderID,
+                    state: .queued,
+                    source: .legacyMigration,
+                    addedAt: legacy.addedAt,
+                    updatedAt: .now,
+                    attemptCount: 0,
+                    lastError: nil
+                )
+            )
+        }
+    }
+
+    private func mergeLegacyPresentationTasks() {
+        let unfinished = DownloadTaskService.shared.tasks.filter {
+            $0.status == .pending || $0.status == .downloading || $0.status == .paused
+        }
+        for task in unfinished where !jobs.contains(where: { $0.id == task.id }) {
+            let payload: Payload?
+            switch task.kind {
+            case .wallpaper:
+                payload = task.wallpaper.map(Payload.wallpaper)
+            case .media:
+                payload = task.mediaItem.map { .media($0, nil, saveToLibrary: true) }
+            case .workshop:
+                payload = (task.workshopItem ?? task.mediaItem).map(Payload.workshop)
+            }
+            guard let payload, !payload.isAlreadyDownloaded else { continue }
+            jobs.append(
+                Job(
+                    id: payload.taskID,
+                    payload: payload,
+                    folderID: nil,
+                    state: .queued,
+                    source: .legacyMigration,
+                    addedAt: task.createdAt,
+                    updatedAt: .now,
+                    attemptCount: 0,
+                    lastError: nil
+                )
+            )
+        }
+    }
+
+    @discardableResult
+    private func persistJobs() -> Bool {
+        do {
+            let directory = checkpointURL.deletingLastPathComponent()
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            let data = try JSONEncoder().encode(Snapshot(version: 2, jobs: jobs))
+            try data.write(to: checkpointURL, options: .atomic)
+            return true
+        } catch {
+            AppLogger.error(.download, "下载队列快照写入失败", metadata: [
+                "path": checkpointURL.path,
+                "error": error.localizedDescription
+            ])
+            return false
+        }
+    }
+
+    private var checkpointURL: URL {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first!
+            .appendingPathComponent("com.waifux.app", isDirectory: true)
+            .appendingPathComponent("DownloadQueue", isDirectory: true)
+            .appendingPathComponent("download-queue-v2.json", isDirectory: false)
     }
 }

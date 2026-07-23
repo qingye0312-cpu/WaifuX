@@ -7,6 +7,7 @@
 //  支持多显示器：每个显示器可以部署不同的视频，扩展根据 choiceConfiguration 选择对应视频。
 
 import AVFoundation
+import Combine
 import Foundation
 import AppKit
 import ImageIO
@@ -20,7 +21,7 @@ import notify
 /// 2. 主 App 维护“显示器 -> 当前桌面视频源”映射
 /// 3. 实例激活后，主 App 仅向对应显示器实例推送桌面帧，不自动切换系统壁纸选择
 @MainActor
-final class LockScreenWallpaperService {
+final class LockScreenWallpaperService: ObservableObject {
     static let shared = LockScreenWallpaperService()
 
     struct DisplayInstance: Codable, Sendable {
@@ -39,6 +40,11 @@ final class LockScreenWallpaperService {
     /// 当前写入共享容器的镜像帧源路径
     private(set) var currentMirroringSourcePath: String?
 
+    /// 动态锁屏扩展当前显示的静态图原始来源。扩展实际使用的是共享容器内的副本，
+    /// UI 需要这里的原始 URL 才能反查到资料库条目。
+    @Published private(set) var staticImageSourceChangeSignal = 0
+    private var staticImageSourceURLByDisplayID: [UInt32: URL] = [:]
+
     /// 已写入共享容器的视频 ID 集合（兼容旧缓存清理）
     private var deployedVideoIDs: Set<String> = []
 
@@ -52,10 +58,20 @@ final class LockScreenWallpaperService {
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID)
     }
 
-    private init() {}
+    private init() {
+        restoreStaticImageSourceURLs()
+    }
 
     var displayInstancesURL: URL? {
         sharedContainerURL?.appendingPathComponent(displayInstancesFileName)
+    }
+
+    /// 返回扩展当前在指定屏幕上渲染的静态图原始来源。
+    func staticImageSourceURL(for screen: NSScreen) -> URL? {
+        guard let displayID = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value else {
+            return nil
+        }
+        return staticImageSourceURLByDisplayID[displayID]
     }
 
     // MARK: - Public API
@@ -128,6 +144,13 @@ final class LockScreenWallpaperService {
             prefs.currentImagePaths = prefs.currentImagePaths?.filter { key, _ in
                 !displayIDs.contains { "display-\($0)" == key }
             }
+            prefs.currentImageSourceURLs = prefs.currentImageSourceURLs?.filter { key, _ in
+                !displayIDs.contains { "display-\($0)" == key }
+            }
+            for displayID in displayIDs {
+                staticImageSourceURLByDisplayID.removeValue(forKey: displayID)
+            }
+            staticImageSourceChangeSignal &+= 1
         }
         let data = try JSONEncoder().encode(prefs)
         try data.write(to: prefsURL, options: .atomic)
@@ -211,10 +234,14 @@ final class LockScreenWallpaperService {
             prefs.currentRealtimeSourceKind = nil
             // Per-display: 本批 displayIDs 全部指向该图片
             var imageMap = prefs.currentImagePaths ?? [:]
+            var sourceMap = prefs.currentImageSourceURLs ?? [:]
             for (displayID, path) in deployedImagePaths {
                 imageMap["display-\(displayID)"] = path
+                sourceMap["display-\(displayID)"] = imageURL.absoluteString
+                staticImageSourceURLByDisplayID[displayID] = imageURL
             }
             prefs.currentImagePaths = imageMap
+            prefs.currentImageSourceURLs = sourceMap
             // 该图片覆盖这些屏的视频路径
             prefs.currentVideoPaths = prefs.currentVideoPaths?.filter { key, _ in
                 !displayIDs.contains { "display-\($0)" == key }
@@ -222,6 +249,7 @@ final class LockScreenWallpaperService {
             let data = try JSONEncoder().encode(prefs)
             try data.write(to: prefsURL, options: .atomic)
             currentMirroringSourcePath = lastPath
+            staticImageSourceChangeSignal &+= 1
         }
 
         syncInstanceCatalogToSocketServer()
@@ -307,6 +335,8 @@ final class LockScreenWallpaperService {
 
         currentMirroringSourcePath = nil
         deployedVideoIDs.removeAll()
+        staticImageSourceURLByDisplayID.removeAll()
+        staticImageSourceChangeSignal &+= 1
         if #available(macOS 26.0, *) {
             WallpaperExtensionSocketServer.shared.clearDisplayVideos()
         }
@@ -731,6 +761,27 @@ final class LockScreenWallpaperService {
         "display-\(displayID)"
     }
 
+    private func restoreStaticImageSourceURLs() {
+        guard let container = sharedContainerURL else { return }
+
+        let prefsURL = container.appendingPathComponent(prefsFileName)
+        guard let data = try? Data(contentsOf: prefsURL),
+              let prefs = try? JSONDecoder().decode(PrefsFile.self, from: data),
+              let sourceURLs = prefs.currentImageSourceURLs else {
+            return
+        }
+
+        staticImageSourceURLByDisplayID = sourceURLs.reduce(into: [:]) { result, entry in
+            let (key, value) = entry
+            guard key.hasPrefix("display-"),
+                  let displayID = UInt32(key.dropFirst("display-".count)),
+                  let url = URL(string: value) else {
+                return
+            }
+            result[displayID] = url
+        }
+    }
+
     private func normalizedImageExtension(from url: URL) -> String {
         let ext = url.pathExtension.lowercased()
         if ["jpg", "jpeg", "png", "heic", "webp", "tiff", "bmp"].contains(ext) {
@@ -878,6 +929,8 @@ final class LockScreenWallpaperService {
         var currentVideoPaths: [String: String]?
         /// Per-display image paths: same scheme as currentVideoPaths.
         var currentImagePaths: [String: String]?
+        /// Original static image URLs for UI state recovery. The extension ignores this metadata.
+        var currentImageSourceURLs: [String: String]?
     }
 }
 

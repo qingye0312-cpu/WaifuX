@@ -14,40 +14,29 @@ printf '%s\n' "$newv" > "$VFILE"
 bash "$ROOT/scripts/sync-version.sh"
 
 # 同步 Docs/appcast.xml（Sparkle 自动更新 feed）
-# 从 git commit 自动生成更新内容（与 CI release.yml 逻辑一致）
+# 从 git commit（subject + body）自动生成更新内容（与 CI release.yml 逻辑一致）
 APPLECAST="$ROOT/Docs/appcast.xml"
 if [ -f "$APPLECAST" ]; then
   PUB_DATE=$(date -R 2>/dev/null || date "+%a, %d %b %Y %H:%M:%S %z")
 
-  # 获取上一个 tag，生成 changelog
   PREV_TAG=$(cd "$ROOT" && git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+  # subject 作标题，body 每行作嵌套 <li>（见 generate-appcast-changelog.py）
   if [ -n "$PREV_TAG" ]; then
-    CHANGELOG=$(cd "$ROOT" && git log "$PREV_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges | head -30)
+    export APPCAST_DESC=$(cd "$ROOT" && python3 "$ROOT/scripts/generate-appcast-changelog.py" \
+      --format html --version "$newv" --since "$PREV_TAG")
   else
-    CHANGELOG="- Initial release"
+    export APPCAST_DESC=$(cd "$ROOT" && python3 "$ROOT/scripts/generate-appcast-changelog.py" \
+      --format html --version "$newv")
   fi
+  export APPCAST_VERSION="$newv"
+  export APPCAST_PUB_DATE="$PUB_DATE"
 
-  # 生成 <li> 列表
-  ITEMS=""
-  while IFS= read -r line; do
-    line=$(echo "$line" | sed 's/^- //')
-    [ -n "$line" ] && ITEMS="${ITEMS}          <li>${line}</li>
-"
-  done <<< "$CHANGELOG"
-
-  # 构建 description CDATA 块
-  DESC="        <h3>WaifuX $newv</h3>
-        <ul>
-${ITEMS}        </ul>"
-
-  # 用 Python 重写整个 appcast.xml（避免 sed 处理特殊字符问题）
+  # 用 Python 重写整个 appcast.xml（@@ 占位，避免 body 中 {} 触发 format）
   cd "$ROOT" && python3 -c "
-import sys
-
-version = sys.argv[1]
-pub_date = sys.argv[2]
-desc = sys.argv[3]
-
+import os
+version = os.environ['APPCAST_VERSION']
+pub_date = os.environ['APPCAST_PUB_DATE']
+desc = os.environ.get('APPCAST_DESC', '')
 xml = '''<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <rss version=\"2.0\" xmlns:sparkle=\"http://www.andymatuschak.org/xml-namespaces/sparkle\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">
   <channel>
@@ -56,27 +45,31 @@ xml = '''<?xml version=\"1.0\" encoding=\"utf-8\"?>
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version {version}</title>
-      <sparkle:version>{version}</sparkle:version>
-      <sparkle:shortVersionString>{version}</sparkle:shortVersionString>
-      <pubDate>{pub_date}</pubDate>
+      <title>Version @@VERSION@@</title>
+      <sparkle:version>@@VERSION@@</sparkle:version>
+      <sparkle:shortVersionString>@@VERSION@@</sparkle:shortVersionString>
+      <pubDate>@@PUB_DATE@@</pubDate>
       <description><![CDATA[
-{desc}
+@@DESC@@
       ]]></description>
       <enclosure
-        url=\"https://github.com/jipika/WaifuX/releases/download/v{version}/WaifuX.dmg\"
+        url=\"https://github.com/jipika/WaifuX/releases/download/v@@VERSION@@/WaifuX.dmg\"
         type=\"application/octet-stream\"
         length=\"0\"
       />
     </item>
   </channel>
-</rss>'''.format(version=version, pub_date=pub_date, desc=desc)
-
+</rss>
+'''
+xml = (xml
+  .replace('@@VERSION@@', version)
+  .replace('@@PUB_DATE@@', pub_date)
+  .replace('@@DESC@@', desc))
 with open('Docs/appcast.xml', 'w') as f:
     f.write(xml)
-" "$newv" "$PUB_DATE" "$DESC"
+"
 
-  echo "Synced appcast.xml -> $newv (changelog from $PREV_TAG)" >&2
+  echo "Synced appcast.xml -> $newv (changelog from ${PREV_TAG:-初始版本})" >&2
 fi
 
 cd "$ROOT" && git add VERSION project.yml Docs/appcast.xml

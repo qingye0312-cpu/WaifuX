@@ -50,12 +50,20 @@ class WallpaperViewModel: ObservableObject {
     @Published var puritySketchy = false
     @Published var purityNSFW = false
 
-    // 排序选项
-    @Published var sortingOption: SortingOption = .dateAdded
+    // 排序选项（用户选择过则跨启动持久化；恢复阶段通过 isRestoringExploreSort 跳过写入）
+    @Published var sortingOption: SortingOption = .dateAdded {
+        didSet {
+            persistExploreSortIfNeeded(sortingOption.rawValue, key: Self.sortingOptionDefaultsKey, changed: sortingOption != oldValue)
+        }
+    }
     @Published var orderDescending = true
 
     // TopRange (用于 toplist 排序)
-    @Published var topRange: TopRange = .oneMonth
+    @Published var topRange: TopRange = .oneMonth {
+        didSet {
+            persistExploreSortIfNeeded(topRange.rawValue, key: Self.topRangeDefaultsKey, changed: topRange != oldValue)
+        }
+    }
 
     // 附加筛选
     @Published var selectedResolutions: [String] = []
@@ -63,13 +71,71 @@ class WallpaperViewModel: ObservableObject {
     @Published var selectedColors: [String] = []
     @Published var atleastResolution: String? = nil  // 最小分辨率，如 "3840x2160"
     @Published var selected4KCategorySlug: String? = nil  // 4K 源的分类 slug（如 "anime", "nature"）
-    @Published var selected4KSorting: FourKSortingOption = .latest  // 4K 源的排序方式
-    @Published var selectedKonachanSorting: KonachanSorting = .dateAdded  // Konachan 源的排序方式
-    @Published var selectedPixivRankingMode: PixivRankingMode = .weekly  // Pixiv 源的排行模式（默认周榜）
+    @Published var selected4KSorting: FourKSortingOption = .latest {  // 4K 源的排序方式
+        didSet {
+            persistExploreSortIfNeeded(selected4KSorting.rawValue, key: Self.fourKSortingDefaultsKey, changed: selected4KSorting != oldValue)
+        }
+    }
+    @Published var selectedKonachanSorting: KonachanSorting = .dateAdded {  // Konachan 源的排序方式
+        didSet {
+            persistExploreSortIfNeeded(selectedKonachanSorting.rawValue, key: Self.konachanSortingDefaultsKey, changed: selectedKonachanSorting != oldValue)
+        }
+    }
+    @Published var selectedPixivRankingMode: PixivRankingMode = .weekly {  // Pixiv 源的排行模式（默认周榜）
+        didSet {
+            persistExploreSortIfNeeded(selectedPixivRankingMode.rawValue, key: Self.pixivRankingModeDefaultsKey, changed: selectedPixivRankingMode != oldValue)
+        }
+    }
     @Published var selectedPixivWorkType: PixivWorkType = .all  // Pixiv 作品类型筛选
     @Published var selectedPixivSearchSort: PixivSearchSort = .dateD  // Pixiv 搜索排序
     @Published var pixivHideAI: Bool = false  // Pixiv 屏蔽 AI 作品
     @Published var pixivRelatedTags: [String] = []  // Pixiv 搜索相关标签
+
+    // MARK: - Explore 排序持久化
+    // ⚠️ 不在 init 读 UserDefaults（macOS 26+ _CFXPreferences 栈溢出风险），由 restoreExploreSortPreferences() 延迟恢复
+    private static let sortingOptionDefaultsKey = "explore.wallpaper.sortingOption"
+    private static let topRangeDefaultsKey = "explore.wallpaper.topRange"
+    private static let fourKSortingDefaultsKey = "explore.wallpaper.fourKSorting"
+    private static let konachanSortingDefaultsKey = "explore.wallpaper.konachanSorting"
+    private static let pixivRankingModeDefaultsKey = "explore.wallpaper.pixivRankingMode"
+    private var isRestoringExploreSort = false
+    private var hasRestoredExploreSort = false
+
+    private func persistExploreSortIfNeeded(_ value: String, key: String, changed: Bool) {
+        guard changed, !isRestoringExploreSort else { return }
+        UserDefaults.standard.set(value, forKey: key)
+    }
+
+    /// 从 UserDefaults 恢复探索排序；仅在用户曾选择过时覆盖默认值。
+    /// 必须在 applicationDidFinishLaunching 之后调用，不可在 init 中调用。
+    func restoreExploreSortPreferences() {
+        guard !hasRestoredExploreSort else { return }
+        hasRestoredExploreSort = true
+        isRestoringExploreSort = true
+        defer { isRestoringExploreSort = false }
+
+        let defaults = UserDefaults.standard
+        if let raw = defaults.string(forKey: Self.sortingOptionDefaultsKey),
+           let option = SortingOption(rawValue: raw) {
+            sortingOption = option
+        }
+        if let raw = defaults.string(forKey: Self.topRangeDefaultsKey),
+           let range = TopRange(rawValue: raw) {
+            topRange = range
+        }
+        if let raw = defaults.string(forKey: Self.fourKSortingDefaultsKey),
+           let option = FourKSortingOption(rawValue: raw) {
+            selected4KSorting = option
+        }
+        if let raw = defaults.string(forKey: Self.konachanSortingDefaultsKey),
+           let option = KonachanSorting(rawValue: raw) {
+            selectedKonachanSorting = option
+        }
+        if let raw = defaults.string(forKey: Self.pixivRankingModeDefaultsKey),
+           let mode = PixivRankingMode(rawValue: raw) {
+            selectedPixivRankingMode = mode
+        }
+    }
 
     // MARK: - 本地收藏与下载记录
     private let wallpaperLibrary = WallpaperLibraryService.shared
@@ -200,6 +266,7 @@ class WallpaperViewModel: ObservableObject {
     @Published var cachedAllLocalWallpapers: [UnifiedLocalWallpaper] = []
 
     init() {
+        // ⚠️ 不在 init 读 UserDefaults；探索排序由 restoreExploreSortPreferences() 延迟恢复
         // 注册内存压力通知
         NotificationCenter.default.addObserver(
             forName: .appDidReceiveMemoryPressure,
@@ -443,28 +510,213 @@ class WallpaperViewModel: ObservableObject {
         wallpaperLibrary.removeWallpaperDownloads(withIDs: ids)
     }
 
+    /// 详情页删除本地壁纸：同时覆盖下载记录与纯本地扫描文件。
+    /// 纯 `local_*` 扫描项没有 download record，仅靠 `removeWallpaperDownloads` 会删不掉。
+    @discardableResult
+    func deleteLocalWallpaper(_ wallpaper: Wallpaper) -> Bool {
+        var idsToRemove = Set<String>()
+        var pathsToDelete = Set<String>()
+
+        // 1) 按 ID 命中下载记录（含导入的 local_import_*）
+        if let record = wallpaperLibrary.downloadRecord(for: wallpaper.id) {
+            idsToRemove.insert(record.wallpaper.id)
+            pathsToDelete.insert((record.localFilePath as NSString).standardizingPath as String)
+        }
+
+        // 2) 解析本地文件路径：下载缓存 / fullImageURL / path 字段
+        var candidateURLs: [URL] = []
+        if let u = wallpaperLibrary.localFileURLIfAvailable(for: wallpaper) {
+            candidateURLs.append(u)
+        }
+        if let u = wallpaper.fullImageURL, u.isFileURL {
+            candidateURLs.append(u)
+        }
+        if let u = URL(string: wallpaper.path), u.isFileURL {
+            candidateURLs.append(u)
+        } else if wallpaper.path.hasPrefix("/") {
+            candidateURLs.append(URL(fileURLWithPath: wallpaper.path))
+        }
+
+        for url in candidateURLs where url.isFileURL {
+            let path = (url.path as NSString).standardizingPath as String
+            guard !path.isEmpty else { continue }
+            pathsToDelete.insert(path)
+
+            // 扫描 ID 与导入 ID 可能不一致，再按路径反查下载记录
+            if let byPath = wallpaperLibrary.downloadRecord(forLocalFilePath: path)
+                ?? wallpaperLibrary.downloadRecords.first(where: {
+                    $0.isActive && (($0.localFilePath as NSString).standardizingPath as String) == path
+                }) {
+                idsToRemove.insert(byPath.wallpaper.id)
+                pathsToDelete.insert((byPath.localFilePath as NSString).standardizingPath as String)
+            }
+        }
+
+        // 3) 软删下载记录（内部会尽量删物理文件）
+        if !idsToRemove.isEmpty {
+            wallpaperLibrary.removeWallpaperDownloads(withIDs: idsToRemove)
+        }
+
+        // 4) 兜底删物理文件（纯 local_* 扫描项 / 记录删完文件仍在）
+        var deletedFile = false
+        let derivedWallpapersDirectory = DownloadPathManager.shared.derivedWallpapersFolderURL
+        for path in pathsToDelete {
+            let sourceURL = URL(fileURLWithPath: path)
+            Task {
+                await PortraitBlurFillWallpaperService.shared.removeArtifacts(
+                    for: sourceURL,
+                    derivedWallpapersDirectory: derivedWallpapersDirectory
+                )
+            }
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            do {
+                try FileManager.default.removeItem(atPath: path)
+                print("[WallpaperViewModel] ✅ Deleted local wallpaper file: \(path)")
+                deletedFile = true
+            } catch {
+                print("[WallpaperViewModel] ⚠️ Failed to delete local wallpaper file \(path): \(error)")
+            }
+        }
+
+        let didSomething = !idsToRemove.isEmpty || deletedFile
+        if didSomething {
+            Task { @MainActor in
+                await LocalWallpaperScanner.shared.forceRescan()
+                scheduleLocalWallpaperCacheRebuild(delayNanoseconds: 0)
+            }
+        }
+        return didSomething
+    }
+
     // MARK: - 通过 URL 解析壁纸
 
-    /// 提取 Wallhaven 壁纸 ID（支持 wallhaven.cc/w/{id} 和 wallhaven.cc/wallpaper/{id}）
+    /// 提取 Wallhaven 壁纸 ID。
+    /// 支持：
+    /// - `https://wallhaven.cc/w/{id}` / `.../wallpaper/{id}`
+    /// - 短链 `https://whvn.cc/{id}`（详情页「复制链接」常见格式，会 301 到 wallhaven.cc/w/{id}）
+    /// - 裸 ID（如 `po71m9`）
     static func extractWallhavenID(from urlString: String) -> String? {
-        guard let url = URL(string: urlString),
-              url.host?.contains("wallhaven") == true else { return nil }
-        let pathComponents = url.pathComponents
-        // 格式: /w/{id} 或 /wallpaper/{id}
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // 裸 ID：Wallhaven 壁纸 ID 为 5–7 位字母数字（常见 6 位）
+        if Self.isWallhavenWallpaperID(trimmed) {
+            return trimmed
+        }
+
+        guard let url = URL(string: trimmed), let host = url.host?.lowercased() else { return nil }
+        let pathComponents = url.pathComponents.filter { $0 != "/" }
+
+        // 短链：whvn.cc/{id}（也可能是 whvn.cc/w/{id}）
+        if host == "whvn.cc" || host.hasSuffix(".whvn.cc") {
+            if pathComponents.count == 1, Self.isWallhavenWallpaperID(pathComponents[0]) {
+                return pathComponents[0]
+            }
+            if let idIndex = pathComponents.firstIndex(where: { $0 == "w" || $0 == "wallpaper" }),
+               idIndex + 1 < pathComponents.count,
+               Self.isWallhavenWallpaperID(pathComponents[idIndex + 1]) {
+                return pathComponents[idIndex + 1]
+            }
+            return nil
+        }
+
+        // 正式站：wallhaven.cc/w/{id} 或 /wallpaper/{id}
+        guard host.contains("wallhaven") else { return nil }
         if let idIndex = pathComponents.firstIndex(where: { $0 == "w" || $0 == "wallpaper" }),
-           idIndex + 1 < pathComponents.count {
+           idIndex + 1 < pathComponents.count,
+           Self.isWallhavenWallpaperID(pathComponents[idIndex + 1]) {
             return pathComponents[idIndex + 1]
         }
         return nil
     }
 
-    /// 通过链接解析壁纸，支持 Wallhaven / 4KWallpapers
+    /// Wallhaven 壁纸 ID：仅字母数字，长度 5–7（官方短链 /w/ 与 whvn.cc 一致）。
+    private static func isWallhavenWallpaperID(_ value: String) -> Bool {
+        let id = value.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard (5...7).contains(id.count) else { return false }
+        return id.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) }
+    }
+
+    /// 提取 4KWallpapers 详情页 URL（4kwallpapers.com/.../{name}-{id}.html）
+    static func extract4KWallpapersDetailURL(from urlString: String) -> URL? {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let host = url.host?.lowercased(),
+              host.contains("4kwallpapers.com") else { return nil }
+        let path = url.path.lowercased()
+        guard path.hasSuffix(".html"), path.contains("-") else { return nil }
+        return url
+    }
+
+    /// 提取 Konachan post ID（konachan.com|net/post/show/{id}）
+    static func extractKonachanID(from urlString: String) -> String? {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let host = url.host?.lowercased(),
+              host.contains("konachan") else { return nil }
+        let components = url.pathComponents
+        // /post/show/{id}
+        if let showIndex = components.firstIndex(of: "show"),
+           showIndex + 1 < components.count {
+            let id = components[showIndex + 1]
+            if id.allSatisfy(\.isNumber) { return id }
+        }
+        // 兜底：路径末段为纯数字
+        if let last = components.last, last.allSatisfy(\.isNumber) {
+            return last
+        }
+        return nil
+    }
+
+    /// 提取 Pixiv 作品 ID（pixiv.net/artworks/{id} 或 /i/{id}）
+    static func extractPixivID(from urlString: String) -> String? {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let host = url.host?.lowercased(),
+              host.contains("pixiv.net") else { return nil }
+        let components = url.pathComponents
+        if let artworksIndex = components.firstIndex(of: "artworks"),
+           artworksIndex + 1 < components.count {
+            let id = components[artworksIndex + 1]
+            if id.allSatisfy(\.isNumber) { return id }
+        }
+        // 旧式 /i/{id}
+        if let iIndex = components.firstIndex(of: "i"),
+           iIndex + 1 < components.count {
+            let id = components[iIndex + 1]
+            if id.allSatisfy(\.isNumber) { return id }
+        }
+        // 查询参数 illust_id=
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let illustID = comps.queryItems?.first(where: { $0.name == "illust_id" })?.value,
+           illustID.allSatisfy(\.isNumber) {
+            return illustID
+        }
+        return nil
+    }
+
+    /// 通过链接解析壁纸，支持 Wallhaven / 4KWallpapers / Konachan / Pixiv
     func resolveWallpaperByURL(_ urlString: String) async throws -> Wallpaper {
-        // 尝试 Wallhaven
-        if let wallpaperID = Self.extractWallhavenID(from: urlString) {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let wallpaperID = Self.extractWallhavenID(from: trimmed) {
             return try await resolveWallhavenWallpaperByID(wallpaperID)
         }
-        throw NSError(domain: "WaifuX", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法解析此链接，仅支持 Wallhaven 链接（wallhaven.cc/w/{id}）"])
+        if let detailURL = Self.extract4KWallpapersDetailURL(from: trimmed) {
+            return try await resolve4KWallpaperByDetailURL(detailURL)
+        }
+        if let konachanID = Self.extractKonachanID(from: trimmed) {
+            return try await resolveKonachanWallpaperByID(konachanID)
+        }
+        if let pixivID = Self.extractPixivID(from: trimmed) {
+            return try await resolvePixivWallpaperByID(pixivID)
+        }
+
+        throw NSError(
+            domain: "WaifuX",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "无法解析此链接，仅支持 Wallhaven / 4KWallpapers / Konachan / Pixiv 详情页链接"]
+        )
     }
 
     /// 通过 Wallhaven API 按 ID 获取壁纸详情
@@ -478,6 +730,100 @@ class WallpaperViewModel: ObservableObject {
             headers: WallhavenAPI.authenticationHeaders(apiKey: normalizedAPIKey)
         )
         return response.data
+    }
+
+    /// 通过 4KWallpapers 详情页 URL 构造可打开的 Wallpaper
+    private func resolve4KWallpaperByDetailURL(_ detailURL: URL) async throws -> Wallpaper {
+        // 先用详情页 URL 构造最小可用模型，再尝试解析原图
+        let fileName = detailURL.deletingPathExtension().lastPathComponent
+        let idPart = fileName.split(separator: "-").last.map(String.init) ?? fileName
+        var wallpaper = Wallpaper(
+            id: "4k_\(idPart)",
+            title: nil,
+            url: detailURL.absoluteString,
+            shortUrl: nil,
+            views: 0,
+            favorites: 0,
+            downloads: nil,
+            source: "4kwallpapers",
+            purity: "sfw",
+            category: "general",
+            dimensionX: 3840,
+            dimensionY: 2160,
+            resolution: "3840x2160",
+            ratio: "1.78",
+            fileSize: nil,
+            fileType: "image/jpeg",
+            createdAt: nil,
+            colors: [],
+            path: detailURL.absoluteString,
+            thumbs: Wallpaper.Thumbs(
+                large: detailURL.absoluteString,
+                original: detailURL.absoluteString,
+                small: detailURL.absoluteString
+            ),
+            tags: nil,
+            uploader: nil
+        )
+
+        if let originalURL = await FourKWallpapersService.shared.fetchOriginalImageURL(for: wallpaper),
+           !originalURL.isEmpty {
+            wallpaper = Wallpaper(
+                id: wallpaper.id,
+                title: wallpaper.title,
+                url: wallpaper.url,
+                shortUrl: wallpaper.shortUrl,
+                views: wallpaper.views,
+                favorites: wallpaper.favorites,
+                downloads: wallpaper.downloads,
+                source: wallpaper.source,
+                purity: wallpaper.purity,
+                category: wallpaper.category,
+                dimensionX: wallpaper.dimensionX,
+                dimensionY: wallpaper.dimensionY,
+                resolution: wallpaper.resolution,
+                ratio: wallpaper.ratio,
+                fileSize: wallpaper.fileSize,
+                fileType: wallpaper.fileType,
+                createdAt: wallpaper.createdAt,
+                colors: wallpaper.colors,
+                path: originalURL,
+                thumbs: Wallpaper.Thumbs(
+                    large: originalURL,
+                    original: originalURL,
+                    small: originalURL
+                ),
+                tags: wallpaper.tags,
+                uploader: wallpaper.uploader
+            )
+        }
+        return wallpaper
+    }
+
+    /// 通过 Konachan post ID 获取壁纸
+    private func resolveKonachanWallpaperByID(_ id: String) async throws -> Wallpaper {
+        // purity rawValue=0：不附加 rating 标签，避免 id 精确查询被分级筛选误杀
+        let response = try await KonachanService.shared.search(
+            query: "id:\(id)",
+            page: 1,
+            perPage: 1,
+            purity: KonachanPuritySelection(rawValue: 0),
+            sorting: .dateAdded
+        )
+        if let wallpaper = response.data.first {
+            return wallpaper
+        }
+        throw NSError(
+            domain: "WaifuX",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "未找到 Konachan 壁纸（id=\(id)）"]
+        )
+    }
+
+    /// 通过 Pixiv 作品 ID 获取壁纸
+    private func resolvePixivWallpaperByID(_ id: String) async throws -> Wallpaper {
+        let detail = try await PixivService.shared.illustDetail(id: id)
+        return detail.toWallpaper()
     }
 
     /// 对外公开的壁纸详情获取接口（供 WallpaperDetailSheet 调用以补充 uploader 数据）
@@ -627,18 +973,26 @@ class WallpaperViewModel: ObservableObject {
     /// - Parameters:
     ///   - username: 作者用户名
     ///   - page: 页码，从 1 开始
-    ///   - limit: 每页数量，默认 20
-    /// - Returns: 壁纸列表
-    func fetchWallpapersByAuthor(username: String, page: Int = 1, limit: Int = 24) async throws -> [Wallpaper] {
+    /// 作者列表分页结果。hasMore 由服务端/切片语义决定，避免转换过滤后误判。
+    struct AuthorPageResult {
+        let items: [Wallpaper]
+        let hasMore: Bool
+    }
+
+    ///   - limit: 每页数量，默认 24
+    /// - Returns: 本页壁纸 + 是否还有下一页
+    func fetchWallpapersByAuthor(username: String, page: Int = 1, limit: Int = 24) async throws -> AuthorPageResult {
         let trimmedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedUsername.isEmpty else { return [] }
+        guard !trimmedUsername.isEmpty else {
+            return AuthorPageResult(items: [], hasMore: false)
+        }
 
         let parameters = WallhavenAPI.SearchParameters(
             query: "@\(trimmedUsername)",
             page: page,
             perPage: limit,
             categories: "111",      // 不限分类，查全量
-            purity: "1100",         // SFW + Sketchy，排除 NSFW
+            purity: "111",          // 作者列表不过滤内容分级（SFW + Sketchy + NSFW）
             sorting: SortingOption.dateAdded.rawValue,
             order: "desc",
             topRange: nil,
@@ -648,9 +1002,56 @@ class WallpaperViewModel: ObservableObject {
             colors: []              // 不限颜色
         )
 
-        let response = try await fetchWallpapers(parameters: parameters)
+        // 作者列表固定走 Wallhaven，不受探索页 activeSource 影响
+        let response = try await fetchFromWallhaven(parameters: parameters)
         wallpaperLibrary.upsertBatch(response.data)
-        return response.data
+        // 优先用 API lastPage；异常源没有可靠 meta 时回退到满页启发式。
+        let hasMore = response.meta.lastPage > 0
+            ? page < response.meta.lastPage
+            : response.data.count >= limit
+        return AuthorPageResult(items: response.data, hasMore: hasMore)
+    }
+
+    /// Pixiv 作者作品 ID 列表缓存，避免每页重复请求 profile/all。
+    private var pixivAuthorIllustIDCache: [String: [String]] = [:]
+
+    /// 获取指定 Pixiv 作者的插画作品。Pixiv 先返回用户的全部插画 ID，再批量补齐当前页的作品信息。
+    func fetchPixivWallpapersByAuthor(userID: String, page: Int = 1, limit: Int = 24) async throws -> AuthorPageResult {
+        let trimmedUserID = userID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedUserID.isEmpty, page > 0, limit > 0 else {
+            return AuthorPageResult(items: [], hasMore: false)
+        }
+
+        // Pixiv /profile/illusts 单次最多 24 个 ids[]
+        let pageLimit = min(limit, 24)
+
+        let orderedIDs: [String]
+        if let cached = pixivAuthorIllustIDCache[trimmedUserID] {
+            orderedIDs = cached
+        } else {
+            let profile = try await PixivService.shared.userAllIllusts(userId: trimmedUserID)
+            // 漫画由 MangaDetailSheet 的独立路由处理，不能在当前壁纸详情面板内原地切换。
+            let artworkIDs = Array((profile.illusts ?? [:]).keys)
+            orderedIDs = Array(Set(artworkIDs)).sorted {
+                (Int64($0) ?? 0) > (Int64($1) ?? 0)
+            }
+            pixivAuthorIllustIDCache[trimmedUserID] = orderedIDs
+        }
+
+        let startIndex = (page - 1) * pageLimit
+        guard startIndex < orderedIDs.count else {
+            return AuthorPageResult(items: [], hasMore: false)
+        }
+
+        let endIndex = min(startIndex + pageLimit, orderedIDs.count)
+        let pageIDs = Array(orderedIDs[startIndex..<endIndex])
+        // hasMore 按 ID 切片判断，不依赖转换后数量（部分 ID 可能解析失败）
+        let hasMore = endIndex < orderedIDs.count
+
+        let works = try await PixivService.shared.userIllusts(userId: trimmedUserID, illustIDs: pageIDs)
+        let worksByID = Dictionary(uniqueKeysWithValues: works.map { ($0.id, $0) })
+        let items = pageIDs.compactMap { worksByID[$0]?.toWallpaper() }
+        return AuthorPageResult(items: items, hasMore: hasMore)
     }
 
     // MARK: - 加载更多（支持 Task Cancellation + 预加载）
@@ -704,6 +1105,11 @@ class WallpaperViewModel: ObservableObject {
                     wallpapers.append(contentsOf: appended)
                 }
 
+                // 注意：正常 loadMore 不做顶部裁剪。
+                // 列表元数据本身不大；真正的 10GB+/70GB 来自全高 NSCollectionView
+                // 把所有 cell 当可见。顶部裁剪会在底部滚动时把 contentSize 从上方抽走，
+                // 造成滚动位置跳动。内存压力路径会主动裁列表。
+
                 currentPage = nextPage
                 hasMorePages = currentPage < results.meta.lastPage
 
@@ -754,14 +1160,17 @@ class WallpaperViewModel: ObservableObject {
 
     // MARK: - 内存压力处理
 
-    /// 系统内存压力时自动触发：取消网络请求，但保留已加载的列表数据（列表仅存元数据，内存开销极小）。
+    /// 系统内存压力时：只取消网络/预取并清图片缓存面，**不裁剪 wallpapers 数据**。
+    /// 探索列表按虚拟滚动处理：数据保留，滚回去必须还能显示；
+    /// 真正占内存的是可见视图与图片缓存，不是元数据数组本身。
     private func handleMemoryPressure() {
-        print("[WallpaperViewModel] 内存压力，取消网络请求: wallpapers=\(wallpapers.count)")
+        print("[WallpaperViewModel] 内存压力，取消网络请求（保留列表数据）: wallpapers=\(wallpapers.count)")
         searchTask?.cancel()
         loadMoreTask?.cancel()
         debounceTask?.cancel()
         preloadTask?.cancel()
         preloadedResponse = nil
+        ForegroundPrefetchManager.shared.stop(namespace: "wallpaper-view-model")
     }
 
     // MARK: - 取消所有任务
@@ -1152,66 +1561,59 @@ class WallpaperViewModel: ObservableObject {
     }
 
     // MARK: - 下载壁纸
-    func downloadWallpaper(_ wallpaper: Wallpaper) async throws {
-        let task = downloadTaskService.addTask(wallpaper: wallpaper)
+    /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
+    ///   为 nil 时不改动已有 folderID；新建记录则落在根目录。
+    func downloadWallpaper(_ wallpaper: Wallpaper, folderID: String? = nil) async throws {
+        try await PersistentDownloadQueueService.shared.enqueueWallpaperAndWait(
+            wallpaper,
+            folderID: folderID,
+            using: self
+        )
+    }
 
-        // 将实际下载逻辑包装为可取消的 Task，并注册到 DownloadTaskService
-        let downloadTask = Task { [weak self] in
-            guard let self else { throw CancellationError() }
+    /// 只执行落盘逻辑；队列统一负责状态、取消、重试与并发槽位。
+    func executeQueuedWallpaperDownload(
+        _ wallpaper: Wallpaper,
+        folderID: String?,
+        taskID: String
+    ) async throws {
+        guard await downloadPathManager.ensureDirectoryStructure() else {
+            throw DownloadError.permissionDenied
+        }
 
-            // 确保下载权限
-            guard await downloadPathManager.ensureDirectoryStructure() else {
-                throw DownloadError.permissionDenied
-            }
+        let imageData = try await downloadWallpaperData(wallpaper, taskID: taskID)
+        try Task.checkCancellation()
 
-            let imageData = try await downloadWallpaperData(wallpaper, taskID: task.id)
+        guard let originalURL = wallpaper.fullImageURL else {
+            throw NetworkError.invalidResponse
+        }
 
-            guard let originalURL = wallpaper.fullImageURL else {
-                throw NetworkError.invalidResponse
-            }
+        updateDownloadProgress(taskID: taskID, progress: 0.92)
+        try await cacheService.cacheImage(imageData, for: originalURL)
 
-            updateDownloadProgress(taskID: task.id, progress: 0.92)
-            try await cacheService.cacheImage(imageData, for: originalURL)
+        let fileURL = downloadPathManager.wallpaperFileURL(
+            id: wallpaper.id,
+            fileExtension: wallpaper.fileExtension
+        )
+        let directory = fileURL.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: directory.path) {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
 
-            // 使用 DownloadPathManager 获取正确的保存路径
-            let fileURL = downloadPathManager.wallpaperFileURL(
-                id: wallpaper.id,
-                fileExtension: wallpaper.fileExtension
+        try await imageData.writeAsync(to: fileURL)
+        try Task.checkCancellation()
+
+        guard await fileURL.fileExistsAsync() else {
+            throw DownloadError.writeFailed(
+                NSError(
+                    domain: "WaifuX",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "File not found after write"]
+                )
             )
-
-            // 确保目标目录存在
-            let directory = fileURL.deletingLastPathComponent()
-            if !FileManager.default.fileExists(atPath: directory.path) {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            }
-
-            // 写入文件（使用后台 I/O，避免阻塞 MainActor）
-            try await imageData.writeAsync(to: fileURL)
-
-            // 验证文件是否成功写入（后台 I/O）
-            let fileExists = await fileURL.fileExistsAsync()
-            if fileExists {
-                wallpaperLibrary.recordDownload(wallpaper, fileURL: fileURL)
-                downloadTaskService.markCompleted(id: task.id)
-            } else {
-                throw DownloadError.writeFailed(NSError(domain: "WaifuX", code: -1, userInfo: [NSLocalizedDescriptionKey: "File not found after write"]))
-            }
         }
 
-        // 注册任务以便支持取消
-        downloadTaskService.registerDownloadTask(id: task.id, task: downloadTask)
-
-        defer { downloadTaskService.unregisterDownloadTask(id: task.id) }
-
-        do {
-            try await downloadTask.value
-        } catch {
-            // 取消时不重复标记 failed（已在 cancelTask 中标记 cancelled）
-            if !(error is CancellationError) {
-                downloadTaskService.markFailed(id: task.id)
-            }
-            throw error
-        }
+        wallpaperLibrary.recordDownload(wallpaper, fileURL: fileURL, folderID: folderID)
     }
 
     func downloadWallpaperData(_ wallpaper: Wallpaper, taskID: String? = nil) async throws -> Data {
@@ -1267,7 +1669,11 @@ class WallpaperViewModel: ObservableObject {
             return try Data(contentsOf: downloadURL)
         }
 
-        return try await networkService.fetchImage(from: downloadURL) { progress in
+        let headers = wallpaper.source == "konachan"
+            ? KonachanRequestConfiguration.imageHeaders
+            : [:]
+
+        return try await networkService.fetchImage(from: downloadURL, headers: headers) { progress in
             guard let taskID else { return }
             Task { @MainActor in
                 DownloadTaskService.shared.updateProgress(id: taskID, progress: min(progress * 0.9, 0.9))
@@ -1280,20 +1686,33 @@ class WallpaperViewModel: ObservableObject {
     }
 
     func retryDownload(task: DownloadTask) async throws {
-        guard let wallpaper = task.wallpaper else {
+        guard task.wallpaper != nil else {
             throw NetworkError.invalidResponse
         }
-
-        downloadTaskService.removeTask(id: task.id)
-        try await downloadWallpaper(wallpaper)
+        try await PersistentDownloadQueueService.shared.retryAndWait(task)
     }
 
     // MARK: - 设置壁纸
     /// - Note: macOS 的锁屏壁纸即桌面壁纸，没有独立的锁屏壁纸 API。
     ///   `.lockScreen` 和 `.both` 最终都等同于设置桌面壁纸，避免重复操作。
     func setWallpaper(from imageURL: URL, option: WallpaperOption) async throws {
-        WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
-        VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly()
+        let screens = NSScreen.screens
+        let imageURLByScreen = try await preparedStaticImageURLs(
+            from: imageURL,
+            for: screens
+        )
+        WallpaperEngineXBridge.shared.prepareForNonExternalWallpaperSwitch(
+            on: screens,
+            reason: "applyStaticWallpaper"
+        )
+
+        let preservesDynamicWallpaperUntilReady = VideoWallpaperManager.shared
+            .hasNativeVideoWallpaper(on: screens)
+            || screens.contains { WallpaperEngineXBridge.shared.isManaging(screen: $0) }
+        if !preservesDynamicWallpaperUntilReady {
+            WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
+            VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly()
+        }
 
         // macOS 26+：仅当用户未启用动态锁屏时才清空锁屏扩展状态。
         // 使用持久化设置 isLockScreenEnabled 而非 isLockScreenMirroringActive。
@@ -1311,27 +1730,48 @@ class WallpaperViewModel: ObservableObject {
         // macOS 26+：动态锁屏启用时，不走系统静态锁屏写入。
         // 改为把静态图源直接部署给 WaifuX 显示器实例，避免覆盖用户已选择的容器。
         if #available(macOS 26.0, *), VideoWallpaperManager.shared.isLockScreenEnabled {
-            let displayIDs = NSScreen.screens.compactMap { screen -> UInt32? in
-                (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            for screen in screens {
+                guard let displayID = (screen.deviceDescription[
+                    NSDeviceDescriptionKey("NSScreenNumber")
+                ] as? NSNumber)?.uint32Value else {
+                    continue
+                }
+                let resolvedImageURL = imageURLByScreen[screen.wallpaperScreenIdentifier] ?? imageURL
+                try await LockScreenWallpaperService.shared.cacheStaticImageSource(
+                    imageURL: resolvedImageURL,
+                    displayIDs: [displayID]
+                )
             }
-            try await LockScreenWallpaperService.shared.cacheStaticImageSource(imageURL: imageURL, displayIDs: displayIDs)
             StaticWallpaperGrainManager.shared.updateOverlay()
             // 互斥：清除可能残留的静态图 overlay
             StaticImageWallpaperOverlayManager.shared.clearState()
             print("[WallpaperViewModel] 🔒 动态锁屏已启用，已将静态图同步到 WaifuX 锁屏/桌面实例")
+            await finishStaticWallpaperTransitionIfNeeded(
+                screens: screens,
+                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+            )
             return
         }
 
         let workspace = NSWorkspace.shared
-        let screens = NSScreen.screens
 
         // 系统壁纸同步关闭时，冻结 setDesktopImageURL 链路，改走独立静态图 overlay 显示。
         // mp4/场景/web 动态壁纸不受影响（它们通过 overlay 窗口或 CLI 进程覆盖桌面）。
         // 颗粒蒙层独立于系统壁纸，仍正常更新。
         if !VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled {
             print("[WallpaperViewModel] 🧊 系统壁纸同步已关闭，走独立静态图 overlay 显示")
-            await StaticImageWallpaperOverlayManager.shared.showAllPrepared(imageURL: imageURL)
+            for screen in screens {
+                let resolvedImageURL = imageURLByScreen[screen.wallpaperScreenIdentifier] ?? imageURL
+                await StaticImageWallpaperOverlayManager.shared.showPrepared(
+                    imageURL: resolvedImageURL,
+                    for: screen
+                )
+            }
             StaticWallpaperGrainManager.shared.updateOverlay()
+            await finishStaticWallpaperTransitionIfNeeded(
+                screens: screens,
+                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+            )
             return
         }
 
@@ -1339,19 +1779,24 @@ class WallpaperViewModel: ObservableObject {
             .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
             .allowClipping: true
         ]
-        let systemWallpaperURL = await StaticImageWallpaperOverlayManager.shared.preparedSystemWallpaperURL(for: imageURL)
         for screen in screens {
+            let resolvedImageURL = imageURLByScreen[screen.wallpaperScreenIdentifier] ?? imageURL
+            let systemWallpaperURL = await StaticImageWallpaperOverlayManager.shared.preparedSystemWallpaperURL(
+                for: resolvedImageURL
+            )
             try workspace.setDesktopImageURLForAllSpaces(systemWallpaperURL, for: screen, options: fillOptions)
+            DesktopWallpaperSyncManager.shared.registerWallpaperSet(systemWallpaperURL, for: screen)
         }
-
-        // 注册壁纸以便跨 Space 同步
-        DesktopWallpaperSyncManager.shared.registerWallpaperSet(systemWallpaperURL)
 
         // 互斥：走系统壁纸时关闭并清除静态图 overlay 持久化状态
         StaticImageWallpaperOverlayManager.shared.clearState()
 
         // 更新静态壁纸颗粒蒙层（独立窗口，不受壁纸切换影响）
         StaticWallpaperGrainManager.shared.updateOverlay()
+        await finishStaticWallpaperTransitionIfNeeded(
+            screens: screens,
+            preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+        )
     }
 
     // MARK: - 设置壁纸到指定屏幕
@@ -1362,12 +1807,27 @@ class WallpaperViewModel: ObservableObject {
 
         // 如果指定了特定屏幕，只设置到该屏幕
         if let targetScreen = targetScreen {
+            let resolvedImageURL = try await preparedStaticImageURL(
+                from: imageURL,
+                for: targetScreen
+            )
+            WallpaperEngineXBridge.shared.prepareForNonExternalWallpaperSwitch(
+                on: [targetScreen],
+                reason: "applyStaticWallpaperForScreen"
+            )
+
+            let preservesDynamicWallpaperUntilReady = VideoWallpaperManager.shared
+                .hasNativeVideoWallpaper(on: [targetScreen])
+                || WallpaperEngineXBridge.shared.isManaging(screen: targetScreen)
+
             // 切到静态图前如果目标屏幕被 CLI 管理则停 CLI 引擎
-            if WallpaperEngineXBridge.shared.isManaging(screen: targetScreen) {
-                WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: targetScreen)
+            if !preservesDynamicWallpaperUntilReady {
+                if WallpaperEngineXBridge.shared.isManaging(screen: targetScreen) {
+                    WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: targetScreen)
+                }
+                // 只停目标屏幕的动态壁纸，避免影响其他屏幕
+                VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: targetScreen)
             }
-            // 只停目标屏幕的动态壁纸，避免影响其他屏幕
-            VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: targetScreen)
             // macOS 26+：仅当用户未启用动态锁屏时才清空锁屏镜像帧源缓存。
             // 使用持久化设置 isLockScreenEnabled 而非 isLockScreenMirroringActive。
             let shouldClearExtension: Bool = {
@@ -1384,12 +1844,19 @@ class WallpaperViewModel: ObservableObject {
             // 改为把静态图源直接部署给该显示器的 WaifuX 实例。
             if #available(macOS 26.0, *), VideoWallpaperManager.shared.isLockScreenEnabled {
                 if let displayID = (targetScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value {
-                    try await LockScreenWallpaperService.shared.cacheStaticImageSource(imageURL: imageURL, displayIDs: [displayID])
+                    try await LockScreenWallpaperService.shared.cacheStaticImageSource(
+                        imageURL: resolvedImageURL,
+                        displayIDs: [displayID]
+                    )
                     StaticWallpaperGrainManager.shared.updateOverlay()
                     // 互斥：清除可能残留的静态图 overlay
                     StaticImageWallpaperOverlayManager.shared.clearState()
                     print("[WallpaperViewModel] 🔒 动态锁屏已启用，已将单屏静态图同步到 WaifuX 实例")
                 }
+                await finishStaticWallpaperTransitionIfNeeded(
+                    screens: [targetScreen],
+                    preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+                )
                 return
             }
 
@@ -1397,8 +1864,15 @@ class WallpaperViewModel: ObservableObject {
             // mp4/场景/web 动态壁纸不受影响；颗粒蒙层独立于系统壁纸，仍正常更新。
             if !VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled {
                 print("[WallpaperViewModel] 🧊 系统壁纸同步已关闭，走单屏独立静态图 overlay 显示")
-                await StaticImageWallpaperOverlayManager.shared.showPrepared(imageURL: imageURL, for: targetScreen)
+                await StaticImageWallpaperOverlayManager.shared.showPrepared(
+                    imageURL: resolvedImageURL,
+                    for: targetScreen
+                )
                 StaticWallpaperGrainManager.shared.updateOverlay()
+                await finishStaticWallpaperTransitionIfNeeded(
+                    screens: [targetScreen],
+                    preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+                )
                 return
             }
 
@@ -1406,15 +1880,76 @@ class WallpaperViewModel: ObservableObject {
                 .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
                 .allowClipping: true
             ]
-            let systemWallpaperURL = await StaticImageWallpaperOverlayManager.shared.preparedSystemWallpaperURL(for: imageURL)
+            let systemWallpaperURL = await StaticImageWallpaperOverlayManager.shared.preparedSystemWallpaperURL(
+                for: resolvedImageURL
+            )
             try workspace.setDesktopImageURLForAllSpaces(systemWallpaperURL, for: targetScreen, options: fillOptions)
             DesktopWallpaperSyncManager.shared.registerWallpaperSet(systemWallpaperURL, for: targetScreen)
 
             // 互斥：走系统壁纸时关闭并清除静态图 overlay 持久化状态
             StaticImageWallpaperOverlayManager.shared.clearState()
+            await finishStaticWallpaperTransitionIfNeeded(
+                screens: [targetScreen],
+                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+            )
         } else {
             try await setWallpaper(from: imageURL, option: option)
         }
+    }
+
+    private func finishStaticWallpaperTransitionIfNeeded(
+        screens: [NSScreen],
+        preservesDynamicWallpaperUntilReady: Bool
+    ) async {
+        guard preservesDynamicWallpaperUntilReady else { return }
+        // 独立静态 overlay 与视频窗处于同一 desktop level。overlay 准备完成时
+        // 先把仍在播放的旧视频提回前方，避免新图片在黑场出现前闪一帧。
+        VideoWallpaperManager.shared.keepNativeVideoPresentationFront(on: screens)
+        await WallpaperCrossTypeTransitionCoordinator.shared.commitPreparedContent(on: screens) {
+            for screen in screens {
+                await WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaperForTransition(
+                    for: screen
+                )
+                VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: screen)
+            }
+        }
+    }
+
+    /// 仅在设置打开时为竖图生成派生壁纸。结果按显示器像素尺寸独立映射，
+    /// 同一原图在不同宽高比的显示器上不会相互覆盖。
+    private func preparedStaticImageURLs(
+        from sourceURL: URL,
+        for screens: [NSScreen]
+    ) async throws -> [String: URL] {
+        guard UserDefaults.standard.bool(forKey: "portrait_blur_fill_enabled") else {
+            return Dictionary(uniqueKeysWithValues: screens.map {
+                ($0.wallpaperScreenIdentifier, sourceURL)
+            })
+        }
+
+        let derivedDirectory = DownloadPathManager.shared.derivedWallpapersFolderURL
+        var imageURLs: [String: URL] = [:]
+        for screen in screens {
+            let pixelSize = CGSize(
+                width: max(1, (screen.frame.width * screen.backingScaleFactor).rounded()),
+                height: max(1, (screen.frame.height * screen.backingScaleFactor).rounded())
+            )
+            imageURLs[screen.wallpaperScreenIdentifier] = try await PortraitBlurFillWallpaperService.shared
+                .preparedWallpaperURL(
+                    for: sourceURL,
+                    targetPixelSize: pixelSize,
+                    derivedWallpapersDirectory: derivedDirectory
+                )
+        }
+        return imageURLs
+    }
+
+    private func preparedStaticImageURL(
+        from sourceURL: URL,
+        for screen: NSScreen
+    ) async throws -> URL {
+        let imageURLs = try await preparedStaticImageURLs(from: sourceURL, for: [screen])
+        return imageURLs[screen.wallpaperScreenIdentifier] ?? sourceURL
     }
 
     // MARK: - 设为壁纸（通过 Wallpaper 对象）
@@ -1519,6 +2054,9 @@ class WallpaperViewModel: ObservableObject {
 
     // MARK: - 初始化加载（支持取消和延迟加载）
     func initialLoad() async {
+        // 兜底：确保探索排序在首次 search 前已从 UserDefaults 恢复
+        restoreExploreSortPreferences()
+
         // 1. 立即加载收藏（本地数据，很快）
         loadFavorites()
 

@@ -22,8 +22,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
     var folderIDs: [String]?
     /// Web/Scene 壁纸在"播完即换"模式下的切换间隔（秒）。nil = 不启用（仅视频走播完通知）
     var webSceneSwitchSeconds: Int?
-    /// 外接显示器连接到电脑后是否立即从库里随机切换一张动态壁纸。
-    var autoChangeOnExternalConnect: Bool
 
     /// 判断是否为"播完即换"模式
     var isOnEndMode: Bool {
@@ -43,12 +41,12 @@ struct DisplaySchedulerConfig: Codable, Equatable {
             includeWallpapers: config.includeWallpapers,
             includeMedia: config.includeMedia,
             folderIDs: nil,
-            webSceneSwitchSeconds: nil,
-            autoChangeOnExternalConnect: false
+            webSceneSwitchSeconds: nil
         )
     }
 
     private enum CodingKeys: String, CodingKey {
+        // isWallpaperEnabled 已废弃：旧配置若含此字段，解码时忽略
         case isEnabled
         case intervalMinutes
         case order
@@ -57,7 +55,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         case includeMedia
         case folderIDs
         case webSceneSwitchSeconds
-        case autoChangeOnExternalConnect
     }
 
     init(
@@ -67,8 +64,7 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         includeWallpapers: Bool,
         includeMedia: Bool,
         folderIDs: [String]? = nil,
-        webSceneSwitchSeconds: Int? = nil,
-        autoChangeOnExternalConnect: Bool = false
+        webSceneSwitchSeconds: Int? = nil
     ) {
         self.isEnabled = isEnabled
         self.intervalMinutes = intervalMinutes
@@ -77,7 +73,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         self.includeMedia = includeMedia
         self.folderIDs = folderIDs
         self.webSceneSwitchSeconds = webSceneSwitchSeconds
-        self.autoChangeOnExternalConnect = autoChangeOnExternalConnect
     }
 
     init(from decoder: Decoder) throws {
@@ -87,7 +82,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         order = try container.decode(ScheduleOrder.self, forKey: .order)
         folderIDs = try container.decodeIfPresent([String].self, forKey: .folderIDs)
         webSceneSwitchSeconds = try container.decodeIfPresent(Int.self, forKey: .webSceneSwitchSeconds)
-        autoChangeOnExternalConnect = try container.decodeIfPresent(Bool.self, forKey: .autoChangeOnExternalConnect) ?? false
 
         if let includeWallpapers = try? container.decode(Bool.self, forKey: .includeWallpapers),
            let includeMedia = try? container.decode(Bool.self, forKey: .includeMedia) {
@@ -117,7 +111,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         try container.encode(includeMedia, forKey: .includeMedia)
         try container.encodeIfPresent(folderIDs, forKey: .folderIDs)
         try container.encodeIfPresent(webSceneSwitchSeconds, forKey: .webSceneSwitchSeconds)
-        try container.encode(autoChangeOnExternalConnect, forKey: .autoChangeOnExternalConnect)
     }
 }
 
@@ -128,6 +121,10 @@ struct SchedulerConfig: Codable {
     var includeWallpapers: Bool
     var includeMedia: Bool
     var displayConfigs: [String: DisplaySchedulerConfig]
+    /// Global mode keeps an independent rotation policy while preserving the
+    /// existing per-display policies for a later return to independent mode.
+    var isGlobalDisplaySyncEnabled: Bool
+    var globalDisplayConfig: DisplaySchedulerConfig
 
     /// 特殊间隔值：播完即换（视频播放完毕后自动切换到下一个）
     static let intervalOnEndMinutes: Int = -1
@@ -140,7 +137,15 @@ struct SchedulerConfig: Codable {
         order: .random,
         includeWallpapers: true,
         includeMedia: true,
-        displayConfigs: [:]
+        displayConfigs: [:],
+        isGlobalDisplaySyncEnabled: false,
+        globalDisplayConfig: DisplaySchedulerConfig(
+            isEnabled: false,
+            intervalMinutes: 60,
+            order: .random,
+            includeWallpapers: true,
+            includeMedia: true
+        )
     )
 
     static let intervalOptions: [Int] = [1, 3, 5, 15, 30, 60, 360, 1440]
@@ -153,6 +158,8 @@ struct SchedulerConfig: Codable {
         case includeWallpapers
         case includeMedia
         case displayConfigs
+        case isGlobalDisplaySyncEnabled
+        case globalDisplayConfig
     }
 
     init(
@@ -161,7 +168,9 @@ struct SchedulerConfig: Codable {
         order: ScheduleOrder,
         includeWallpapers: Bool,
         includeMedia: Bool,
-        displayConfigs: [String: DisplaySchedulerConfig] = [:]
+        displayConfigs: [String: DisplaySchedulerConfig] = [:],
+        isGlobalDisplaySyncEnabled: Bool = false,
+        globalDisplayConfig: DisplaySchedulerConfig? = nil
     ) {
         self.isEnabled = isEnabled
         self.intervalMinutes = intervalMinutes
@@ -169,6 +178,14 @@ struct SchedulerConfig: Codable {
         self.includeWallpapers = includeWallpapers
         self.includeMedia = includeMedia
         self.displayConfigs = displayConfigs
+        self.isGlobalDisplaySyncEnabled = isGlobalDisplaySyncEnabled
+        self.globalDisplayConfig = globalDisplayConfig ?? DisplaySchedulerConfig(
+            isEnabled: isEnabled,
+            intervalMinutes: intervalMinutes,
+            order: order,
+            includeWallpapers: includeWallpapers,
+            includeMedia: includeMedia
+        )
     }
 
     init(from decoder: Decoder) throws {
@@ -196,6 +213,21 @@ struct SchedulerConfig: Codable {
             self.includeWallpapers = true
             self.includeMedia = true
         }
+
+        isGlobalDisplaySyncEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .isGlobalDisplaySyncEnabled
+        ) ?? false
+        globalDisplayConfig = try container.decodeIfPresent(
+            DisplaySchedulerConfig.self,
+            forKey: .globalDisplayConfig
+        ) ?? DisplaySchedulerConfig(
+            isEnabled: isEnabled,
+            intervalMinutes: intervalMinutes,
+            order: order,
+            includeWallpapers: includeWallpapers,
+            includeMedia: includeMedia
+        )
     }
 
     func encode(to encoder: Encoder) throws {
@@ -206,9 +238,19 @@ struct SchedulerConfig: Codable {
         try container.encode(includeWallpapers, forKey: .includeWallpapers)
         try container.encode(includeMedia, forKey: .includeMedia)
         try container.encode(displayConfigs, forKey: .displayConfigs)
+        try container.encode(isGlobalDisplaySyncEnabled, forKey: .isGlobalDisplaySyncEnabled)
+        try container.encode(globalDisplayConfig, forKey: .globalDisplayConfig)
     }
 
     func resolvedDisplayConfig(for screenID: String) -> DisplaySchedulerConfig {
+        if isGlobalDisplaySyncEnabled {
+            return globalDisplayConfig
+        }
+        return storedDisplayConfig(for: screenID)
+    }
+
+    /// Reads the saved per-display policy even while global mode is active.
+    func storedDisplayConfig(for screenID: String) -> DisplaySchedulerConfig {
         if let config = displayConfigs[screenID] {
             return config
         }

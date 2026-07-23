@@ -33,9 +33,9 @@ jobs:
               with:
                   fetch-depth: 0
 
-            - name: Select Xcode 26.4
+            - name: Select Xcode 26.6
               run: |
-                  sudo xcode-select -s /Applications/Xcode_26.4.app/Contents/Developer
+                  sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
                   echo "Xcode Path: $(xcode-select -p)"
                   xcodebuild -version
                   swift --version
@@ -586,6 +586,55 @@ jobs:
                   prerelease: false
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # Release 创建后同步更新 homebrew tap 仓库的 Casks/waifux.rb。
+            # 跨仓库写入需要 PAT（GITHUB_TOKEN 无权写 homebrew-waifux），
+            # 故使用 TAP_REPO_TOKEN。GITHUB_TOKEN 创建的 release 事件不会触发
+            # update-homebrew-tap.yml，因此必须在此内联执行。
+            - name: Update Homebrew Tap
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
+              env:
+                  TAP_REPO_TOKEN: ${{ secrets.TAP_REPO_TOKEN }}
+              run: |
+                  VERSION="${{ steps.version.outputs.version }}"
+                  DMG_URL="https://github.com/jipika/WaifuX/releases/download/v${VERSION}/WaifuX.dmg"
+
+                  # 等待 Release 资产可下载（刚创建的 Release 偶尔有几秒传播延迟）
+                  echo "等待 DMG 可下载: $DMG_URL"
+                  for i in {1..6}; do
+                    if curl -sL -o /tmp/WaifuX.dmg "$DMG_URL" && [ -s /tmp/WaifuX.dmg ]; then
+                      echo "✅ DMG 下载成功"
+                      break
+                    fi
+                    echo "attempt $i: 尚未就绪，10s 后重试..."
+                    sleep 10
+                  done
+                  if [ ! -s /tmp/WaifuX.dmg ]; then
+                    echo "❌ DMG 下载失败，跳过 tap 更新"
+                    exit 0
+                  fi
+
+                  SHA256=$(shasum -a 256 /tmp/WaifuX.dmg | cut -d' ' -f1)
+                  echo "版本: $VERSION  SHA256: $SHA256"
+
+                  # 克隆 tap 仓库（用 PAT 认证）
+                  git clone --depth 1 "https://x-access-token:${TAP_REPO_TOKEN}@github.com/jipika/homebrew-waifux.git" /tmp/tap
+                  cd /tmp/tap
+
+                  # 用 base64 模板避免 YAML/Shell 引号转义问题（与 update-homebrew-tap.yml 一致）
+                  echo "Y2FzayAid2FpZnV4IiBkbwogIHZlcnNpb24gIiN7VkVSU0lPTn0iCiAgc2hhMjU2ICIje1NIQTI1Nn0iCgogIHVybCAiaHR0cHM6Ly9naXRodWIuY29tL2ppcGlrYS9XYWlmdVgvcmVsZWFzZXMvZG93bmxvYWQvdiN7VkVSU0lPTn0vV2FpZnVYLmRtZyIKICBuYW1lICJXYWlmdVgiCiAgZGVzYyAiQmVhdXRpZnVsIGFuaW1lIHdhbGxwYXBlciBhbmQgY29udGVudCBicm93c2VyIgogIGhvbWVwYWdlICJodHRwczovL2dpdGh1Yi5jb20vamlwaWthL1dhaWZ1WCIKCiAgbGl2ZWNoZWNrIGRvCiAgICB1cmwgOnVybAogICAgcmVnZXgoL152PyhcZCsoPzpcLlxkKykrKSQvaSkKICBlbmQKCiAgYXV0b191cGRhdGVzIHRydWUKCiAgYXBwICJXYWlmdVguYXBwIgoKICAjIGJyZXcg5pu05paw5piv5YWI5Yig5penIGJ1bmRsZSDlho3mi7fmlrAgYnVuZGxl77yMbWFjT1Mg5Lya6YeN572u5omp5bGV5ZCv55So54q25oCB44CCCiAgIyBsc3JlZ2lzdGVyIC1mIOmHjeaWsOazqOWGjCBBcHAgYnVuZGxl77yI5ZCr5YaF5bWMIC5hcHBleO+8ie+8jAogICMgcGx1Z2lua2l0IC1lIHVzZSDmmL7lvI/lkK/nlKjmianlsZXvvIwKICAjIOacgOWQjumHjeWQryBXYWxscGFwZXJBZ2VudCDkvb/lhbbph43mlrDliqDovb3mianlsZXliJfooajvvIjmuIXpmaTlhoXlrZjnvJPlrZjvvInjgIIKICBwb3N0ZmxpZ2h0IGRvCiAgICBzeXN0ZW1fY29tbWFuZCAiL1N5c3RlbS9MaWJyYXJ5L0ZyYW1ld29ya3MvQ29yZVNlcnZpY2VzLmZyYW1ld29yay9GcmFtZXdvcmtzL0xhdW5jaFNlcnZpY2VzLmZyYW1ld29yay9TdXBwb3J0L2xzcmVnaXN0ZXIiLAogICAgICBhcmdzOiBbIi1mIiwgIiN7c3RhZ2VkX3BhdGh9L1dhaWZ1WC5hcHAiXQogICAgc3lzdGVtX2NvbW1hbmQgIi91c3IvYmluL3BsdWdpbmtpdCIsCiAgICAgIGFyZ3M6IFsiLWUiLCAidXNlIiwgIi1pIiwgImNvbS53YWlmdXguYXBwLndhbGxwYXBlcmV4dGVuc2lvbiJdCiAgICBzeXN0ZW1fY29tbWFuZCAiL3Vzci9iaW4va2lsbGFsbCIsCiAgICAgIGFyZ3M6IFsiV2FsbHBhcGVyQWdlbnQiXSwKICAgICAgcHJpbnRfc3RkZXJyOiBmYWxzZQogIGVuZAoKICB6YXAgdHJhc2g6IFsKICAgICJ+L0xpYnJhcnkvQXBwbGljYXRpb24gU3VwcG9ydC9XYWlmdVgiLAogICAgIn4vTGlicmFyeS9DYWNoZXMvY29tLndhaWZ1eC5hcHAiLAogICAgIn4vTGlicmFyeS9QcmVmZXJlbmNlcy9jb20ud2FpZnV4LmFwcC5wbGlzdCIsCiAgICAifi9MaWJyYXJ5L1NhdmVkIEFwcGxpY2F0aW9uIFN0YXRlL2NvbS53YWlmdXguYXBwLnNhdmVkU3RhdGUiLAogIF0KZW5kCg==" | base64 -d > Casks/waifux.rb
+                  sed -i '' "s/#{VERSION}/$VERSION/g; s/#{SHA256}/$SHA256/" Casks/waifux.rb
+
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+                  git add Casks/waifux.rb
+                  if git diff --cached --quiet; then
+                    echo "无变更，跳过"
+                  else
+                    git commit -m "Bump waifux to v${VERSION}"
+                    git push
+                    echo "✅ homebrew tap 已更新到 v${VERSION}"
+                  fi
 
             - name: Build (PRs)
               if: github.event_name == 'pull_request'

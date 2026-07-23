@@ -2,7 +2,109 @@ import Foundation
 import AVFoundation
 import AppKit
 import CryptoKit
+import ImageIO
 import Kingfisher
+
+/// 串行化高成本的 AVFoundation 抽帧，并将同一输出文件的请求合并为一个任务。
+/// 海报生成会解码高分辨率视频帧，允许多个任务同时运行会迅速耗尽 CPU 和内存。
+private actor VideoPosterGenerationCoordinator {
+    static let shared = VideoPosterGenerationCoordinator()
+
+    private let maxConcurrentGenerations = 1
+    private var activeGenerations = 0
+    private var waitingGenerations: [CheckedContinuation<Void, Never>] = []
+    private var tasks: [String: Task<URL?, Never>] = [:]
+
+    func generate(
+        key: String,
+        operation: @escaping @Sendable () async -> URL?
+    ) async -> URL? {
+        if let task = tasks[key] {
+            return await task.value
+        }
+
+        let task = Task.detached(priority: .utility) { [operation] () -> URL? in
+            await self.acquireSlot()
+            let result = await operation()
+            await self.releaseSlot()
+            return result
+        }
+        tasks[key] = task
+
+        let result = await task.value
+        tasks.removeValue(forKey: key)
+        return result
+    }
+
+    private func acquireSlot() async {
+        if activeGenerations < maxConcurrentGenerations {
+            activeGenerations += 1
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waitingGenerations.append(continuation)
+        }
+    }
+
+    private func releaseSlot() {
+        if let next = waitingGenerations.first {
+            waitingGenerations.removeFirst()
+            next.resume()
+        } else {
+            activeGenerations = max(0, activeGenerations - 1)
+        }
+    }
+}
+
+/// 列表小图抽帧限并发（外置卡上同时 N 路 AVAsset 会全卡死）。
+private actor VideoListThumbnailGenerationCoordinator {
+    static let shared = VideoListThumbnailGenerationCoordinator()
+
+    private let maxConcurrentGenerations = 2
+    private var activeGenerations = 0
+    private var waitingGenerations: [CheckedContinuation<Void, Never>] = []
+    private var tasks: [String: Task<URL?, Never>] = [:]
+
+    func generate(
+        key: String,
+        operation: @escaping @Sendable () async -> URL?
+    ) async -> URL? {
+        if let task = tasks[key] {
+            return await task.value
+        }
+
+        let task = Task.detached(priority: .utility) { [operation] () -> URL? in
+            await self.acquireSlot()
+            let result = await operation()
+            await self.releaseSlot()
+            return result
+        }
+        tasks[key] = task
+
+        let result = await task.value
+        tasks.removeValue(forKey: key)
+        return result
+    }
+
+    private func acquireSlot() async {
+        if activeGenerations < maxConcurrentGenerations {
+            activeGenerations += 1
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waitingGenerations.append(continuation)
+        }
+    }
+
+    private func releaseSlot() {
+        if let next = waitingGenerations.first {
+            waitingGenerations.removeFirst()
+            next.resume()
+        } else {
+            activeGenerations = max(0, activeGenerations - 1)
+        }
+    }
+}
 
 /// 视频缩略图缓存服务
 /// 为本地视频文件生成并缓存缩略图
@@ -29,18 +131,25 @@ final class VideoThumbnailCache {
         memoryCache.removeAllObjects()
     }
     
-    /// 若已为本地媒体生成过列表缩略图（`generateThumbnail`）或动态壁纸海报帧（`posterJPEGFileURL`），返回对应磁盘文件 URL。
-    /// 供「我的库」等场景优先于站点封面展示截取静帧。
+    /// 「我的库」等列表封面用的静帧查找。
+    ///
+    /// **仅服务 UI 列表展示**，不得用于桌面/锁屏静态底图。
+    /// 优先级：列表小图（`generateThumbnail` 写入，完整画幅）→ 高清 poster（仅兜底）。
+    ///
+    /// 注意：高清 poster 会做 letterbox 去黑边，竖屏/带边视频会被裁窄；若列表优先用它，
+    /// 再叠加 KF `Downsampling(512×512)` + `scaledToFill`，封面会像被放大裁切。
+    /// 因此列表必须优先未裁切的 800×600 列表帧。
     func cachedStaticThumbnailFileURLIfExists(forLocalFile mediaURL: URL) -> URL? {
         guard mediaURL.isFileURL else { return nil }
-        let path = mediaURL.standardizedFileURL.path
-        guard fileManager.fileExists(atPath: path) else { return nil }
+        // 列表热路径：只查本机 SSD 上的抽帧缓存，不要 fileExists 外置原片
 
         let thumb = cacheURL(for: mediaURL)
-        if fileManager.fileExists(atPath: thumb.path) { return thumb }
+        if isUsableCachedImage(at: thumb) { return thumb }
 
+        // 无列表小图时才回退 poster（旧缓存/仅生成过高清帧的路径）
+        let path = mediaURL.standardizedFileURL.path
         let poster = posterCacheURL(forPathKey: path)
-        if fileManager.fileExists(atPath: poster.path) { return poster }
+        if isUsableCachedImage(at: poster) { return poster }
 
         return nil
     }
@@ -48,16 +157,84 @@ final class VideoThumbnailCache {
     /// Scene 烘焙封面使用稳定的 item 级缓存文件，避免每次重新烘焙因为 MP4 文件名变化而堆出多张抽帧图。
     func cachedSceneBakePosterFileURLIfExists(itemID: String) -> URL? {
         let poster = sceneBakePosterCacheURL(itemID: itemID)
-        guard fileManager.fileExists(atPath: poster.path),
-              let attrs = try? fileManager.attributesOfItem(atPath: poster.path),
-              let sz = attrs[.size] as? NSNumber,
-              sz.intValue > 500 else {
-            return nil
-        }
+        guard isUsableCachedImage(at: poster) else { return nil }
         return poster
     }
 
-    /// 获取视频缩略图 URL
+    /// 仅返回已缓存的**高清**动态壁纸 poster，不触发 AVFoundation 抽帧。
+    /// 调度器切换下一张时优先走这里，避免串行抽帧把切换卡住。
+    ///
+    /// **绝不返回** `generateThumbnail` 的列表小图（800×600）。
+    func cachedPosterJPEGFileURLIfExists(forLocalVideo videoURL: URL) -> URL? {
+        guard videoURL.isFileURL else { return nil }
+        let pathKey = videoURL.standardizedFileURL.path
+        guard fileManager.fileExists(atPath: pathKey) else { return nil }
+        let poster = posterCacheURL(forPathKey: pathKey)
+        guard isUsableCachedImage(at: poster) else { return nil }
+        return poster
+    }
+
+    /// 桌面/锁屏静态底图：只读**高清** poster 缓存，绝不触发抽帧，也**绝不回退列表缩略图**。
+    ///
+    /// 优先级：
+    /// 1. scene 烘焙稳定封面 `scene_bake_<itemID>.jpg`（烘焙完成时写入，高清）
+    /// 2. 下载/设壁纸生成的高清 poster `poster_wallpaper_<path>.jpg`（最大 3840×2160）
+    /// 3. 调用方显式 fallback（必须是 file URL 且可用）
+    ///
+    /// **不用** `generateThumbnail` 的列表小图（800×600，仅供库列表/网格 UI）。
+    /// **不用** Workshop 工程自带的 `preview.*`（商店缩略图，不适合桌面/锁屏）。
+    ///
+    /// 锁屏/桌面若需要强制生成高清帧，请走 `posterJPEGFileURL` / `sceneBakePosterJPEGFileURL`
+    /// 或 `LocalWallpaperApplyService.Options.generatePosterFromVideoIfNeeded`。
+    func existingWallpaperPosterURL(
+        forLocalVideo videoURL: URL?,
+        sceneBakeItemID: String? = nil,
+        projectRoot: URL? = nil,
+        fallbackPosterURL: URL? = nil
+    ) -> URL? {
+        _ = projectRoot // 兼容旧调用；不再从工程目录取 preview.*
+
+        if let sceneBakeItemID,
+           let scenePoster = cachedSceneBakePosterFileURLIfExists(itemID: sceneBakeItemID) {
+            return scenePoster
+        }
+
+        if let videoURL,
+           let poster = cachedPosterJPEGFileURLIfExists(forLocalVideo: videoURL) {
+            return poster
+        }
+
+        if let fallbackPosterURL,
+           fallbackPosterURL.isFileURL,
+           isUsableCachedImage(at: fallbackPosterURL) {
+            return fallbackPosterURL
+        }
+
+        return nil
+    }
+
+    /// 列表缩略图磁盘缓存（`generateThumbnail` 写入，最大 800×600），不触发生成。
+    /// **仅供列表/网格 UI**，禁止作为桌面/锁屏静态底图。
+    func cachedListThumbnailFileURLIfExists(forLocalVideo videoURL: URL) -> URL? {
+        guard videoURL.isFileURL else { return nil }
+        let thumb = cacheURL(for: videoURL)
+        guard isUsableCachedImage(at: thumb) else { return nil }
+        return thumb
+    }
+
+    private func isUsableCachedImage(at url: URL) -> Bool {
+        guard fileManager.fileExists(atPath: url.path),
+              let attrs = try? fileManager.attributesOfItem(atPath: url.path),
+              let sz = attrs[.size] as? NSNumber,
+              sz.intValue > 500 else {
+            return false
+        }
+        return true
+    }
+
+    /// 获取**列表**视频缩略图 URL（最大 800×600）。
+    /// - Important: 仅供库列表/网格 UI，**禁止**作为桌面/锁屏静态底图。
+    ///   锁屏/桌面请用 `posterJPEGFileURL` / `existingWallpaperPosterURL`。
     /// - Parameter videoURL: 视频文件 URL
     /// - Returns: 缩略图 URL（可能是缓存的文件 URL，也可能是原始视频 URL）
     func thumbnailURL(for videoURL: URL) -> URL {
@@ -73,7 +250,7 @@ final class VideoThumbnailCache {
             return cachedURL
         }
         
-        // 异步生成缩略图
+        // 异步生成列表缩略图（非高清 poster）
         Task {
             await generateThumbnail(for: videoURL)
         }
@@ -82,18 +259,21 @@ final class VideoThumbnailCache {
         return videoURL
     }
     
-    /// 从本地视频抽一帧为 JPEG，用作动态壁纸的**静态桌面/锁屏**底图（与 `VideoWallpaperManager.setPosterAsDesktopWallpaper` 配套）。
-    /// - Note: 输出在 `VideoThumbnails` 目录，文件名由视频路径哈希决定；失败时返回 `nil`。
+    /// 从本地视频抽一帧为**高清** JPEG（最大 3840×2160），用作动态壁纸的**静态桌面/锁屏**底图
+    /// （与 `VideoWallpaperManager.setPosterAsDesktopWallpaper` 配套）。
+    ///
+    /// - Important: 这是锁屏/桌面唯一允许的抽帧生成入口；与列表 `generateThumbnail`（800×600）完全隔离。
+    /// - Note: 输出在 `VideoThumbnails` 目录，文件名 `poster_wallpaper_<path_md5>.jpg`；失败时返回 `nil`。
+    /// - Performance: 缓存命中时立即返回，letterbox 去黑边在后台异步修正，不阻塞设壁纸。
     func posterJPEGFileURL(forLocalVideo videoURL: URL) async -> URL? {
         guard videoURL.isFileURL else { return nil }
         let pathKey = videoURL.standardizedFileURL.path
         guard fileManager.fileExists(atPath: pathKey) else { return nil }
 
         let outURL = posterCacheURL(forPathKey: pathKey)
-        if fileManager.fileExists(atPath: outURL.path),
-           let attrs = try? fileManager.attributesOfItem(atPath: outURL.path),
-           let sz = attrs[.size] as? NSNumber, sz.intValue > 500 {
-            await Self.cropExistingPosterIfNeeded(outURL)
+        if isUsableCachedImage(at: outURL) {
+            // 关键：不要 await 全分辨率 letterbox 扫描；已有高清 poster 直接返回
+            scheduleCropExistingPosterIfNeeded(outURL)
             return outURL
         }
 
@@ -114,7 +294,7 @@ final class VideoThumbnailCache {
         let outURL = sceneBakePosterCacheURL(itemID: itemID)
         if !forceRegenerate,
            let existing = cachedSceneBakePosterFileURLIfExists(itemID: itemID) {
-            await Self.cropExistingPosterIfNeeded(existing)
+            scheduleCropExistingPosterIfNeeded(existing)
             return existing
         }
 
@@ -128,14 +308,43 @@ final class VideoThumbnailCache {
         if let videoPath, !videoPath.isEmpty {
             let videoURL = URL(fileURLWithPath: videoPath)
             try? fileManager.removeItem(at: posterCacheURL(forPathKey: videoURL.standardizedFileURL.path))
-            try? fileManager.removeItem(at: cacheURL(for: videoURL))
+            removeListThumbnail(forLocalVideo: videoURL)
         }
     }
 
-    /// 动态壁纸的锁屏/静态桌面底图：对 mp4/mov/webm/m4v 从片源抽高清帧，失败或未识别扩展名时回退为站点封面等。
+    /// 删除视频对应的列表小图磁盘缓存 + 内存缓存（重新烘焙后必须调用，否则 path 不变会继续命中旧帧）。
+    func removeListThumbnail(forLocalVideo videoURL: URL) {
+        guard videoURL.isFileURL else { return }
+        let pathKey = Self.stablePathKey(for: videoURL)
+        let listURL = cacheURL(forPathKey: pathKey)
+        try? fileManager.removeItem(at: listURL)
+        // 兼容旧 absoluteString / 无 list_ 前缀键
+        try? fileManager.removeItem(at: cacheDirectory.appendingPathComponent("\(videoURL.absoluteString.md5).jpg"))
+        try? fileManager.removeItem(at: cacheDirectory.appendingPathComponent("\(pathKey.md5).jpg"))
+        try? fileManager.removeItem(
+            at: cacheDirectory.appendingPathComponent("\(URL(fileURLWithPath: pathKey).absoluteString.md5).jpg")
+        )
+        memoryCache.removeObject(forKey: pathKey as NSString)
+        memoryCache.removeObject(forKey: videoURL.absoluteString as NSString)
+    }
+
+    /// 强制从当前视频重新抽列表小图（完整画幅），覆盖旧 `list_*.jpg`。
+    @discardableResult
+    func regenerateListThumbnailJPEGFileURL(forLocalVideo videoURL: URL) async -> URL? {
+        guard videoURL.isFileURL else { return nil }
+        removeListThumbnail(forLocalVideo: videoURL)
+        return await listThumbnailJPEGFileURL(forLocalVideo: videoURL)
+    }
+
+    /// 动态壁纸的锁屏/静态桌面底图：对 mp4/mov/webm/m4v **强制**从片源抽高清帧。
+    /// 失败或未识别扩展名时才回退站点封面等；**绝不**使用列表 `generateThumbnail` 小图。
     func lockScreenPosterURL(forLocalVideo localVideoURL: URL, fallbackPosterURL: URL?) async -> URL? {
         let ext = localVideoURL.pathExtension.lowercased()
         guard ["mp4", "mov", "webm", "m4v"].contains(ext) else { return fallbackPosterURL }
+        // 先读高清 poster 缓存；没有就抽一帧生成，绝不碰列表小图
+        if let existing = cachedPosterJPEGFileURLIfExists(forLocalVideo: localVideoURL) {
+            return existing
+        }
         return await posterJPEGFileURL(forLocalVideo: localVideoURL) ?? fallbackPosterURL
     }
 
@@ -148,78 +357,107 @@ final class VideoThumbnailCache {
     }
 
     private func generatePosterJPEGFile(from videoURL: URL, outputURL: URL) async -> URL? {
-        await Task.detached(priority: .utility) {
-            let asset = AVAsset(url: videoURL)
-            let generator = AVAssetImageGenerator(asset: asset)
-            generator.appliesPreferredTrackTransform = true
-            generator.maximumSize = CGSize(width: 3840, height: 2160)
+        await VideoPosterGenerationCoordinator.shared.generate(key: outputURL.path) {
+            await Task.detached(priority: .userInitiated) {
+                let startedAt = CFAbsoluteTimeGetCurrent()
+                let asset = AVURLAsset(url: videoURL)
+                let generator = AVAssetImageGenerator(asset: asset)
+                generator.appliesPreferredTrackTransform = true
+                // 允许就近关键帧，显著快于精确 seek（尤其长 GOP / 4K）
+                generator.requestedTimeToleranceBefore = CMTime(seconds: 0.35, preferredTimescale: 600)
+                generator.requestedTimeToleranceAfter = CMTime(seconds: 0.35, preferredTimescale: 600)
+                generator.maximumSize = CGSize(width: 3840, height: 2160)
 
-            // 计算候选时间点：优先中间帧，回退到 30%/70%/1s，避免第一帧（可能是黑屏/过渡）
-            var candidates: [Double] = []
-            if let duration = try? await asset.load(.duration) {
-                let d = CMTimeGetSeconds(duration)
-                if d.isFinite, d > 0 {
-                    // 主候选：中间时间点；回退：30%、70%、1秒
-                    candidates = [d * 0.5, d * 0.3, d * 0.7, min(d * 0.1, 2.0)]
-                        .filter { $0 >= 0.2 }  // 过滤掉太靠前的（避免第一帧）
-                    // 去重并保持顺序
-                    var seen = Set<Double>()
-                    candidates = candidates.compactMap {
-                        let rounded = (($0 * 10).rounded() / 10)
-                        guard !seen.contains(rounded) else { return nil }
-                        seen.insert(rounded)
-                        return $0
+                // 少候选 + 优先靠近片头的可读帧，避免 4K 中间帧随机 seek 过慢。
+                // 中间帧只作为首轮失败后的备选，不再默认先抽 50%。
+                var candidates: [Double] = [1.0, 0.5, 2.0]
+                if let duration = try? await asset.load(.duration) {
+                    let d = CMTimeGetSeconds(duration)
+                    if d.isFinite, d > 0 {
+                        let mid = d * 0.5
+                        let early = min(max(d * 0.15, 0.3), 2.0)
+                        candidates = [early, min(1.0, max(d * 0.05, 0.2)), mid]
+                            .filter { $0 >= 0 && $0 < d }
+                        var seen = Set<Double>()
+                        candidates = candidates.compactMap {
+                            let rounded = (($0 * 10).rounded() / 10)
+                            guard !seen.contains(rounded) else { return nil }
+                            seen.insert(rounded)
+                            return $0
+                        }
                     }
                 }
-            }
-            // 兜底：如果所有候选都被过滤（如超短视频），回退到第一帧
-            if candidates.isEmpty {
-                candidates = [0.0]
-            }
+                if candidates.isEmpty {
+                    candidates = [0.0]
+                }
 
-            // 多点尝试，任一成功即返回
-            for seconds in candidates {
-                let t = CMTime(seconds: seconds, preferredTimescale: 600)
-                do {
-                    let cgImage = try generator.copyCGImage(at: t, actualTime: nil)
-                    let posterImage = Self.croppingImageLetterboxIfNeeded(cgImage)
-                    let image = NSImage(cgImage: posterImage, size: NSSize(width: posterImage.width, height: posterImage.height))
-                    guard let tiff = image.tiffRepresentation,
-                          let rep = NSBitmapImageRep(data: tiff),
-                          let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.88]) else {
+                for seconds in candidates {
+                    let t = CMTime(seconds: seconds, preferredTimescale: 600)
+                    do {
+                        let cgImage = try generator.copyCGImage(at: t, actualTime: nil)
+                        // 生成阶段先不做全分辨率 letterbox 扫描（4K 全图像素扫描极慢），
+                        // 直接编码 JPEG；后续由 scheduleCropExistingPosterIfNeeded 后台修正。
+                        guard let jpeg = Self.encodeJPEG(cgImage, quality: 0.88) else {
+                            continue
+                        }
+                        try jpeg.write(to: outputURL, options: .atomic)
+                        let elapsed = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+                        print("[VideoThumbnailCache] Poster frame at \(String(format: "%.1f", seconds))s in \(String(format: "%.0f", elapsed))ms → \(outputURL.lastPathComponent)")
+                        // 后台异步去黑边，不阻塞返回
+                        Task.detached(priority: .utility) {
+                            await Self.cropExistingPosterIfNeeded(outputURL)
+                        }
+                        return outputURL
+                    } catch {
+                        print("[VideoThumbnailCache] Poster try at \(String(format: "%.1f", seconds))s failed: \(error)")
                         continue
                     }
-                    try jpeg.write(to: outputURL, options: .atomic)
-                    print("[VideoThumbnailCache] Poster frame at \(String(format: "%.1f", seconds))s for wallpaper: \(outputURL.path)")
-                    return outputURL
-                } catch {
-                    print("[VideoThumbnailCache] Poster try at \(String(format: "%.1f", seconds))s failed: \(error)")
-                    continue
                 }
-            }
 
-            print("[VideoThumbnailCache] All poster frame attempts exhausted for \(videoURL.lastPathComponent)")
+                print("[VideoThumbnailCache] All poster frame attempts exhausted for \(videoURL.lastPathComponent)")
+                return nil
+            }.value
+        }
+    }
+
+    /// 后台异步 letterbox 修正；调用方不得 await，避免阻塞设壁纸热路径。
+    private func scheduleCropExistingPosterIfNeeded(_ url: URL) {
+        Task.detached(priority: .utility) {
+            await Self.cropExistingPosterIfNeeded(url)
+        }
+    }
+
+    /// 用 ImageIO 直接编码 JPEG，避免 NSImage → TIFF → NSBitmapImageRep 的双份全分辨率拷贝。
+    nonisolated private static func encodeJPEG(_ image: CGImage, quality: CGFloat) -> Data? {
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            data as CFMutableData,
+            "public.jpeg" as CFString,
+            1,
+            nil
+        ) else {
             return nil
-        }.value
+        }
+        let props: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: quality
+        ]
+        CGImageDestinationAddImage(dest, image, props as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return data as Data
     }
 
     nonisolated private static func cropExistingPosterIfNeeded(_ url: URL) async {
         await Task.detached(priority: .utility) {
-            guard let image = NSImage(contentsOf: url),
-                  let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+            guard let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil),
                   let cropped = croppedImageLetterbox(cgImage),
                   cropped.width != cgImage.width || cropped.height != cgImage.height else {
                 return
             }
-            let nsImage = NSImage(cgImage: cropped, size: NSSize(width: cropped.width, height: cropped.height))
-            guard let tiff = nsImage.tiffRepresentation,
-                  let rep = NSBitmapImageRep(data: tiff),
-                  let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.88]) else {
-                return
-            }
+            guard let jpeg = encodeJPEG(cropped, quality: 0.88) else { return }
             do {
                 try jpeg.write(to: url, options: .atomic)
-                print("[VideoThumbnailCache] Cropped existing poster letterbox: \(url.path)")
+                print("[VideoThumbnailCache] Cropped existing poster letterbox: \(url.lastPathComponent)")
             } catch {
                 print("[VideoThumbnailCache] Failed to rewrite cropped poster: \(error)")
             }
@@ -344,7 +582,8 @@ final class VideoThumbnailCache {
         return CGRect(x: cropLeft, y: cropTop, width: cropW, height: cropH)
     }
 
-    /// 获取缩略图图片
+    /// 获取**列表**缩略图图片（最大 800×600）。
+    /// - Important: 仅供 UI 列表，禁止用于锁屏/桌面。
     /// - Parameter videoURL: 视频文件 URL
     /// - Returns: 缩略图
     func thumbnailImage(for videoURL: URL) async -> NSImage? {
@@ -368,55 +607,165 @@ final class VideoThumbnailCache {
         return await generateThumbnail(for: videoURL)
     }
     
-    /// 生成并缓存缩略图
+    /// 生成并缓存**列表**缩略图（最长边约 960，保持原始宽高比，**不做 letterbox 裁切**）。
+    /// - Important: 仅供库列表/网格 UI。桌面/锁屏必须走 `generatePosterJPEGFile`（3840×2160）。
     @discardableResult
     private func generateThumbnail(for videoURL: URL) async -> NSImage? {
-        let cacheKeyString = videoURL.absoluteString
-        
-        return await Task.detached(priority: .utility) { [weak self] in
-            guard let self = self else { return nil }
-            
-            let asset = AVAsset(url: videoURL)
-            let imageGenerator = AVAssetImageGenerator(asset: asset)
-            imageGenerator.appliesPreferredTrackTransform = true
-            imageGenerator.maximumSize = CGSize(width: 800, height: 600)
-            
-            do {
-                let cgImage = try imageGenerator.copyCGImage(
-                    at: CMTime(seconds: 0, preferredTimescale: 1),
-                    actualTime: nil
-                )
-                
-                let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                let cost = Int(cgImage.width * cgImage.height * 4)
-                
-                // 保存到内存缓存
-                await MainActor.run {
-                    let cacheKey = cacheKeyString as NSString
-                    self.memoryCache.setObject(image, forKey: cacheKey, cost: cost)
-                }
-                
-                // 保存到磁盘缓存
-                let cachedURL = await self.cacheURL(for: videoURL)
-                if let data = image.tiffRepresentation,
-                   let bitmap = NSBitmapImageRep(data: data),
-                   let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) {
-                    try? jpegData.write(to: cachedURL)
-                    print("[VideoThumbnailCache] Generated and cached thumbnail: \(cachedURL.path)")
-                }
-                
-                return image
-            } catch {
-                print("[VideoThumbnailCache] Failed to generate thumbnail for \(videoURL.lastPathComponent): \(error)")
+        // 统一用标准化 path 作为缓存键与读盘路径，避免 fileURL absoluteString 编码差异导致
+        // 「生成写了 A.jpg、查找读 B.jpg」——外置卡上路径形态不一时表现为部分封面永远空白。
+        let pathKey = Self.stablePathKey(for: videoURL)
+        let sourceURL = URL(fileURLWithPath: pathKey)
+        let outputURL = cacheURL(forPathKey: pathKey)
+        let memoryKey = pathKey as NSString
+
+        if let cached = memoryCache.object(forKey: memoryKey) {
+            return cached
+        }
+        if isUsableCachedImage(at: outputURL),
+           let data = try? Data(contentsOf: outputURL),
+           let image = NSImage(data: data) {
+            memoryCache.setObject(image, forKey: memoryKey)
+            return image
+        }
+
+        let generated = await VideoListThumbnailGenerationCoordinator.shared.generate(key: pathKey) {
+            await Self.extractListThumbnailJPEG(
+                sourceURL: sourceURL,
+                outputURL: outputURL
+            )
+        }
+        guard generated != nil,
+              let data = try? Data(contentsOf: outputURL),
+              let image = NSImage(data: data) else {
+            return nil
+        }
+        let cost = Int((image.size.width * image.size.height * 4).rounded())
+        memoryCache.setObject(image, forKey: memoryKey, cost: max(cost, 1))
+        return image
+    }
+
+    /// 后台抽列表帧并写入 `outputURL`；成功返回 outputURL。
+    nonisolated private static func extractListThumbnailJPEG(
+        sourceURL: URL,
+        outputURL: URL
+    ) async -> URL? {
+        await Task.detached(priority: .utility) {
+            guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+                print("[VideoThumbnailCache] List thumb source missing: \(sourceURL.lastPathComponent)")
                 return nil
             }
+
+            let asset = AVURLAsset(url: sourceURL)
+            let imageGenerator = AVAssetImageGenerator(asset: asset)
+            imageGenerator.appliesPreferredTrackTransform = true
+            // 列表专用上限：正方形 bounding box，按比例缩小，竖/横画幅都够用
+            imageGenerator.maximumSize = CGSize(width: 960, height: 960)
+            imageGenerator.requestedTimeToleranceBefore = CMTime(seconds: 0.35, preferredTimescale: 600)
+            imageGenerator.requestedTimeToleranceAfter = CMTime(seconds: 0.35, preferredTimescale: 600)
+
+            // 多候选：短视频 / 片头黑帧 / 外置卡 seek 失败
+            var candidates: [Double] = [0.5, 1.0, 0.2, 0.0, 2.0]
+            if let duration = try? await asset.load(.duration) {
+                let d = CMTimeGetSeconds(duration)
+                if d.isFinite, d > 0 {
+                    candidates = [
+                        min(max(d * 0.1, 0.15), 1.5),
+                        min(0.5, max(d * 0.05, 0.1)),
+                        min(1.0, d * 0.25),
+                        min(d * 0.5, d - 0.05),
+                        0.0
+                    ]
+                    .filter { $0 >= 0 && $0 < d }
+                    var seen = Set<String>()
+                    candidates = candidates.filter {
+                        let k = String(format: "%.2f", $0)
+                        return seen.insert(k).inserted
+                    }
+                    if candidates.isEmpty { candidates = [0.0] }
+                }
+            }
+
+            for seconds in candidates {
+                let t = CMTime(seconds: seconds, preferredTimescale: 600)
+                do {
+                    let cgImage = try imageGenerator.copyCGImage(at: t, actualTime: nil)
+                    guard let jpeg = encodeJPEG(cgImage, quality: 0.82) else { continue }
+                    try jpeg.write(to: outputURL, options: .atomic)
+                    print("[VideoThumbnailCache] List thumb @\(String(format: "%.1f", seconds))s \(cgImage.width)x\(cgImage.height) → \(outputURL.lastPathComponent)")
+                    return outputURL
+                } catch {
+                    print("[VideoThumbnailCache] List thumb try @\(seconds)s failed: \(error)")
+                    continue
+                }
+            }
+            print("[VideoThumbnailCache] Failed to generate list thumbnail for \(sourceURL.lastPathComponent)")
+            return nil
         }.value
     }
-    
-    /// 获取缓存 URL
+
+    /// 为列表 UI 生成/返回 列表小图 URL（完整画幅，无 letterbox 裁切）。
+    /// 与 `posterJPEGFileURL`（高清+去黑边，桌面/锁屏用）隔离。
+    func listThumbnailJPEGFileURL(forLocalVideo videoURL: URL) async -> URL? {
+        guard videoURL.isFileURL else { return nil }
+        let pathKey = Self.stablePathKey(for: videoURL)
+        let thumb = cacheURL(forPathKey: pathKey)
+        if isUsableCachedImage(at: thumb) {
+            return thumb
+        }
+        // 也尝试旧 absoluteString 键（迁移前写入的缓存），命中则复制到新键
+        if migrateLegacyListThumbIfNeeded(for: videoURL, pathKey: pathKey) {
+            return thumb
+        }
+        _ = await generateThumbnail(for: URL(fileURLWithPath: pathKey))
+        return isUsableCachedImage(at: thumb) ? thumb : nil
+    }
+
+    /// 标准化路径键：去掉 file URL 编码差异，统一 `/private` 前缀形态。
+    nonisolated private static func stablePathKey(for videoURL: URL) -> String {
+        var path = videoURL.standardizedFileURL.path
+        // fileURLWithPath 与 absoluteString 解析后的 path 可能一个带 /private
+        if path.hasPrefix("/private/var/"), path.count > "/private".count {
+            // 保留原样；NSString.standardizingPath 已处理大部分
+            path = (path as NSString).standardizingPath
+        } else {
+            path = (path as NSString).standardizingPath
+        }
+        return path
+    }
+
+    /// 获取缓存 URL（基于稳定 path，而非 absoluteString）
     private func cacheURL(for videoURL: URL) -> URL {
-        let hash = videoURL.absoluteString.md5
-        return cacheDirectory.appendingPathComponent("\(hash).jpg")
+        cacheURL(forPathKey: Self.stablePathKey(for: videoURL))
+    }
+
+    private func cacheURL(forPathKey pathKey: String) -> URL {
+        cacheDirectory.appendingPathComponent("list_\(pathKey.md5).jpg")
+    }
+
+    /// 兼容旧版 `\(absoluteString.md5).jpg` 与未加 `list_` 前缀的 path 键。
+    @discardableResult
+    private func migrateLegacyListThumbIfNeeded(for videoURL: URL, pathKey: String) -> Bool {
+        let dest = cacheURL(forPathKey: pathKey)
+        guard !isUsableCachedImage(at: dest) else { return true }
+
+        let legacyCandidates = [
+            cacheDirectory.appendingPathComponent("\(videoURL.absoluteString.md5).jpg"),
+            cacheDirectory.appendingPathComponent("\(pathKey.md5).jpg"),
+            // 某些路径会多/少 trailing slash
+            cacheDirectory.appendingPathComponent("\(URL(fileURLWithPath: pathKey).absoluteString.md5).jpg")
+        ]
+        for legacy in legacyCandidates {
+            guard isUsableCachedImage(at: legacy) else { continue }
+            do {
+                try fileManager.copyItem(at: legacy, to: dest)
+                print("[VideoThumbnailCache] Migrated legacy list thumb → \(dest.lastPathComponent)")
+                return true
+            } catch {
+                // 已存在或拷贝失败：若 dest 可用仍算成功
+                if isUsableCachedImage(at: dest) { return true }
+            }
+        }
+        return false
     }
     
     /// 迁移缓存键：将旧路径对应的缓存文件重命名为新路径对应的缓存文件名。
@@ -426,7 +775,37 @@ final class VideoThumbnailCache {
             let fileManager = FileManager.default
             var movedCount = 0
 
-            // 基于 media & wallpaper 下载记录重建映射
+            func moveIfNeeded(from old: URL, to new: URL) {
+                guard fileManager.fileExists(atPath: old.path),
+                      !fileManager.fileExists(atPath: new.path) else { return }
+                try? fileManager.moveItem(at: old, to: new)
+                movedCount += 1
+            }
+
+            func migrateListThumbs(oldPath: String, newPath: String) {
+                let oldKey = (oldPath as NSString).standardizingPath
+                let newKey = (newPath as NSString).standardizingPath
+                let oldURL = URL(fileURLWithPath: oldKey)
+                let newURL = URL(fileURLWithPath: newKey)
+
+                // 新键 list_<path.md5>
+                let oldList = cacheDirectory.appendingPathComponent("list_\(oldKey.md5).jpg")
+                let newList = cacheDirectory.appendingPathComponent("list_\(newKey.md5).jpg")
+                moveIfNeeded(from: oldList, to: newList)
+
+                // 旧 absoluteString 键 / 裸 path.md5 键 → 新 list_ 键
+                for legacy in [
+                    cacheDirectory.appendingPathComponent("\(oldURL.absoluteString.md5).jpg"),
+                    cacheDirectory.appendingPathComponent("\(oldKey.md5).jpg")
+                ] {
+                    moveIfNeeded(from: legacy, to: newList)
+                }
+
+                let oldPoster = cacheDirectory.appendingPathComponent("poster_wallpaper_\(oldKey.md5).jpg")
+                let newPoster = cacheDirectory.appendingPathComponent("poster_wallpaper_\(newKey.md5).jpg")
+                moveIfNeeded(from: oldPoster, to: newPoster)
+            }
+
             let mediaRecords = await MainActor.run { MediaLibraryService.shared.downloadRecords }
             let wallpaperRecords = await MainActor.run { WallpaperLibraryService.shared.downloadRecords }
 
@@ -434,50 +813,14 @@ final class VideoThumbnailCache {
                 let path = record.localFilePath
                 guard path.hasPrefix(newPrefix) else { continue }
                 let oldPath = oldPrefix + String(path.dropFirst(newPrefix.count))
-
-                let oldURL = URL(fileURLWithPath: oldPath)
-                let newURL = URL(fileURLWithPath: path)
-
-                // 缩略图缓存
-                let oldThumb = cacheDirectory.appendingPathComponent("\(oldURL.absoluteString.md5).jpg")
-                let newThumb = cacheDirectory.appendingPathComponent("\(newURL.absoluteString.md5).jpg")
-                if fileManager.fileExists(atPath: oldThumb.path), !fileManager.fileExists(atPath: newThumb.path) {
-                    try? fileManager.moveItem(at: oldThumb, to: newThumb)
-                    movedCount += 1
-                }
-
-                // 海报帧缓存
-                let oldPoster = cacheDirectory.appendingPathComponent("poster_wallpaper_\(oldPath.md5).jpg")
-                let newPoster = cacheDirectory.appendingPathComponent("poster_wallpaper_\(path.md5).jpg")
-                if fileManager.fileExists(atPath: oldPoster.path), !fileManager.fileExists(atPath: newPoster.path) {
-                    try? fileManager.moveItem(at: oldPoster, to: newPoster)
-                    movedCount += 1
-                }
+                migrateListThumbs(oldPath: oldPath, newPath: path)
             }
 
             for record in wallpaperRecords {
                 let path = record.localFilePath
                 guard path.hasPrefix(newPrefix) else { continue }
                 let oldPath = oldPrefix + String(path.dropFirst(newPrefix.count))
-
-                let oldURL = URL(fileURLWithPath: oldPath)
-                let newURL = URL(fileURLWithPath: path)
-
-                // 缩略图缓存
-                let oldThumb = cacheDirectory.appendingPathComponent("\(oldURL.absoluteString.md5).jpg")
-                let newThumb = cacheDirectory.appendingPathComponent("\(newURL.absoluteString.md5).jpg")
-                if fileManager.fileExists(atPath: oldThumb.path), !fileManager.fileExists(atPath: newThumb.path) {
-                    try? fileManager.moveItem(at: oldThumb, to: newThumb)
-                    movedCount += 1
-                }
-
-                // 海报帧缓存
-                let oldPoster = cacheDirectory.appendingPathComponent("poster_wallpaper_\(oldPath.md5).jpg")
-                let newPoster = cacheDirectory.appendingPathComponent("poster_wallpaper_\(path.md5).jpg")
-                if fileManager.fileExists(atPath: oldPoster.path), !fileManager.fileExists(atPath: newPoster.path) {
-                    try? fileManager.moveItem(at: oldPoster, to: newPoster)
-                    movedCount += 1
-                }
+                migrateListThumbs(oldPath: oldPath, newPath: path)
             }
 
             print("[VideoThumbnailCache] Migrated \(movedCount) cache files from old paths to new paths")

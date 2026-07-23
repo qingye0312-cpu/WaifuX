@@ -264,6 +264,10 @@ struct ContentView: View {
     // 顶层仅在 .task 中一次性轮询 isInitialSourceSelectionComplete，无需响应式；
     // 数据源切换提示由独立的 SourceSwitchToast / WorkshopSourceSwitchToast 子视图各自观察。
     @State private var detailPath: [MainDetailRoute] = []
+    /// 状态栏可在已有详情页上请求另一个详情；重建栈以避免 SwiftUI 复用旧 destination。
+    @State private var detailNavigationStackID = UUID()
+    @State private var pendingCurrentWallpaperRoute: MainDetailRoute?
+    @State private var detailBackSwipeRegistration: UUID?
 
     init(
         wallpaperViewModel: WallpaperViewModel,
@@ -287,6 +291,7 @@ struct ContentView: View {
                         detailDestination(for: route)
                     }
             }
+            .id(detailNavigationStackID)
 
             globalOverlayLayer
         }
@@ -295,12 +300,21 @@ struct ContentView: View {
             AppResponsivenessMonitor.noteTabChange(navigationState.selectedTab.title)
             AppResponsivenessMonitor.noteDetailDepth(detailPath.count)
             AppResponsivenessMonitor.noteScenePhase("contentViewVisible")
+            registerDetailBackSwipeHandler()
+            consumePendingWallpaperDetailRequest()
+        }
+        .onDisappear {
+            unregisterDetailBackSwipeHandler()
         }
         .onChange(of: navigationState.selectedTab) { _, tab in
             AppResponsivenessMonitor.noteTabChange(tab.title)
         }
         .onChange(of: detailPath.count) { _, depth in
             AppResponsivenessMonitor.noteDetailDepth(depth)
+        }
+        // 必须位于详情页 NavigationStack 的外层，已有详情页显示时也要能收到替换请求。
+        .onReceive(NotificationCenter.default.publisher(for: .openCurrentWallpaperDetail)) { _ in
+            consumePendingWallpaperDetailRequest()
         }
         .onChange(of: navigationState.selectedWallpaper) { _, wallpaper in
             guard let wallpaper else { return }
@@ -405,6 +419,11 @@ struct ContentView: View {
                         handleDownloadToastRetry(snapshot)
                     }
                 )
+                BackgroundDownloadProgressToastHost(
+                    onExpand: { DownloadTaskService.shared.restoreAllRunningToasts() }
+                )
+                VideoOptimizationProgressToastHost()
+                BakeProgressToastHost()
                 WallpaperSourceSwitchToast()
                     .padding(.horizontal, 24)
                     .padding(.bottom, 8)
@@ -502,6 +521,42 @@ struct ContentView: View {
         navigationState.selectedTab = .myMedia
     }
 
+    private func consumePendingWallpaperDetailRequest() {
+        guard let request = MainNavigationRequestStore.consumeWallpaperDetailRequest() else { return }
+
+        navigationState.selectedTab = .myMedia
+        switch request {
+        case .media(let item):
+            replaceDetailWithCurrentWallpaper(.media(item, context: [item]))
+        case .wallpaper(let wallpaper):
+            if wallpaper.isPixivManga {
+                let route = MangaRoutePayload(
+                    source: .pixiv,
+                    illustId: String(wallpaper.id.dropFirst("pixiv_".count)),
+                    seedTitle: wallpaper.title,
+                    seedCoverURL: wallpaper.path
+                )
+                replaceDetailWithCurrentWallpaper(.manga(route))
+            } else {
+                replaceDetailWithCurrentWallpaper(.wallpaper(wallpaper, context: [wallpaper]))
+            }
+        }
+    }
+
+    /// 先完整关闭当前详情页，再在下一轮主线程事件重建并打开目标详情。
+    private func replaceDetailWithCurrentWallpaper(_ route: MainDetailRoute) {
+        pendingCurrentWallpaperRoute = route
+        detailPath.removeAll()
+        clearSelectedDetailBindings()
+        detailNavigationStackID = UUID()
+        Task { @MainActor in
+            await Task.yield()
+            guard pendingCurrentWallpaperRoute == route else { return }
+            pendingCurrentWallpaperRoute = nil
+            openDetail(route)
+        }
+    }
+
     @ViewBuilder
     private func detailDestination(for route: MainDetailRoute) -> some View {
         switch route {
@@ -547,7 +602,12 @@ struct ContentView: View {
             .toolbar(.hidden, for: .automatic)
 
         case .manga(let route):
-            MangaDetailSheet(route: route)
+            MangaDetailSheet(
+                route: route,
+                onNavigateToManga: { selectedRoute in
+                    detailPath.append(.manga(selectedRoute))
+                }
+            )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea()
                 .navigationBarBackButtonHidden(true)
@@ -577,6 +637,22 @@ struct ContentView: View {
         if detailPath.isEmpty {
             clearSelectedDetailBindings()
         }
+    }
+
+    /// Wallpaper, media, anime, and manga detail pages share this NavigationStack.
+    private func registerDetailBackSwipeHandler() {
+        guard detailBackSwipeRegistration == nil else { return }
+        detailBackSwipeRegistration = TrackpadBackSwipeRouter.shared.register(
+            priority: 100,
+            isEnabled: { !self.detailPath.isEmpty },
+            action: { self.popDetail() }
+        )
+    }
+
+    private func unregisterDetailBackSwipeHandler() {
+        guard let detailBackSwipeRegistration else { return }
+        TrackpadBackSwipeRouter.shared.unregister(detailBackSwipeRegistration)
+        self.detailBackSwipeRegistration = nil
     }
 
     // MARK: - 猜你喜欢回调
@@ -964,6 +1040,145 @@ private struct DownloadProgressToastHost: View {
                 displayedSnapshot = nil
             }
         }
+    }
+}
+
+// MARK: - Compact background download surface
+private struct BackgroundDownloadProgressToastHost: View {
+    @ObservedObject private var downloadService = DownloadTaskService.shared
+    let onExpand: () -> Void
+
+    private var backgroundTasks: [DownloadTask] {
+        downloadService.runningTasks.filter { downloadService.isToastSuppressed(for: $0.id) }
+    }
+
+    var body: some View {
+        Group {
+            if let task = downloadService.compactOverlayTask {
+                BackgroundTaskProgressToast(
+                    title: String(format: t("download.backgroundProgress"), Int((task.progress * 100).rounded())),
+                    detail: remainingDetail(backgroundTasks.count - 1),
+                    progress: task.progress,
+                    onTap: onExpand
+                )
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+    }
+
+    private func remainingDetail(_ count: Int) -> String? {
+        count > 0 ? String(format: t("progress.remainingCount"), count) : nil
+    }
+}
+
+/// Reads the unified optimization queue without owning or changing any task.
+/// The same compact layer is visible in the library and on detail pages.
+private struct VideoOptimizationProgressToastHost: View {
+    @ObservedObject private var queue = VideoOptimizationQueueService.shared
+
+    private var activeItem: FrameInterpolationQueueItem? {
+        queue.activeProcessingItem
+    }
+
+    var body: some View {
+        Group {
+            if let item = activeItem {
+                BackgroundTaskProgressToast(
+                    title: title(for: item),
+                    detail: remainingDetail(queue.remainingWorkCount),
+                    progress: item.progress
+                )
+            }
+        }
+        .transition(.opacity.combined(with: .move(edge: .bottom)))
+    }
+
+    private func title(for item: FrameInterpolationQueueItem) -> String {
+        let progress = Int((item.progress * 100).rounded())
+        switch item.currentOperation {
+        case .loopTransition:
+            return String(format: t("loopAnalysis.toastRunning"), progress)
+        case .frameInterpolation:
+            return String(format: t("frameInterpolationToastRunning"), progress)
+        case nil:
+            return t("videoOptimizationOptimizingVideo")
+        }
+    }
+
+    private func remainingDetail(_ count: Int) -> String? {
+        count > 0 ? String(format: t("progress.remainingCount"), count) : nil
+    }
+}
+
+/// Compact bake progress for scene offline bake and standalone BakeService work.
+private struct BakeProgressToastHost: View {
+    @ObservedObject private var taskQueue = TaskQueueStatusService.shared
+
+    private var bakeEntries: [TaskQueueStatusService.Entry] {
+        taskQueue.entries.filter { $0.category == .bake }
+    }
+
+    var body: some View {
+        Group {
+            if let entry = bakeEntries.first {
+                BackgroundTaskProgressToast(
+                    title: String(format: t("bake.backgroundProgress"), Int((entry.progress * 100).rounded())),
+                    detail: remainingDetail(bakeEntries.count - 1),
+                    progress: entry.progress
+                )
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+    }
+
+    private func remainingDetail(_ count: Int) -> String? {
+        count > 0 ? String(format: t("progress.remainingCount"), count) : nil
+    }
+}
+
+private struct BackgroundTaskProgressToast: View {
+    let title: String
+    let detail: String?
+    let progress: Double
+    var onTap: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .monospacedDigit()
+                .fixedSize(horizontal: true, vertical: false)
+
+            ZStack(alignment: .leading) {
+                Capsule(style: .continuous)
+                    .fill(Color.white.opacity(0.12))
+                    .frame(width: 92, height: 5)
+
+                Capsule(style: .continuous)
+                    .fill(Color.white.opacity(0.78))
+                    .frame(width: 92 * min(1, max(0, progress)), height: 5)
+            }
+
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.72))
+                    .monospacedDigit()
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .liquidGlassSurface(.prominent, tint: Color.white.opacity(0.06), in: Capsule(style: .continuous))
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.16), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+        .contentShape(Capsule(style: .continuous))
+        .onTapGesture { onTap?() }
+        .accessibilityAddTraits(onTap == nil ? [] : .isButton)
     }
 }
 

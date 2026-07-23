@@ -12,7 +12,7 @@ struct WallpaperDetailSheet: View {
     let onNavigateToWallpaper: ((Wallpaper) -> Void)?
 
     @State private var resolvedWallpaper: Wallpaper
-    @State private var isDownloading = false
+    @State private var downloadActivity = DetailDownloadActivity()
     @State private var showError = false
     @State private var errorMessage = ""
     @State private var isSettingWallpaper = false
@@ -57,8 +57,10 @@ struct WallpaperDetailSheet: View {
     @State private var isLoadingAuthorWallpapers = false
     @State private var authorWallpapersPage = 1
     @State private var hasMoreAuthorWallpapers = true
-    /// 已加载的作者用户名，防止面板已打开时重复加载
-    @State private var authorLoadedUploaderName: String?
+    /// 已加载的作者标识，防止面板已打开时重复加载。
+    /// Wallhaven 使用用户名，Pixiv 使用用户 ID。
+    @State private var authorLoadedIdentifier: String?
+    @State private var authorSource: String?
     /// 缓存当前作者 uploader，避免切换壁纸时因新壁纸无 uploader 导致面板闪退
     @State private var cachedAuthorUploader: Wallpaper.Uploader?
     /// 从作者面板切换时使用淡入淡出过渡（而非滑动）
@@ -82,6 +84,10 @@ struct WallpaperDetailSheet: View {
 
     // 计算属性：当前壁纸
     var wallpaper: Wallpaper { resolvedWallpaper }
+
+    private var isDownloading: Bool {
+        downloadActivity.isDownloading(itemID: wallpaper.id)
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -187,9 +193,13 @@ struct WallpaperDetailSheet: View {
                         }
                 }
 
+                DetailSheetWindowControls()
+                    .zIndex(110)
+
                 floatingBackButton
-                    .padding(.top, topBarTopInset + 18)
-                    .padding(.leading, 28)
+                    .padding(.top, max(topBarTopInset, DetailSheetTopBarLayout.actionRowTop))
+                    .padding(.leading, DetailSheetTopBarLayout.actionRowLeading)
+                    .zIndex(100)
 
                 floatingInfoOverlay(
                     viewportWidth: viewW,
@@ -255,7 +265,9 @@ struct WallpaperDetailSheet: View {
         }
         .alert(t("delete"), isPresented: $showDeleteConfirm) {
             Button(t("delete"), role: .destructive) {
-                viewModel.removeWallpaperDownloads(withIDs: [wallpaper.id])
+                // 纯 local_* 扫描项没有下载记录，必须走本地删除；
+                // 导入的 local_import_* 也一并按路径兜底清理，避免删不掉 preview 残留。
+                _ = viewModel.deleteLocalWallpaper(wallpaper)
                 onClose()
             }
             Button(t("cancel"), role: .cancel) {}
@@ -473,8 +485,9 @@ struct WallpaperDetailSheet: View {
         let opacity = 1 - (squeezeProgress * 0.3)
 
         return VStack(spacing: 0) {
+            // 预留给标题栏红绿灯 + 下方返回/工具行，避免标题区与顶栏控件重叠
             Spacer()
-                .frame(height: max(topBarTopInset + 56, 72))
+                .frame(height: max(topBarTopInset, DetailSheetTopBarLayout.heroContentTop))
             centerInfoSection
                 .padding(.horizontal, max(28, min(96, viewportWidth * 0.08)))
         }
@@ -576,8 +589,9 @@ struct WallpaperDetailSheet: View {
                     )
             }
         }
-        .padding(.top, topBarTopInset + 18)
-        .padding(.trailing, 28)
+        // 与左侧返回按钮同一动作行基线（红绿灯单独在上方）
+        .padding(.top, max(topBarTopInset, DetailSheetTopBarLayout.actionRowTop))
+        .padding(.trailing, DetailSheetTopBarLayout.actionRowTrailing)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
         .zIndex(2)
     }
@@ -755,49 +769,55 @@ struct WallpaperDetailSheet: View {
                         .frame(height: 1),
                     alignment: .bottom
                 )
-
-                Button {
-                    showMoreOptionsPopover = false
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(wallpaper.url, forType: .string)
-                    showCopyLinkToast = true
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 2_000_000_000)
-                        showCopyLinkToast = false
-                    }
-                } label: {
-                    HStack {
-                        Image(systemName: "link")
-                        Text(t("wallpaperDetail.copyLink"))
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                }
-                .buttonStyle(.plain)
-            } else {
-                Button {
-                    showMoreOptionsPopover = false
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(wallpaper.url, forType: .string)
-                    showCopyLinkToast = true
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 2_000_000_000)
-                        showCopyLinkToast = false
-                    }
-                } label: {
-                    HStack {
-                        Image(systemName: "link")
-                        Text(t("wallpaperDetail.copyLink"))
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                }
-                .buttonStyle(.plain)
             }
+
+            Button {
+                guard let link = copyableSourceLinkString else {
+                    NSSound.beep()
+                    return
+                }
+                showMoreOptionsPopover = false
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(link, forType: .string)
+                showCopyLinkToast = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    showCopyLinkToast = false
+                }
+            } label: {
+                HStack {
+                    Image(systemName: "link")
+                    Text(t("wallpaperDetail.copyLink"))
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .opacity(hasCopyableSourceLink ? 1 : 0.4)
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasCopyableSourceLink)
         }
         .frame(width: 192)
+    }
+
+    /// 可复制的来源页链接：优先 shortUrl（Wallhaven），否则用 url（各源详情页）。
+    private var copyableSourceLinkString: String? {
+        let candidates = [wallpaper.shortUrl, wallpaper.url]
+        for raw in candidates {
+            guard let raw else { continue }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let url = URL(string: trimmed),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  !url.isFileURL else { continue }
+            return trimmed
+        }
+        return nil
+    }
+
+    private var hasCopyableSourceLink: Bool {
+        copyableSourceLinkString != nil
     }
 
     // 横线分隔符
@@ -847,7 +867,7 @@ struct WallpaperDetailSheet: View {
 
             infoSection(title: t("info")) {
                 compactFact(label: "ID", value: wallpaper.id.uppercased())
-                if let _ = wallpaper.uploader {
+                if canOpenAuthorSheet {
                     Button {
                         openAuthorSheet()
                     } label: {
@@ -1095,6 +1115,21 @@ struct WallpaperDetailSheet: View {
         return sourceLabel
     }
 
+    private var isPixivWallpaper: Bool {
+        wallpaper.source?.caseInsensitiveCompare("pixiv") == .orderedSame
+    }
+
+    private var authorIdentifier: String? {
+        if isPixivWallpaper {
+            return wallpaper.pixivAuthorID
+        }
+        return wallpaper.uploader?.username
+    }
+
+    private var canOpenAuthorSheet: Bool {
+        wallpaper.uploader != nil && authorIdentifier != nil
+    }
+
     private var tagNames: [String] {
         let tags = wallpaper.tags?
             .map(\.name)
@@ -1181,7 +1216,7 @@ struct WallpaperDetailSheet: View {
     /// 统一的胶囊渲染：如果是作者且可点击则包装为 Button
     @ViewBuilder
     private func authorAwareCapsule(label: String, value: String, isLast: Bool) -> some View {
-        if label == t("author"), let _ = wallpaper.uploader {
+        if label == t("author"), canOpenAuthorSheet {
             Button {
                 openAuthorSheet()
             } label: {
@@ -1215,6 +1250,26 @@ struct WallpaperDetailSheet: View {
 
     /// 调用 Wallhaven 详情 API 获取完整数据（含 uploader），更新当前壁纸
     private func fetchDetailAndUpdateUploader() {
+        if isPixivWallpaper {
+            guard wallpaper.uploader == nil || wallpaper.pixivAuthorID == nil else { return }
+            let rawID = wallpaper.id.replacingOccurrences(of: "pixiv_", with: "")
+            guard !rawID.isEmpty else { return }
+
+            Task {
+                do {
+                    let detail = try await PixivService.shared.illustDetail(id: rawID)
+                    await MainActor.run {
+                        guard resolvedWallpaper.id == "pixiv_\(rawID)" else { return }
+                        resolvedWallpaper = detail.toWallpaper()
+                    }
+                } catch {
+                    AppLogger.warn(.wallpaper, "获取 Pixiv 作品详情失败（不影响浏览）",
+                        metadata: ["wallpaperID": wallpaper.id, "error": error.localizedDescription])
+                }
+            }
+            return
+        }
+
         // 已有 uploader 则跳过
         if wallpaper.uploader != nil { return }
         let wallpaperID = wallpaper.id
@@ -1248,7 +1303,8 @@ struct WallpaperDetailSheet: View {
                             path: updated.path,
                             thumbs: updated.thumbs,
                             tags: updated.tags,
-                            uploader: detail.uploader
+                            uploader: detail.uploader,
+                            pixivAuthorID: updated.pixivAuthorID
                         )
                         resolvedWallpaper = newWallpaper
                         AppLogger.info(.wallpaper, "详情 API 返回 uploader",
@@ -1264,31 +1320,35 @@ struct WallpaperDetailSheet: View {
 
     // MARK: - 操作方法
     private func downloadWallpaper() {
+        let downloadingWallpaper = wallpaper
+        let wallpaperID = downloadingWallpaper.id
+
         // 本地文件无需下载
         if isLocalFile {
-            AppLogger.debug(.download, "跳过下载：本地文件", metadata: ["id": wallpaper.id])
+            AppLogger.debug(.download, "跳过下载：本地文件", metadata: ["id": wallpaperID])
             return
         }
 
         AppLogger.info(.download, "开始下载壁纸",
-            metadata: ["id": wallpaper.id, "分辨率": wallpaper.resolution, "大小": wallpaper.fileSize.map { "\($0)B" } ?? "未知"])
-        isDownloading = true
+            metadata: ["id": wallpaperID, "分辨率": downloadingWallpaper.resolution, "大小": downloadingWallpaper.fileSize.map { "\($0)B" } ?? "未知"])
+        downloadActivity.start(itemID: wallpaperID)
         errorMessage = ""
         let start = Date()
-        Task {
+        Task { @MainActor in
+            defer { downloadActivity.finish(itemID: wallpaperID) }
+
             do {
-                try await viewModel.downloadWallpaper(wallpaper)
+                try await viewModel.downloadWallpaper(downloadingWallpaper)
                 AppLogger.info(.download, "下载成功",
-                    metadata: ["id": wallpaper.id, "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))])
+                    metadata: ["id": wallpaperID, "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))])
             } catch {
                 errorMessage = "\(t("error")): \(error.localizedDescription)"
                 showError = true
                 AppLogger.error(.download, "下载失败",
-                    metadata: ["id": wallpaper.id, "error": error.localizedDescription,
+                    metadata: ["id": wallpaperID, "error": error.localizedDescription,
                      "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))])
                 print("Download error: \(error)")
             }
-            isDownloading = false
         }
     }
 
@@ -1581,8 +1641,11 @@ struct WallpaperDetailSheet: View {
         if showAuthorSheet, let uploader = cachedAuthorUploader {
             AuthorWallpaperSheet(
                 uploader: uploader,
+                sourceName: authorSource?.caseInsensitiveCompare("pixiv") == .orderedSame ? "Pixiv" : "wallhaven",
+                contentTitle: t("authorWallpapers"),
                 wallpapers: authorWallpapers,
                 isLoading: isLoadingAuthorWallpapers,
+                hasMore: hasMoreAuthorWallpapers,
                 activeWallpaperID: wallpaper.id,
                 onSelectWallpaper: { selectedWallpaper in
                     navigateToAuthorWallpaper(selectedWallpaper)
@@ -1594,7 +1657,7 @@ struct WallpaperDetailSheet: View {
                     self.loadMoreAuthorWallpapers()
                 },
                 onDownloadAll: { wallpapers in
-                    downloadAllByAuthor(uploader: uploader, wallpapers: wallpapers)
+                    downloadAllByAuthor(authorName: uploader.username, wallpapers: wallpapers)
                 },
                 isDownloadingAll: $isDownloadingAllAuthor
             )
@@ -1605,11 +1668,14 @@ struct WallpaperDetailSheet: View {
 
     /// 打开作者壁纸弹窗，开始加载该作者的壁纸列表
     private func openAuthorSheet() {
-        guard let uploader = wallpaper.uploader else { return }
+        guard let uploader = wallpaper.uploader,
+              let identifier = authorIdentifier else { return }
         // 面板已打开且同一作者时，不重复加载
-        if showAuthorSheet && uploader.username == authorLoadedUploaderName { return }
+        if showAuthorSheet && identifier == authorLoadedIdentifier { return }
+        let isPixivAuthor = isPixivWallpaper
         showAuthorSheet = true
-        authorLoadedUploaderName = uploader.username
+        authorLoadedIdentifier = identifier
+        authorSource = wallpaper.source
         cachedAuthorUploader = uploader
         authorWallpapers = []
         authorWallpapersPage = 1
@@ -1618,19 +1684,28 @@ struct WallpaperDetailSheet: View {
 
         Task {
             do {
-                let results = try await viewModel.fetchWallpapersByAuthor(
-                    username: uploader.username,
-                    page: 1,
-                    limit: 24
-                )
+                let page: WallpaperViewModel.AuthorPageResult
+                if isPixivAuthor {
+                    page = try await viewModel.fetchPixivWallpapersByAuthor(
+                        userID: identifier,
+                        page: 1,
+                        limit: 24
+                    )
+                } else {
+                    page = try await viewModel.fetchWallpapersByAuthor(
+                        username: uploader.username,
+                        page: 1,
+                        limit: 24
+                    )
+                }
                 await MainActor.run {
-                    authorWallpapers = results
-                    hasMoreAuthorWallpapers = results.count >= 24
+                    authorWallpapers = page.items
+                    hasMoreAuthorWallpapers = page.hasMore
                     isLoadingAuthorWallpapers = false
                 }
             } catch {
                 AppLogger.error(.wallpaper, "加载作者壁纸失败",
-                    metadata: ["username": uploader.username, "error": error.localizedDescription])
+                    metadata: ["author": identifier, "source": isPixivAuthor ? "pixiv" : "wallhaven", "error": error.localizedDescription])
                 await MainActor.run {
                     isLoadingAuthorWallpapers = false
                 }
@@ -1644,86 +1719,163 @@ struct WallpaperDetailSheet: View {
         authorWallpapersPage = 1
         hasMoreAuthorWallpapers = true
         isLoadingAuthorWallpapers = false
-        authorLoadedUploaderName = nil
+        authorLoadedIdentifier = nil
+        authorSource = nil
         cachedAuthorUploader = nil
     }
 
-    /// 批量下载作者所有已加载壁纸，并自动归入以作者名命名的虚拟文件夹
-    private func downloadAllByAuthor(uploader: Wallpaper.Uploader, wallpapers: [Wallpaper]) {
+    /// 批量下载作者所有已加载壁纸，并自动归入以作者名命名的虚拟文件夹。
+    /// 同作者多次批量下载会复用同一文件夹，避免拆成多个同名目录。
+    private func downloadAllByAuthor(authorName: String, wallpapers: [Wallpaper]) {
         let folderStore = LibraryFolderStore.shared
         let libraryService = WallpaperLibraryService.shared
-        let authorName = uploader.username
+        var identityKeys = Set(wallpapers.flatMap { LibraryFolderStore.wallpaperAuthorIdentityKeys($0) })
+        if let identifier = authorLoadedIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !identifier.isEmpty {
+            if authorSource?.caseInsensitiveCompare("pixiv") == .orderedSame {
+                identityKeys.insert("pixiv:\(identifier)")
+            } else {
+                identityKeys.insert("name:\(identifier.lowercased())")
+            }
+        }
+        let trimmedAuthorName = authorName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedAuthorName.isEmpty {
+            identityKeys.insert("name:\(trimmedAuthorName.lowercased())")
+        }
+
+        // 列表接口常缺 uploader / pixivAuthorID；写入下载记录前补齐，便于后续按作者身份复用文件夹
+        let authorUploader = cachedAuthorUploader
+            ?? wallpapers.first(where: { $0.uploader != nil })?.uploader
+            ?? Wallpaper.Uploader(
+                username: authorName,
+                group: authorSource?.caseInsensitiveCompare("pixiv") == .orderedSame ? "pixiv" : "wallhaven",
+                avatar: Wallpaper.Avatar(px200: "", px128: "", px32: "", px20: "")
+            )
+        let pixivAuthorID: String? = {
+            if authorSource?.caseInsensitiveCompare("pixiv") == .orderedSame {
+                return authorLoadedIdentifier
+            }
+            return wallpapers.first(where: { $0.pixivAuthorID != nil })?.pixivAuthorID
+        }()
+        let stampedWallpapers = wallpapers.map {
+            $0.stampingAuthor(uploader: authorUploader, pixivAuthorID: pixivAuthorID)
+        }
 
         Task { @MainActor in
-            // 查找或创建以作者名为名的虚拟文件夹
-            let existingFolders = folderStore.folders(for: .wallpaper, parentID: nil, collection: .downloads)
-            let folder: LibraryFolder
-            if let existing = existingFolders.first(where: { $0.name == authorName }) {
-                folder = existing
-            } else {
-                folder = folderStore.createFolder(
-                    name: authorName,
-                    contentType: .wallpaper,
-                    parentID: nil,
-                    collection: .downloads
-                )
-            }
+            defer { isDownloadingAllAuthor = false }
+
+            let folder = folderStore.findOrCreateAuthorDownloadFolder(
+                name: authorName,
+                contentType: .wallpaper,
+                identityKeys: identityKeys
+            )
 
             // 已下载的项直接归入文件夹，过滤出需要下载的
+            // 作者批量下载只改下载集合，禁止污染收藏侧 folderID
             var pendingWallpapers: [Wallpaper] = []
-            for wallpaper in wallpapers {
+            for wallpaper in stampedWallpapers {
                 if libraryService.isDownloaded(wallpaper) {
-                    folderStore.moveWallpaperToFolder(wallpaperID: wallpaper.id, folderID: folder.id)
+                    folderStore.moveWallpaperToFolder(
+                        wallpaperID: wallpaper.id,
+                        folderID: folder.id,
+                        scope: .downloads
+                    )
                 } else {
                     pendingWallpapers.append(wallpaper)
                 }
             }
 
-            // 并发提交所有下载任务
+            // 全部已下载时只归夹；defer 会复位按钮，不弹错误框
+            guard !pendingWallpapers.isEmpty else { return }
+
+            // 并发提交下载；folderID 在落盘登记时一并写入，避免“成功落盘却落在根目录”
             let vm = viewModel
-            await withTaskGroup(of: Void.self) { group in
+            let folderID = folder.id
+            var successCount = 0
+            var failureCount = 0
+            await withTaskGroup(of: (String, Bool).self) { group in
                 for wallpaper in pendingWallpapers {
                     group.addTask {
                         do {
-                            try await vm.downloadWallpaper(wallpaper)
-                            await MainActor.run {
-                                folderStore.moveWallpaperToFolder(wallpaperID: wallpaper.id, folderID: folder.id)
-                            }
+                            try await vm.downloadWallpaper(wallpaper, folderID: folderID)
+                            return (wallpaper.id, true)
                         } catch {
                             AppLogger.error(.download, "作者壁纸批量下载失败",
                                 metadata: ["wallpaperID": wallpaper.id, "author": authorName,
                                            "error": error.localizedDescription])
+                            return (wallpaper.id, false)
                         }
                     }
                 }
+                for await (_, ok) in group {
+                    if ok { successCount += 1 } else { failureCount += 1 }
+                }
             }
 
-            isDownloadingAllAuthor = false
+            // 兜底：本批成功项再归一次作者夹。
+            // 优先按 isDownloaded；若仅有下载记录（文件检测偶发缓存滞后）也尝试归夹。
+            for wallpaper in stampedWallpapers {
+                let hasRecord = libraryService.downloadRecords.contains {
+                    $0.wallpaper.id == wallpaper.id && $0.isActive
+                }
+                guard libraryService.isDownloaded(wallpaper) || hasRecord else { continue }
+                folderStore.moveWallpaperToFolder(
+                    wallpaperID: wallpaper.id,
+                    folderID: folderID,
+                    scope: .downloads
+                )
+            }
+
+            if failureCount > 0 {
+                if successCount == 0 {
+                    errorMessage = String(format: t("downloadAllByAuthor.allFailed"), failureCount)
+                } else {
+                    errorMessage = String(format: t("downloadAllByAuthor.partialFailed"), successCount, failureCount)
+                }
+                showError = true
+            }
         }
     }
 
     /// 加载更多作者壁纸（分页），防止重复触发
     private func loadMoreAuthorWallpapers() {
-        guard let uploader = cachedAuthorUploader, !isLoadingAuthorWallpapers, hasMoreAuthorWallpapers else { return }
+        guard let uploader = cachedAuthorUploader,
+              let identifier = authorLoadedIdentifier,
+              !isLoadingAuthorWallpapers,
+              hasMoreAuthorWallpapers else { return }
         isLoadingAuthorWallpapers = true
         let nextPage = authorWallpapersPage + 1
+        let isPixivAuthor = authorSource?.caseInsensitiveCompare("pixiv") == .orderedSame
 
         Task {
             do {
-                let results = try await viewModel.fetchWallpapersByAuthor(
-                    username: uploader.username,
-                    page: nextPage,
-                    limit: 24
-                )
+                let page: WallpaperViewModel.AuthorPageResult
+                if isPixivAuthor {
+                    page = try await viewModel.fetchPixivWallpapersByAuthor(
+                        userID: identifier,
+                        page: nextPage,
+                        limit: 24
+                    )
+                } else {
+                    page = try await viewModel.fetchWallpapersByAuthor(
+                        username: uploader.username,
+                        page: nextPage,
+                        limit: 24
+                    )
+                }
                 await MainActor.run {
-                    authorWallpapers.append(contentsOf: results)
+                    // 去重追加，避免跨页重复项
+                    let existingIDs = Set(authorWallpapers.map(\.id))
+                    let fresh = page.items.filter { !existingIDs.contains($0.id) }
+                    authorWallpapers.append(contentsOf: fresh)
                     authorWallpapersPage = nextPage
-                    hasMoreAuthorWallpapers = results.count >= 24
+                    // 无新增时停止，避免重复页 + sentinel 重建形成死循环
+                    hasMoreAuthorWallpapers = page.hasMore && !fresh.isEmpty
                     isLoadingAuthorWallpapers = false
                 }
             } catch {
                 AppLogger.error(.wallpaper, "加载更多作者壁纸失败",
-                    metadata: ["username": uploader.username, "page": nextPage, "error": error.localizedDescription])
+                    metadata: ["author": identifier, "source": isPixivAuthor ? "pixiv" : "wallhaven", "page": nextPage, "error": error.localizedDescription])
                 await MainActor.run {
                     isLoadingAuthorWallpapers = false
                 }

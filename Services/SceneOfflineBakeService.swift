@@ -1,10 +1,12 @@
 import AppKit
 import AVFoundation
+import CryptoKit
 import Foundation
 import Kingfisher
 
 enum SceneOfflineBakeError: LocalizedError {
     case cliNotFound
+    case webCliNotFound
     case ineligible
     case contentRootMissing
     case insufficientMemory
@@ -14,6 +16,7 @@ enum SceneOfflineBakeError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .cliNotFound: return "未找到 wallpaper-wgpu"
+        case .webCliNotFound: return "未找到 wallpaperengine-cli"
         case .ineligible: return "当前 Scene 不适合离线烘焙（资格不足）"
         case .contentRootMissing: return "内容目录不存在，请重新下载"
         case .insufficientMemory: return LocalizationService.shared.t("sceneBake.error.insufficientMemory.bake")
@@ -25,10 +28,12 @@ enum SceneOfflineBakeError: LocalizedError {
 
 enum SceneBakeRenderer: String, CaseIterable, Codable, Hashable, Sendable {
     case wallpaperWgpu
+    case wallpaperEngineWeb
 
     var displayName: String {
         switch self {
         case .wallpaperWgpu: return "1. wallpaper-wgpu"
+        case .wallpaperEngineWeb: return "2. wallpaperengine-cli Web"
         }
     }
 }
@@ -46,50 +51,357 @@ extension Notification.Name {
 @MainActor
 func regenerateSceneBakePosterAndNotify(itemID: String, videoURL: URL) async -> URL? {
     guard SceneOfflineBakeService.isUsableBakedVideo(at: videoURL) else { return nil }
-    guard let posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+
+    // 重新烘焙时 MP4 路径通常不变（analysisId+分辨率+fps+时长）；必须先清列表帧，
+    // 否则 library 优先 list_*.jpg 会一直显示旧画面。
+    VideoThumbnailCache.shared.removeListThumbnail(forLocalVideo: videoURL)
+
+    // 并行重生：高清 poster（锁屏/桌面/详情）+ 列表完整画幅小图（我的库网格）
+    async let posterTask = VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
         forLocalVideo: videoURL,
         itemID: itemID,
         forceRegenerate: true
-    ) else {
-        return nil
-    }
-    // 清除 Kingfisher 对该 poster URL 的缓存，确保下次 KFImage 加载时读取磁盘上的新文件
-    try? await ImageCache.default.removeImage(forKey: posterURL.cacheKey)
-    // KFImage 使用了 DownsamplingImageProcessor(size: 512x512)，处理器会生成不同的缓存 key
-    // （格式：originalKey@processorIdentifier），必须一并清除，否则旧的降采样版本仍被命中
+    )
+    async let listTask = VideoThumbnailCache.shared.regenerateListThumbnailJPEGFileURL(forLocalVideo: videoURL)
+    let posterURL = await posterTask
+    let listURL = await listTask
+
+    // 库列表优先完整画幅 list 帧；无则退 poster
+    let displayURL = listURL ?? posterURL
+    guard let displayURL else { return nil }
+
     let processor = DownsamplingImageProcessor(size: CGSize(width: 512, height: 512))
-    try? await ImageCache.default.removeImage(forKey: posterURL.cacheKey, processorIdentifier: processor.identifier)
-    print("[BakeService] ✅ 已清除 Kingfisher 缓存: \(posterURL.cacheKey)")
+    for url in [displayURL, posterURL, listURL].compactMap({ $0 }) {
+        try? await ImageCache.default.removeImage(forKey: url.cacheKey)
+        try? await ImageCache.default.removeImage(
+            forKey: url.cacheKey,
+            processorIdentifier: processor.identifier
+        )
+    }
+    print("[BakeService] ✅ 已刷新烘焙封面 item=\(itemID) list=\(listURL?.lastPathComponent ?? "nil") poster=\(posterURL?.lastPathComponent ?? "nil")")
+
     NotificationCenter.default.post(
         name: .sceneOfflineBakeThumbnailDidUpdate,
         object: itemID,
-        userInfo: ["thumbnailURL": posterURL]
+        userInfo: ["thumbnailURL": displayURL]
     )
-    return posterURL
+    return displayURL
 }
 
-/// 全局只允许一个 `wallpaper-wgpu bake` 子进程，避免重叠渲染导致内存成倍上涨。
-private actor SceneOfflineBakeConcurrencyGate {
-    static let shared = SceneOfflineBakeConcurrencyGate()
-    private var busy = false
-    private var busySince: Date?
-
-    func tryEnter() -> Bool {
-        // 安全重置：如果门控卡死超过 10 分钟，自动重置
-        if busy, let since = busySince, Date().timeIntervalSince(since) > 600 {
-            print("[SceneOfflineBakeConcurrencyGate] ⚠️ 门控卡死超过 10 分钟，自动重置")
-            busy = false
-            busySince = nil
-        }
-        if busy { return false }
-        busy = true
-        busySince = Date()
-        return true
+/// Enough information to rebuild an unfinished Scene/Web bake after relaunch.
+struct PersistentOfflineBakeJob: Codable, Hashable, Sendable, Identifiable {
+    enum Kind: String, Codable, Hashable, Sendable {
+        case scene
+        case web
     }
 
-    func leave() {
-        busy = false
-        busySince = nil
+    let id: UUID
+    let key: String
+    let kind: Kind
+    let itemID: String?
+    let recordID: String?
+    let contentRootPath: String
+    let eligibility: SceneBakeEligibilitySnapshot?
+    let cacheItemID: String?
+    let durationSeconds: Double
+    let fps: Int
+    let renderer: SceneBakeRenderer
+    let persistArtifactToItemID: String?
+    let progressItemID: String?
+    let addedAt: Date
+
+    static func scene(
+        id: UUID = UUID(),
+        eligibility: SceneBakeEligibilitySnapshot,
+        contentRoot: URL,
+        cacheItemID: String,
+        durationSeconds: Double,
+        fps: Int32,
+        renderer: SceneBakeRenderer,
+        persistArtifactToItemID: String?,
+        progressItemID: String?
+    ) -> PersistentOfflineBakeJob {
+        let normalizedRoot = contentRoot.standardizedFileURL.path
+        let key = [
+            Kind.scene.rawValue,
+            normalizedRoot,
+            eligibility.analysisId.uuidString,
+            cacheItemID,
+            renderer.rawValue,
+            String(fps),
+            String(format: "%.3f", durationSeconds),
+        ].joined(separator: "|")
+        return PersistentOfflineBakeJob(
+            id: id,
+            key: key,
+            kind: .scene,
+            itemID: progressItemID ?? persistArtifactToItemID,
+            recordID: persistArtifactToItemID,
+            contentRootPath: normalizedRoot,
+            eligibility: eligibility,
+            cacheItemID: cacheItemID,
+            durationSeconds: durationSeconds,
+            fps: Int(fps),
+            renderer: renderer,
+            persistArtifactToItemID: persistArtifactToItemID,
+            progressItemID: progressItemID,
+            addedAt: .now
+        )
+    }
+
+    static func web(
+        id: UUID = UUID(),
+        record: MediaDownloadRecord,
+        contentRoot: URL,
+        outputURL: URL,
+        durationSeconds: Double,
+        fps: Int32
+    ) -> PersistentOfflineBakeJob {
+        PersistentOfflineBakeJob(
+            id: id,
+            key: "\(Kind.web.rawValue)|\(outputURL.standardizedFileURL.path)",
+            kind: .web,
+            itemID: record.item.id,
+            recordID: record.id,
+            contentRootPath: contentRoot.standardizedFileURL.path,
+            eligibility: nil,
+            cacheItemID: record.id,
+            durationSeconds: durationSeconds,
+            fps: Int(fps),
+            renderer: .wallpaperEngineWeb,
+            persistArtifactToItemID: record.id,
+            progressItemID: record.item.id,
+            addedAt: .now
+        )
+    }
+}
+
+private struct OfflineBakeQueueCheckpointStore {
+    private struct Snapshot: Codable {
+        let version: Int
+        let jobs: [PersistentOfflineBakeJob]
+    }
+
+    static let shared = OfflineBakeQueueCheckpointStore()
+
+    private var fileURL: URL {
+        let support = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.temporaryDirectory
+        return support
+            .appendingPathComponent("WaifuX", isDirectory: true)
+            .appendingPathComponent("SceneBake", isDirectory: true)
+            .appendingPathComponent("pending-queue.json")
+    }
+
+    func load() -> [PersistentOfflineBakeJob] {
+        guard let data = try? Data(contentsOf: fileURL),
+              let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data),
+              snapshot.version == 1 else {
+            return []
+        }
+        var seen = Set<String>()
+        return snapshot.jobs
+            .sorted { $0.addedAt < $1.addedAt }
+            .filter { seen.insert($0.key).inserted }
+    }
+
+    func save(_ jobs: [PersistentOfflineBakeJob]) {
+        guard !jobs.isEmpty else {
+            try? FileManager.default.removeItem(at: fileURL)
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
+            try encoder.encode(Snapshot(version: 1, jobs: jobs))
+                .write(to: fileURL, options: .atomic)
+        } catch {
+            print("[OfflineBakeQueue] checkpoint write failed: \(error.localizedDescription)")
+        }
+    }
+}
+
+/// 所有离线烘焙共用的串行 FIFO 队列。
+///
+/// Scene / Web 烘焙都会占用大量 GPU、内存和编码资源。这里允许用户连续提交任务，
+/// 但始终只放行一个实际子进程，避免重叠渲染导致内存成倍上涨。
+actor OfflineBakeSerialQueue {
+    static let shared = OfflineBakeSerialQueue()
+
+    private struct Waiter {
+        let jobID: UUID
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var activeJobID: UUID?
+    private var waiters: [Waiter] = []
+
+    func waitForTurn(jobID: UUID) async {
+        if activeJobID == nil, waiters.isEmpty {
+            activeJobID = jobID
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            waiters.append(Waiter(jobID: jobID, continuation: continuation))
+        }
+    }
+
+    func leave(jobID: UUID) {
+        guard activeJobID == jobID else { return }
+        activeJobID = nil
+
+        guard !waiters.isEmpty else { return }
+        let next = waiters.removeFirst()
+        activeJobID = next.jobID
+        next.continuation.resume()
+    }
+}
+
+/// 跨详情页生命周期保留的烘焙进度。
+/// 详情页关闭后 `@State` 会丢，重进时需要从这里恢复 UI。
+@MainActor
+final class SceneOfflineBakeProgressTracker {
+    static let shared = SceneOfflineBakeProgressTracker()
+
+    enum State: Equatable {
+        case queued
+        case running
+    }
+
+    struct Entry: Identifiable, Equatable {
+        let id: UUID
+        let itemID: String?
+        let persistentJob: PersistentOfflineBakeJob?
+        var state: State
+        var progress: Double
+    }
+
+    struct EnqueueResult {
+        let jobID: UUID
+        let shouldExecute: Bool
+    }
+
+    private(set) var entries: [Entry]
+    private var claimedRestoredJobIDs = Set<UUID>()
+
+    private init() {
+        let restoredJobs = OfflineBakeQueueCheckpointStore.shared.load()
+        entries = restoredJobs.map {
+            Entry(
+                id: $0.id,
+                itemID: $0.itemID,
+                persistentJob: $0,
+                state: .queued,
+                progress: 0
+            )
+        }
+        guard !restoredJobs.isEmpty else { return }
+        print("[OfflineBakeQueue] restored \(restoredJobs.count) unfinished bake job(s)")
+        Task { @MainActor in
+            // MediaLibraryService finishes its own persisted-record load during app startup.
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            await SceneOfflineBakeService.resumePersistedBakeQueue()
+        }
+    }
+
+    var activeItemID: String? {
+        entries.first(where: { $0.state == .running })?.itemID
+    }
+
+    var progress: Double {
+        entries.first(where: { $0.state == .running })?.progress ?? 0
+    }
+
+    var isBaking: Bool { !entries.isEmpty }
+
+    func enqueue(
+        job: PersistentOfflineBakeJob,
+        resumingJobID: UUID? = nil
+    ) -> EnqueueResult {
+        if let resumingJobID,
+           let existing = entries.first(where: { $0.id == resumingJobID }) {
+            let claimed = claimedRestoredJobIDs.insert(resumingJobID).inserted
+            return EnqueueResult(jobID: existing.id, shouldExecute: claimed)
+        }
+        if let existing = entries.first(where: { $0.persistentJob?.key == job.key }) {
+            print("[OfflineBakeQueue] duplicate bake excluded: \(job.key)")
+            return EnqueueResult(jobID: existing.id, shouldExecute: false)
+        }
+
+        entries.append(
+            Entry(
+                id: job.id,
+                itemID: job.itemID,
+                persistentJob: job,
+                state: .queued,
+                progress: 0
+            )
+        )
+        persistPendingJobs()
+        notifyProgress(itemID: job.itemID, progress: 0)
+        return EnqueueResult(jobID: job.id, shouldExecute: true)
+    }
+
+    func begin(jobID: UUID) {
+        guard let index = entries.firstIndex(where: { $0.id == jobID }) else { return }
+        entries[index].state = .running
+        notifyProgress(itemID: entries[index].itemID, progress: entries[index].progress)
+    }
+
+    func update(jobID: UUID, progress value: Double) {
+        guard let index = entries.firstIndex(where: { $0.id == jobID }) else { return }
+        let clamped = min(max(value, 0.0), 0.99)
+        entries[index].progress = max(entries[index].progress, clamped)
+        notifyProgress(itemID: entries[index].itemID, progress: entries[index].progress)
+    }
+
+    func finish(jobID: UUID, success: Bool) {
+        guard let index = entries.firstIndex(where: { $0.id == jobID }) else { return }
+        let entry = entries[index]
+        if success {
+            notifyProgress(itemID: entry.itemID, progress: 1)
+        }
+        entries.remove(at: index)
+        claimedRestoredJobIDs.remove(jobID)
+        persistPendingJobs()
+    }
+
+    func progress(for itemID: String) -> Double? {
+        entries.first(where: { $0.itemID == itemID })?.progress
+    }
+
+    var pendingPersistentJobs: [PersistentOfflineBakeJob] {
+        entries.compactMap(\.persistentJob).sorted { $0.addedAt < $1.addedAt }
+    }
+
+    func discardPersistedJob(id: UUID, reason: String) {
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
+        let itemID = entries[index].itemID
+        entries.remove(at: index)
+        claimedRestoredJobIDs.remove(id)
+        persistPendingJobs()
+        notifyProgress(itemID: itemID, progress: 0)
+        print("[OfflineBakeQueue] dropped restored job \(id): \(reason)")
+    }
+
+    private func persistPendingJobs() {
+        OfflineBakeQueueCheckpointStore.shared.save(entries.compactMap(\.persistentJob))
+    }
+
+    private func notifyProgress(itemID: String?, progress: Double) {
+        guard let itemID else { return }
+        NotificationCenter.default.post(
+            name: .sceneOfflineBakeProgressDidUpdate,
+            object: itemID,
+            userInfo: ["progress": progress]
+        )
     }
 }
 
@@ -143,6 +455,25 @@ enum SceneOfflineBakeService {
         let height: Int
     }
 
+    /// 已连接显示器中的最高刷新率，用作离线烘焙输出的帧率上限。
+    private static var maximumBakeFPS: Double {
+        Double(NSScreen.screens.map(\.maxRefreshRate).max() ?? 60)
+    }
+
+    /// 将显式请求或用户偏好规范为烘焙器可用的帧率。
+    ///
+    /// 统一在服务层限制，确保自动烘焙和旧版保存的偏好也不会超过显示器最高刷新率。
+    private static func resolvedBakeFPS(requestedFPS: Int32?) -> Int32 {
+        let selectedFPS: Double
+        if let requestedFPS {
+            selectedFPS = Double(requestedFPS)
+        } else {
+            let savedFPS = UserDefaults.standard.double(forKey: "scene_bake_fps")
+            selectedFPS = savedFPS >= 15 ? savedFPS : 30
+        }
+        return Int32(min(max(selectedFPS, 15), maximumBakeFPS))
+    }
+
     private static func displayIDs(for screens: [NSScreen]?) -> [UInt32] {
         let targetScreens = (screens?.isEmpty == false) ? screens! : NSScreen.screens
         return targetScreens.compactMap { screen in
@@ -150,11 +481,19 @@ enum SceneOfflineBakeService {
         }
     }
 
-    private static func usableArtifact(from record: MediaDownloadRecord?) -> SceneBakeArtifact? {
+    static func usableArtifact(from record: MediaDownloadRecord?) -> SceneBakeArtifact? {
         guard let record,
               let artifact = record.sceneBakeArtifact,
-              artifact.analysisId == record.sceneBakeEligibility?.analysisId,
               isUsableBakedVideo(at: URL(fileURLWithPath: artifact.videoPath)) else {
+            return nil
+        }
+        // Web bake: no eligibility snapshot; file presence is enough (same as recovery path).
+        if artifact.renderer == .wallpaperEngineWeb {
+            return artifact
+        }
+        // Scene bake: analysisId must still match eligibility when present.
+        if let eligibilityId = record.sceneBakeEligibility?.analysisId,
+           artifact.analysisId != eligibilityId {
             return nil
         }
         return artifact
@@ -162,12 +501,19 @@ enum SceneOfflineBakeService {
 
     @MainActor
     private static func downloadedRecord(forResolvedContentRoot contentRoot: URL) -> MediaDownloadRecord? {
-        let resolvedPath = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: contentRoot).path
+        let resolvedContentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: contentRoot)
+        let resolvedPath = resolvedContentRoot.path
         if let exact = MediaLibraryService.shared.downloadRecord(forLocalFilePath: resolvedPath) {
             return exact
         }
         return MediaLibraryService.shared.downloadedItems.first { record in
-            WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: URL(fileURLWithPath: record.localFilePath)).path == resolvedPath
+            // SteamCMD stores a Workshop download at its outer `workshop_<id>` directory,
+            // whose sibling content/downloads/temp folders prevent a generic root walk from
+            // reaching the actual project. Use the record's canonical path comparison first.
+            record.hasSameLocalContent(as: resolvedContentRoot)
+                || WorkshopService.resolveWallpaperEngineProjectRoot(
+                    startingAt: URL(fileURLWithPath: record.localFilePath)
+                ).path == resolvedPath
         }
     }
 
@@ -176,10 +522,7 @@ enum SceneOfflineBakeService {
     @MainActor
     static func scheduleRealtimeCompanionBake(path: String, targetScreens: [NSScreen]? = nil, reason: String) {
         guard #available(macOS 26.0, *) else { return }
-        guard UserDefaults.standard.bool(forKey: "auto_bake_scene") else {
-            print("[SceneOfflineBake] realtime companion bake skipped (\(reason)): auto_bake_scene is disabled")
-            return
-        }
+        let autoBakeEnabled = UserDefaults.standard.bool(forKey: "auto_bake_scene")
         let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: URL(fileURLWithPath: path))
         guard SceneBakeEligibilityAnalyzer.sceneContentRootIfEligibleForAnalysis(localFileURL: contentRoot) != nil else {
             print("[SceneOfflineBake] realtime companion bake skipped (\(reason)): not a scene project \(contentRoot.path)")
@@ -197,6 +540,11 @@ enum SceneOfflineBakeService {
                 if let artifact = usableArtifact(from: record) {
                     await syncRealtimeBakeToLockScreen(artifact: artifact, itemID: record?.item.id, displayIDs: displayIDs, reason: reason)
                     print("[SceneOfflineBake] realtime companion bake cache hit (\(reason)): \(artifact.videoPath)")
+                    return
+                }
+
+                guard autoBakeEnabled else {
+                    print("[SceneOfflineBake] realtime companion bake skipped (\(reason)): cache miss and auto_bake_scene is disabled")
                     return
                 }
 
@@ -230,19 +578,11 @@ enum SceneOfflineBakeService {
                     contentRoot: contentRoot,
                     cacheItemID: cacheItemID,
                     renderer: .wallpaperWgpu,
-                    persistArtifactToItemID: itemID
-                ) { @MainActor progress in
-                    guard let itemID else { return }
-                    NotificationCenter.default.post(
-                        name: .sceneOfflineBakeProgressDidUpdate,
-                        object: itemID,
-                        userInfo: ["progress": progress]
-                    )
-                }
+                    persistArtifactToItemID: itemID,
+                    progressItemID: itemID
+                )
                 print("[SceneOfflineBake] realtime companion bake finished (\(reason)): \(artifact.videoPath)")
                 await syncRealtimeBakeToLockScreen(artifact: artifact, itemID: itemID, displayIDs: displayIDs, reason: reason)
-            } catch SceneOfflineBakeError.concurrentBakeInProgress {
-                print("[SceneOfflineBake] realtime companion bake skipped (\(reason)): another bake is running")
             } catch {
                 print("[SceneOfflineBake] realtime companion bake failed (\(reason)): \(error.localizedDescription)")
             }
@@ -271,35 +611,56 @@ enum SceneOfflineBakeService {
             )
             print("[SceneOfflineBake] realtime companion bake synced lock screen (\(reason)): display=\(displayIDs) video=\(videoID)")
         } else {
-            // 动态锁屏关闭：用烘焙产物的静态帧设置桌面 poster（不启动视频播放器）
-            if let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: videoURL, fallbackPosterURL: nil) {
-                let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
-                    .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
-                    .allowClipping: true
-                ]
-                // 只把 poster 推给目标显示器，绝不能写回 NSScreen.screens 全集 ——
-                // 否则用户只在屏幕 N 上启用场景实时渲染时，烘焙完成会把静帧 poster
-                // 顺手贴到其它屏的桌面（其它屏没有 wallpaper-wgpu 叠层挡着，直接可见）。
-                // 入参 displayIDs 已由调用方按 targetScreens 精确指定，这里照单全收。
-                let targetScreens: [NSScreen]
-                if displayIDs.isEmpty {
-                    // 调用方未指定 → 退回历史行为（兼容无显示器信息的路径）
-                    targetScreens = NSScreen.screens
-                } else {
-                    let idSet = Set(displayIDs)
-                    targetScreens = NSScreen.screens.filter { screen in
-                        guard let n = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
-                            return false
-                        }
-                        return idSet.contains(n.uint32Value)
-                    }
-                }
-                for screen in targetScreens {
-                    try? NSWorkspace.shared.setDesktopImageURLForAllSpaces(posterURL, for: screen, options: fillOptions)
-                    DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen, options: fillOptions)
-                }
-                print("[SceneOfflineBake] realtime companion bake set desktop poster (\(reason)) on \(targetScreens.count) screen(s) display=\(displayIDs): \(posterURL.path)")
+            // 动态锁屏关闭：仅在系统壁纸同步开启时写桌面 poster。
+            // 关闭同步时桌面由实时 scene 渲染，不得偷偷改系统壁纸。
+            guard VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled else {
+                print("[SceneOfflineBake] 🧊 系统壁纸同步已关闭，跳过 companion bake 桌面 poster (\(reason))")
+                return
             }
+            guard let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(
+                forLocalVideo: videoURL,
+                fallbackPosterURL: nil
+            ) else {
+                print("[SceneOfflineBake] realtime companion bake could not generate desktop poster (\(reason)): \(videoURL.path)")
+                return
+            }
+            let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
+                .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
+                .allowClipping: true
+            ]
+            // 只把 poster 推给目标显示器，绝不能写回 NSScreen.screens 全集 ——
+            // 否则用户只在屏幕 N 上启用场景实时渲染时，烘焙完成会把静帧 poster
+            // 顺手贴到其它屏的桌面（其它屏没有 wallpaper-wgpu 叠层挡着，直接可见）。
+            // 入参 displayIDs 已由调用方按 targetScreens 精确指定，这里照单全收。
+            let targetScreens: [NSScreen]
+            if displayIDs.isEmpty {
+                // 调用方未指定 → 退回历史行为（兼容无显示器信息的路径）
+                targetScreens = NSScreen.screens
+            } else {
+                let idSet = Set(displayIDs)
+                targetScreens = NSScreen.screens.filter { screen in
+                    guard let n = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                        return false
+                    }
+                    return idSet.contains(n.uint32Value)
+                }
+            }
+            guard !targetScreens.isEmpty else {
+                print("[SceneOfflineBake] realtime companion bake has no matching display for desktop poster (\(reason)): display=\(displayIDs)")
+                return
+            }
+
+            var appliedScreens = 0
+            for screen in targetScreens {
+                do {
+                    try NSWorkspace.shared.setDesktopImageURLForAllSpaces(posterURL, for: screen, options: fillOptions)
+                    DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen, options: fillOptions)
+                    appliedScreens += 1
+                } catch {
+                    print("[SceneOfflineBake] failed to set desktop poster (\(reason)) on \(screen.localizedName): \(error.localizedDescription)")
+                }
+            }
+            print("[SceneOfflineBake] realtime companion bake set desktop poster (\(reason)) on \(appliedScreens)/\(targetScreens.count) screen(s) display=\(displayIDs): \(posterURL.path)")
         }
     }
 
@@ -308,6 +669,8 @@ enum SceneOfflineBakeService {
         switch renderer {
         case .wallpaperWgpu:
             return WallpaperEngineXBridge.resolvedCLIExecutableURL() != nil
+        case .wallpaperEngineWeb:
+            return WallpaperEngineXBridge.resolvedLegacyCLIExecutableURL() != nil
         }
     }
 
@@ -356,6 +719,8 @@ enum SceneOfflineBakeService {
                 arguments: args,
                 renderer: renderer
             )
+        case .wallpaperEngineWeb:
+            throw SceneOfflineBakeError.ineligible
         }
     }
 
@@ -368,13 +733,33 @@ enum SceneOfflineBakeService {
         width: Int,
         height: Int,
         fps: Int,
-        durationSeconds: Double
+        durationSeconds: Double,
+        propertiesCacheKey: String?
     ) -> URL {
         let safeID = itemID.replacingOccurrences(of: "/", with: "_")
         let dir = baseDir.appendingPathComponent(safeID, isDirectory: true)
+        let propertiesSuffix = propertiesCacheKey.map { "_props-\($0)" } ?? ""
         let name =
-            "\(analysisId.uuidString)_\(renderer.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s.mp4"
+            "\(analysisId.uuidString)_\(renderer.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s\(propertiesSuffix).mp4"
         return dir.appendingPathComponent(name)
+    }
+
+    /// 设计面板属性会改变输出画面，必须参与缓存区分。
+    private static func propertiesCacheKey(for userProperties: String?) -> String? {
+        guard let userProperties,
+              !userProperties.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let data: Data
+        if let source = userProperties.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: source),
+           let canonical = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) {
+            data = canonical
+        } else {
+            data = Data(userProperties.utf8)
+        }
+        return SHA256.hash(data: data).prefix(12).map { String(format: "%02x", $0) }.joined()
     }
 
     static func rendererLaunchEnvironment(for executableURL: URL) -> [String: String] {
@@ -410,6 +795,7 @@ enum SceneOfflineBakeService {
 
     /// 与资格快照配套；`cacheItemID` 通常等于 `MediaItem.id`，无记录时用 `stableOrphanCacheItemID`。
     /// - Parameter persistArtifactToItemID: 非 nil 时将成品写回对应下载记录。
+    /// - Parameter progressItemID: 用于跨详情页恢复的进度追踪 item id；默认取 `persistArtifactToItemID`。
     static func bake(
         eligibility: SceneBakeEligibilitySnapshot,
         contentRoot: URL,
@@ -418,15 +804,11 @@ enum SceneOfflineBakeService {
         fps: Int32? = nil,
         renderer: SceneBakeRenderer = .wallpaperWgpu,
         persistArtifactToItemID: String? = nil,
+        progressItemID: String? = nil,
+        resumingJobID: UUID? = nil,
         progress: (@MainActor (Double) -> Void)? = nil
     ) async throws -> SceneBakeArtifact {
-        let effectiveFPS: Int32
-        if let fps {
-            effectiveFPS = fps
-        } else {
-            let saved = UserDefaults.standard.double(forKey: "scene_bake_fps")
-            effectiveFPS = saved >= 15 ? Int32(min(max(saved, 15), 60)) : 30
-        }
+        let effectiveFPS = resolvedBakeFPS(requestedFPS: fps)
         let effectiveDuration: Double
         if let durationSeconds {
             effectiveDuration = durationSeconds
@@ -434,10 +816,36 @@ enum SceneOfflineBakeService {
             let saved = UserDefaults.standard.double(forKey: "scene_bake_duration")
             effectiveDuration = saved >= 5 ? min(max(saved, 5), 60) : 15
         }
-        // 并发门控：防止多个烘焙同时运行
-        let entered = await SceneOfflineBakeConcurrencyGate.shared.tryEnter()
-        guard entered else {
+        let trackedItemID = progressItemID ?? persistArtifactToItemID
+        let persistentJob = PersistentOfflineBakeJob.scene(
+            id: resumingJobID ?? UUID(),
+            eligibility: eligibility,
+            contentRoot: contentRoot,
+            cacheItemID: cacheItemID,
+            durationSeconds: effectiveDuration,
+            fps: effectiveFPS,
+            renderer: renderer,
+            persistArtifactToItemID: persistArtifactToItemID,
+            progressItemID: trackedItemID
+        )
+        let enqueueResult = await MainActor.run {
+            SceneOfflineBakeProgressTracker.shared.enqueue(
+                job: persistentJob,
+                resumingJobID: resumingJobID
+            )
+        }
+        guard enqueueResult.shouldExecute else {
             throw SceneOfflineBakeError.concurrentBakeInProgress
+        }
+        let jobID = enqueueResult.jobID
+
+        await OfflineBakeSerialQueue.shared.waitForTurn(jobID: jobID)
+        await MainActor.run {
+            SceneOfflineBakeProgressTracker.shared.begin(jobID: jobID)
+        }
+        let trackedProgress: (@MainActor (Double) -> Void)? = { value in
+            SceneOfflineBakeProgressTracker.shared.update(jobID: jobID, progress: value)
+            progress?(value)
         }
         do {
             let result = try await bakeCore(
@@ -448,19 +856,86 @@ enum SceneOfflineBakeService {
                 fps: effectiveFPS,
                 renderer: renderer,
                 persistArtifactToItemID: persistArtifactToItemID,
-                progress: progress
+                progress: trackedProgress
             )
-            await SceneOfflineBakeConcurrencyGate.shared.leave()
             await MainActor.run {
+                SceneOfflineBakeProgressTracker.shared.finish(jobID: jobID, success: true)
+                let bakedURL = URL(fileURLWithPath: result.videoPath)
+                let title = persistArtifactToItemID.flatMap {
+                    MediaLibraryService.shared.downloadRecord(for: $0)?.item.title
+                } ?? bakedURL.deletingPathExtension().lastPathComponent
+                VideoOptimizationQueueService.shared.registerBakedSource(
+                    videoURL: bakedURL,
+                    sourcePath: contentRoot.path,
+                    artifact: result
+                )
+                _ = VideoOptimizationQueueService.shared.enqueueAfterBakeIfNeeded(
+                    videoURL: bakedURL,
+                    title: title
+                )
                 NotificationCenter.default.post(name: .sceneOfflineBakeDidComplete, object: result)
             }
+            await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
             return result
         } catch {
-            await SceneOfflineBakeConcurrencyGate.shared.leave()
             await MainActor.run {
+                SceneOfflineBakeProgressTracker.shared.finish(jobID: jobID, success: false)
                 NotificationCenter.default.post(name: .sceneOfflineBakeDidComplete, object: nil)
             }
+            await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
             throw error
+        }
+    }
+
+    /// Re-enqueues unfinished checkpoint entries after relaunch. The original
+    /// UUID is reused so recovery does not create a second visible queue item.
+    @MainActor
+    static func resumePersistedBakeQueue() async {
+        let jobs = SceneOfflineBakeProgressTracker.shared.pendingPersistentJobs
+        guard !jobs.isEmpty else { return }
+
+        for job in jobs {
+            switch job.kind {
+            case .scene:
+                guard let eligibility = job.eligibility,
+                      let cacheItemID = job.cacheItemID else {
+                    SceneOfflineBakeProgressTracker.shared.discardPersistedJob(
+                        id: job.id,
+                        reason: "scene checkpoint is incomplete"
+                    )
+                    continue
+                }
+                do {
+                    _ = try await bake(
+                        eligibility: eligibility,
+                        contentRoot: URL(fileURLWithPath: job.contentRootPath),
+                        cacheItemID: cacheItemID,
+                        durationSeconds: job.durationSeconds,
+                        fps: Int32(job.fps),
+                        renderer: job.renderer,
+                        persistArtifactToItemID: job.persistArtifactToItemID,
+                        progressItemID: job.progressItemID,
+                        resumingJobID: job.id
+                    )
+                } catch {
+                    SceneOfflineBakeProgressTracker.shared.discardPersistedJob(
+                        id: job.id,
+                        reason: error.localizedDescription
+                    )
+                    print("[OfflineBakeQueue] restored scene bake failed: \(error.localizedDescription)")
+                }
+
+            case .web:
+                do {
+                    _ = try await WebOfflineBakeService.resumePersistedBakeJob(job)
+                } catch {
+                    SceneOfflineBakeProgressTracker.shared.discardPersistedJob(
+                        id: job.id,
+                        reason: error.localizedDescription
+                    )
+                    print("[OfflineBakeQueue] restored web bake failed: \(error.localizedDescription)")
+                }
+            }
         }
     }
 
@@ -486,6 +961,12 @@ enum SceneOfflineBakeService {
         let h = max(64, mainDisplaySize.height)
         let evenW = (w / 2) * 2
         let evenH = (h / 2) * 2
+        let effectiveUserProperties = await MainActor.run {
+            SceneConfigOverrideService.mergedPropertiesJSON(
+                userPropertiesJSON: SceneWallpaperPropertiesService.propertiesOverrideJSON(for: contentRoot.path),
+                for: contentRoot.path
+            )
+        }
 
         let sceneBakesRoot = await MainActor.run {
             DownloadPathManager.shared.sceneBakesFolderURL
@@ -499,7 +980,8 @@ enum SceneOfflineBakeService {
             width: evenW,
             height: evenH,
             fps: Int(fps),
-            durationSeconds: cacheDurationSeconds
+            durationSeconds: cacheDurationSeconds,
+            propertiesCacheKey: propertiesCacheKey(for: effectiveUserProperties)
         )
 
         try FileManager.default.createDirectory(at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -508,6 +990,8 @@ enum SceneOfflineBakeService {
             switch renderer {
             case .wallpaperWgpu:
                 return await inspectBakedVideo(at: outURL, expectedWidth: evenW, expectedHeight: evenH)
+            case .wallpaperEngineWeb:
+                return nil
             }
         }()
         if let cachedInspection,
@@ -553,8 +1037,11 @@ enum SceneOfflineBakeService {
                 height: evenH,
                 fps: fps,
                 durationSeconds: durationSeconds,
+                userProperties: effectiveUserProperties,
                 progress: progress
             )
+        case .wallpaperEngineWeb:
+            throw SceneOfflineBakeError.ineligible
         }
         if let itemID = persistArtifactToItemID {
             await MainActor.run {
@@ -581,6 +1068,7 @@ enum SceneOfflineBakeService {
         height: Int,
         fps: Int32,
         durationSeconds: Double,
+        userProperties: String?,
         progress: (@MainActor (Double) -> Void)?
     ) async throws -> SceneBakeArtifact {
         // 使用 wallpaper-wgpu bake 子命令（GPU readback 直接编码，不需要屏幕录制）
@@ -605,6 +1093,10 @@ enum SceneOfflineBakeService {
         // assets 路径（异步等待解压完成）
         if let assets = await WallpaperEngineEmbeddedAssets.awaitAssetsReady(), !assets.isEmpty {
             args += ["--assets", assets]
+        }
+
+        if let userProperties, !userProperties.isEmpty {
+            args += ["--user-properties", userProperties]
         }
 
         // 自动检测周期时不需要传 --duration，让 bake 自己检测
@@ -927,9 +1419,7 @@ enum SceneOfflineBakeService {
 
     /// 检查是否有缓存（不触发实际烘焙）
     static func hasCachedArtifact(record: MediaDownloadRecord, renderer: SceneBakeRenderer? = nil) -> Bool {
-        guard let art = record.sceneBakeArtifact,
-              art.analysisId == record.sceneBakeEligibility?.analysisId,
-              isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) else { return false }
+        guard let art = usableArtifact(from: record) else { return false }
         if let renderer {
             return art.renderer == renderer
         }
@@ -937,7 +1427,7 @@ enum SceneOfflineBakeService {
     }
 
     /// 与 `MediaDownloadRecord.sceneBakeEligibility` 配套；默认主屏逻辑分辨率 × scale。
-    /// FPS 默认值取自用户设置 `scene_bake_fps`（回退 30）。
+    /// FPS 默认值取自用户设置 `scene_bake_fps`（回退 30），且不超过显示器最高刷新率。
     static func bake(
         record: MediaDownloadRecord,
         durationSeconds: Double? = nil,
@@ -945,13 +1435,7 @@ enum SceneOfflineBakeService {
         renderer: SceneBakeRenderer = .wallpaperWgpu,
         progress: (@MainActor (Double) -> Void)? = nil
     ) async throws -> SceneBakeArtifact {
-        let effectiveFPS: Int32
-        if let fps {
-            effectiveFPS = fps
-        } else {
-            let saved = UserDefaults.standard.double(forKey: "scene_bake_fps")
-            effectiveFPS = saved >= 15 ? Int32(min(max(saved, 15), 60)) : 30
-        }
+        let effectiveFPS = resolvedBakeFPS(requestedFPS: fps)
         let effectiveDuration: Double
         if let durationSeconds {
             effectiveDuration = durationSeconds
@@ -971,6 +1455,7 @@ enum SceneOfflineBakeService {
             fps: effectiveFPS,
             renderer: renderer,
             persistArtifactToItemID: record.id,
+            progressItemID: record.item.id,
             progress: progress
         )
     }
@@ -984,10 +1469,6 @@ enum SceneOfflineBakeService {
             }
             guard let record,
                   let eligibility = record.sceneBakeEligibility else { return }
-            guard SystemMemoryPressure.hasRoomForSceneOfflineBake() else {
-                print("[SceneOfflineBake] auto-bake skipped: insufficient reclaimable memory")
-                return
-            }
             if let art = record.sceneBakeArtifact,
                art.analysisId == eligibility.analysisId,
                (art.renderer == nil || art.renderer == .wallpaperWgpu),
@@ -995,26 +1476,27 @@ enum SceneOfflineBakeService {
                 return
             }
             do {
-                _ = try await bake(record: record) { @MainActor progress in
-                    NotificationCenter.default.post(
-                        name: .sceneOfflineBakeProgressDidUpdate,
-                        object: itemID,
-                        userInfo: ["progress": progress]
-                    )
-                }
+                // 进度由 SceneOfflineBakeProgressTracker 统一广播
+                _ = try await bake(record: record)
                 print("[SceneOfflineBake] auto-bake finished \(itemID)")
             } catch {
-                if case SceneOfflineBakeError.concurrentBakeInProgress = error {
-                    print("[SceneOfflineBake] auto-bake skipped (busy) \(itemID)")
-                } else {
-                    print("[SceneOfflineBake] auto-bake failed \(itemID): \(error.localizedDescription)")
-                }
+                print("[SceneOfflineBake] auto-bake failed \(itemID): \(error.localizedDescription)")
             }
         }
     }
 
+    /// Lightweight, main-thread-safe gate: file exists and is non-trivial.
+    /// Avoids AVAsset + semaphore on the main actor (that path deadlocked /
+    /// starved set-wallpaper when a bake product was present).
     static func isUsableBakedVideo(at url: URL) -> Bool {
-        inspectBakedVideoSync(at: url) != nil
+        guard url.isFileURL,
+              FileManager.default.fileExists(atPath: url.path),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? NSNumber,
+              size.int64Value > 10_000 else {
+            return false
+        }
+        return true
     }
 
     private static func mainDisplayPixelSize() -> (width: Int, height: Int) {
@@ -1028,13 +1510,7 @@ enum SceneOfflineBakeService {
     }
 
     private static func inspectBakedVideo(at url: URL, expectedWidth: Int? = nil, expectedHeight: Int? = nil) async -> BakedVideoInspection? {
-        guard url.isFileURL,
-              FileManager.default.fileExists(atPath: url.path),
-              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attrs[.size] as? NSNumber,
-              size.int64Value > 10_000 else {
-            return nil
-        }
+        guard isUsableBakedVideo(at: url) else { return nil }
 
         let asset = AVURLAsset(url: url)
         let duration = try? await asset.load(.duration)
@@ -1051,19 +1527,5 @@ enum SceneOfflineBakeService {
             return nil
         }
         return BakedVideoInspection(duration: durationSec, width: width, height: height)
-    }
-
-    private static func inspectBakedVideoSync(at url: URL, expectedWidth: Int? = nil, expectedHeight: Int? = nil) -> BakedVideoInspection? {
-        final class Box: @unchecked Sendable { var value: BakedVideoInspection? }
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = Box()
-        DispatchQueue.global().async {
-            Task {
-                box.value = await inspectBakedVideo(at: url, expectedWidth: expectedWidth, expectedHeight: expectedHeight)
-                semaphore.signal()
-            }
-        }
-        semaphore.wait()
-        return box.value
     }
 }

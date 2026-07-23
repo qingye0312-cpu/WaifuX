@@ -69,6 +69,7 @@ struct MediaExploreContentView: View {
     @State private var loadMoreFailed = false
     @State private var lastSyncedFirstItemID: String?
     @State private var isApplyingProgrammaticReset = false
+    @State private var isSourceMenuHovered = false
 
     @State private var searchTask: Task<Void, Never>?
     @State private var loadMoreTask: Task<Void, Never>?
@@ -163,7 +164,10 @@ struct MediaExploreContentView: View {
                 errorMessage: workshopURLError,
                 isLoading: isResolvingWorkshopURL,
                 onSubmit: { handleWorkshopURLSubmit() },
-                onDismiss: { showWorkshopURLSheet = false }
+                onDismiss: { showWorkshopURLSheet = false },
+                title: "通过链接打开壁纸",
+                placeholder: "粘贴壁纸链接...",
+                supportedFormatsHint: "支持格式：steamcommunity.com/sharedfiles/filedetails/?id=1234567890、motionbgs.com/xxx、wallsflow.com/…/数字-slug.html，或动态桌面 OSS 视频直链"
             )
         }
         .onAppear {
@@ -378,13 +382,14 @@ struct MediaExploreContentView: View {
                     ScrollToTopButton {
                         outerScrollToTopToken &+= 1
                     }
-                    .padding(.trailing, 28)
-                    .padding(.bottom, 120)
+                    .padding(.trailing, 8)
+                    .padding(.bottom, 112)
                     .transition(.scale.combined(with: .opacity))
                 }
             }
         }
         .animation(.easeInOut(duration: 0.3), value: showScrollToTop)
+        .zIndex(1)
     }
 
     // MARK: - Header
@@ -518,7 +523,9 @@ struct MediaExploreContentView: View {
     }
 
     private var headerTitle: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let activeSource = workshopSourceManager.activeSource
+
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Text(greetingText)
                     .font(.system(size: 14, weight: .semibold))
@@ -533,7 +540,7 @@ struct MediaExploreContentView: View {
                             HStack(spacing: 8) {
                                 Text(source.displayName)
                                     .font(.system(size: 13, weight: .semibold))
-                                if source == workshopSourceManager.activeSource {
+                                if source == activeSource {
                                     Image(systemName: "checkmark")
                                         .font(.system(size: 11, weight: .bold))
                                 }
@@ -541,16 +548,30 @@ struct MediaExploreContentView: View {
                         }
                     }
                 } label: {
-                    HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Image(systemName: "globe")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(arcSettings.primaryText.opacity(0.55))
-                        Text(workshopSourceManager.activeSource.displayName)
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundStyle(arcSettings.primaryText.opacity(0.75))
+                    Text(activeSource.displayName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(arcSettings.primaryText.opacity(isSourceMenuHovered ? 0.92 : 0.78))
+                }
+                // AppKit 会缓存 Menu 的原生项；源切换后强制用新状态重新构建菜单。
+                .id(activeSource)
+                .menuStyle(.borderlessButton)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .liquidGlassSurface(.subtle, in: RoundedRectangle(cornerRadius: 8, style: .continuous), lightweight: true)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.white.opacity(isSourceMenuHovered ? 0.055 : 0))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(Color.white.opacity(isSourceMenuHovered ? 0.26 : 0.14), lineWidth: 0.5)
+                        }
+                        .allowsHitTesting(false)
+                }
+                .onHover { hovering in
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        isSourceMenuHovered = hovering
                     }
                 }
-                .menuStyle(.borderlessButton)
                 .offset(y: 1.5)
                 .background {
                     SourceHintIcon()
@@ -1343,6 +1364,7 @@ struct MediaExploreContentView: View {
     // MARK: - Actions
 
     private func handleInitialLoad() async {
+        syncExploreSortStateFromViewModel()
 
         let restoredFeed = viewModel.restoreExploreFeedIfNeededAfterDetailReturn()
         if viewModel.items.isEmpty {
@@ -1351,6 +1373,8 @@ struct MediaExploreContentView: View {
         if !restoredFeed {
             await viewModel.initialLoadIfNeeded()
         }
+        // 加载完成后再次同步（兜底：restore 可能发生在 onAppear 之后）
+        syncExploreSortStateFromViewModel()
         if searchText.isEmpty {
             searchText = viewModel.currentQuery
         }
@@ -1361,11 +1385,13 @@ struct MediaExploreContentView: View {
     private func performFirstAppearanceLoad() async {
         // ⚠️ 防止 NavigationStack pop 后视图被重建导致丢失已加载的多页数据
         guard viewModel.items.isEmpty else {
+            syncExploreSortStateFromViewModel()
             isFirstAppearance = false
             return
         }
 
         isInitialLoading = true
+        syncExploreSortStateFromViewModel()
         searchText = ""
         mediaSearchQuery = ""
         translationBridge.reset()
@@ -1374,7 +1400,7 @@ struct MediaExploreContentView: View {
         selectedWorkshopType = .all
         selectedWorkshopContentLevel = .everyone
         selectedWorkshopResolution = nil
-        selectedWorkshopSort = .trendWeek
+        // 保留用户持久化过的排序，不强制回默认
         selectedCategory = .all
         selectedSort = .newest
         lastSyncedFirstItemID = nil
@@ -1382,10 +1408,22 @@ struct MediaExploreContentView: View {
         viewModel.errorMessage = nil
 
         await viewModel.initialLoadIfNeeded()
+        syncExploreSortStateFromViewModel()
 
         syncAtmosphereIfNeeded()
         isInitialLoading = false
         isFirstAppearance = false
+    }
+
+    /// 从 ViewModel 恢复的排序同步到本地 @State
+    private func syncExploreSortStateFromViewModel() {
+        let workshop = WorkshopSortOption(rawValue: viewModel.workshopSortMenuRawValue) ?? .trendWeek
+        if selectedWorkshopSort != workshop {
+            selectedWorkshopSort = workshop
+        }
+        if selectedDongTaiSort != viewModel.dongtaiSortBy {
+            selectedDongTaiSort = viewModel.dongtaiSortBy
+        }
     }
 
     private func selectCategory(_ category: MediaCategory) {
@@ -1527,6 +1565,12 @@ struct MediaExploreContentView: View {
 
     private func handleWorkshopSortChange() {
         guard !isApplyingProgrammaticReset else { return }
+        // 与 ViewModel 已恢复值一致时不重复写回/重载
+        guard selectedWorkshopSort.rawValue != viewModel.workshopSortMenuRawValue
+            || selectedWorkshopSort.sortBy != viewModel.workshopSortBy
+            || selectedWorkshopSort.days != viewModel.workshopDays else {
+            return
+        }
 
         AppLogger.info(.wallpaper, "Workshop 排序变化", metadata: ["排序": selectedWorkshopSort.rawValue])
         // 仅在 Workshop 模式下实际重载数据；MotionBG 下仅更新 UI 不触发加载
@@ -1538,13 +1582,15 @@ struct MediaExploreContentView: View {
             defer { searchTask = nil }
             await viewModel.setWorkshopSort(
                 sortBy: selectedWorkshopSort.sortBy,
-                days: selectedWorkshopSort.days
+                days: selectedWorkshopSort.days,
+                menuRawValue: selectedWorkshopSort.rawValue
             )
         }
     }
 
     private func handleDongTaiSortChange() {
         guard !isApplyingProgrammaticReset else { return }
+        guard selectedDongTaiSort != viewModel.dongtaiSortBy else { return }
 
         guard workshopSourceManager.activeSource == .dongtai else { return }
         prepareForFeedReplacement()
@@ -1578,13 +1624,23 @@ struct MediaExploreContentView: View {
             do {
                 let isWE = WorkshopService.extractWorkshopID(from: url) != nil
                 let isDongTai = DynamicWallpaperService.shared.canHandleOSSURL(url)
+                let isWallsflow = url.lowercased().contains("wallsflow.com")
+                let isMotionBG = url.lowercased().contains("motionbgs.com")
                 let item: MediaItem
                 if isWE {
                     item = try await viewModel.resolveWorkshopItemByURL(url)
                 } else if isDongTai {
                     item = try await viewModel.resolveDongTaiItemByURL(url)
-                } else {
+                } else if isWallsflow {
+                    item = try await viewModel.resolveWallsflowItemByURL(url)
+                } else if isMotionBG {
                     item = try await viewModel.resolveMotionBGItemByURL(url)
+                } else {
+                    throw NSError(
+                        domain: "WaifuX",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "无法解析此链接，仅支持 Steam Workshop / MotionBG / Wallsflow / 动态桌面 OSS 链接"]
+                    )
                 }
                 await MainActor.run {
                     isResolvingWorkshopURL = false
@@ -1670,10 +1726,11 @@ struct MediaExploreContentView: View {
         selectedWorkshopType = .all
         selectedWorkshopContentLevel = .everyone
         selectedWorkshopResolution = nil
-        selectedWorkshopSort = .trendWeek
+        // 切换源 / 清除筛选时保留用户持久化过的排序
+        selectedWorkshopSort = WorkshopSortOption(rawValue: viewModel.workshopSortMenuRawValue) ?? .trendWeek
         selectedDongTaiCategories = []
         selectedDongTaiListType = .all
-        selectedDongTaiSort = .popular
+        selectedDongTaiSort = viewModel.dongtaiSortBy
         dongtaiFilterAudio = nil
         dongtaiFilterFourK = nil
         selectedWallsflowCategorySlug = "live-wallpapers"
@@ -2073,6 +2130,12 @@ struct WorkshopURLInputSheet: View {
     let isLoading: Bool
     let onSubmit: () -> Void
     let onDismiss: () -> Void
+    /// 弹窗标题（壁纸探索 / 媒体探索各自传入）
+    var title: String = "通过链接打开壁纸"
+    /// 输入框占位符
+    var placeholder: String = "粘贴壁纸链接..."
+    /// 支持格式说明（与当前页可解析的源对齐）
+    var supportedFormatsHint: String = "支持格式：steamcommunity.com/sharedfiles/filedetails/?id=1234567890 或 motionbgs.com/xxx"
 
     @FocusState private var isInputFocused: Bool
 
@@ -2080,7 +2143,7 @@ struct WorkshopURLInputSheet: View {
         VStack(spacing: 20) {
             // Header
             HStack {
-                Text("通过链接打开壁纸")
+                Text(title)
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.92))
                 Spacer()
@@ -2096,7 +2159,7 @@ struct WorkshopURLInputSheet: View {
 
             // Input
             VStack(alignment: .leading, spacing: 8) {
-                TextField("粘贴壁纸链接...", text: $urlInput, axis: .vertical)
+                TextField(placeholder, text: $urlInput, axis: .vertical)
                     .font(.system(size: 13))
                     .foregroundStyle(.white.opacity(0.9))
                     .textFieldStyle(.plain)
@@ -2122,9 +2185,10 @@ struct WorkshopURLInputSheet: View {
                         .transition(.opacity)
                 }
 
-                Text("支持格式：steamcommunity.com/sharedfiles/filedetails/?id=1234567890 或 motionbgs.com/xxx")
+                Text(supportedFormatsHint)
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.35))
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             // Buttons

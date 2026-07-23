@@ -16,31 +16,24 @@ done
 if git diff --cached --name-only | grep -qx "VERSION"; then
   NEW_VERSION=$(cat VERSION | tr -d '[:space:]')
   if [ -n "$NEW_VERSION" ] && [ -d "Docs" ]; then
-    # 从上一个 tag 到 HEAD 生成 changelog
+    ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
     PREV_TAG=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || echo "")
+    # subject 作标题，body 每行作嵌套 <li>
     if [ -n "$PREV_TAG" ]; then
-      CHANGELOG=$(git log "$PREV_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges | head -30)
+      export APPCAST_DESC=$(python3 "$ROOT/scripts/generate-appcast-changelog.py" \
+        --format html --version "$NEW_VERSION" --since "$PREV_TAG")
     else
-      CHANGELOG="- Initial release"
+      export APPCAST_DESC=$(python3 "$ROOT/scripts/generate-appcast-changelog.py" \
+        --format html --version "$NEW_VERSION")
     fi
-
-    # 生成 <li> 列表
-    ITEMS=""
-    while IFS= read -r line; do
-      line=$(echo "$line" | sed 's/^- //')
-      [ -n "$line" ] && ITEMS="${ITEMS}          <li>${line}</li>
-"
-    done <<< "$CHANGELOG"
-
-    DESC="        <h3>WaifuX $NEW_VERSION</h3>
-        <ul>
-${ITEMS}        </ul>"
-
-    PUB_DATE=$(date -R 2>/dev/null || date "+%a, %d %b %Y %H:%M:%S %z")
+    export APPCAST_VERSION="$NEW_VERSION"
+    export APPCAST_PUB_DATE=$(date -R 2>/dev/null || date "+%a, %d %b %Y %H:%M:%S %z")
 
     python3 -c "
-import sys
-version, pub_date, desc = sys.argv[1], sys.argv[2], sys.argv[3]
+import os
+version = os.environ['APPCAST_VERSION']
+pub_date = os.environ['APPCAST_PUB_DATE']
+desc = os.environ.get('APPCAST_DESC', '')
 xml = '''<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <rss version=\"2.0\" xmlns:sparkle=\"http://www.andymatuschak.org/xml-namespaces/sparkle\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">
   <channel>
@@ -49,24 +42,29 @@ xml = '''<?xml version=\"1.0\" encoding=\"utf-8\"?>
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version {version}</title>
-      <sparkle:version>{version}</sparkle:version>
-      <sparkle:shortVersionString>{version}</sparkle:shortVersionString>
-      <pubDate>{pub_date}</pubDate>
+      <title>Version @@VERSION@@</title>
+      <sparkle:version>@@VERSION@@</sparkle:version>
+      <sparkle:shortVersionString>@@VERSION@@</sparkle:shortVersionString>
+      <pubDate>@@PUB_DATE@@</pubDate>
       <description><![CDATA[
-{desc}
+@@DESC@@
       ]]></description>
       <enclosure
-        url=\"https://github.com/jipika/WaifuX/releases/download/v{version}/WaifuX.dmg\"
+        url=\"https://github.com/jipika/WaifuX/releases/download/v@@VERSION@@/WaifuX.dmg\"
         type=\"application/octet-stream\"
         length=\"0\"
       />
     </item>
   </channel>
-</rss>'''.format(version=version, pub_date=pub_date, desc=desc)
+</rss>
+'''
+xml = (xml
+  .replace('@@VERSION@@', version)
+  .replace('@@PUB_DATE@@', pub_date)
+  .replace('@@DESC@@', desc))
 with open('Docs/appcast.xml', 'w') as f:
     f.write(xml)
-" "$NEW_VERSION" "$PUB_DATE" "$DESC"
+"
 
     git add Docs/appcast.xml
     echo "✅ appcast.xml 已自动生成 -> $NEW_VERSION (changelog from ${PREV_TAG:-初始版本})"

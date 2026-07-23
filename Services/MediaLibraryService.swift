@@ -74,6 +74,9 @@ final class MediaLibraryService: ObservableObject {
     /// 延迟恢复持久化数据（必须在 AppDelegate.applicationDidFinishLaunching 中调用）
     func restoreSavedData() {
         loadPersistedState()
+        Task { [weak self] in
+            await self?.rebuildManagedMediaLibrary()
+        }
     }
 
     private func rebuildFavoriteIndex() {
@@ -97,16 +100,20 @@ final class MediaLibraryService: ObservableObject {
             .map(\.item)
     }
 
-    /// 获取指定文件夹内的收藏项目
+/// 获取指定文件夹内的收藏项目
     func favoriteItems(inFolder folderID: String?) -> [MediaItem] {
-        favoriteRecords
-            .filter { $0.isActive && $0.folderID == folderID }
+        let target = Self.normalizedFolderID(folderID)
+        return favoriteRecords
+            .filter { $0.isActive && Self.normalizedFolderID($0.folderID) == target }
             .map(\.item)
     }
 
     /// 获取指定文件夹内的下载项目
     func downloadedItems(inFolder folderID: String?) -> [MediaDownloadRecord] {
-        downloadRecords.filter { $0.isActive && $0.folderID == folderID }
+        let target = Self.normalizedFolderID(folderID)
+        return downloadRecords.filter {
+            $0.isActive && Self.normalizedFolderID($0.folderID) == target
+        }
     }
 
     var downloadedItems: [MediaDownloadRecord] {
@@ -114,8 +121,10 @@ final class MediaLibraryService: ObservableObject {
     }
 
     /// 根目录下载项目（无 folderID）
-    var rootDownloadedItems: [MediaDownloadRecord] {
-        downloadRecords.filter { $0.isActive && $0.folderID == nil }
+    func rootDownloadedItems() -> [MediaDownloadRecord] {
+        downloadRecords.filter {
+            $0.isActive && Self.normalizedFolderID($0.folderID) == nil
+        }
     }
 
     var pendingSyncFavorites: [MediaFavoriteRecord] {
@@ -210,15 +219,27 @@ final class MediaLibraryService: ObservableObject {
         return record.resolvedVideoFileURL
     }
 
-    func recordDownload(item: MediaItem, localFileURL: URL) {
+    /// 登记下载记录。
+    /// - Parameter folderID: 可选目标文件夹。传入时写入/覆盖归属；
+    ///   不传时保留已有 folderID（避免二次 record 把作者批量下载归夹冲掉）。
+    func recordDownload(item: MediaItem, localFileURL: URL, folderID: String? = nil) {
+        let targetFolderID = Self.normalizedFolderID(folderID)
         if let index = downloadRecords.firstIndex(where: { $0.item.id == item.id }) {
             downloadRecords[index].item = item
             downloadRecords[index].localFilePath = localFileURL.path
             downloadRecords[index].downloadedAt = .now
             downloadRecords[index].metadata.markLocalMutation(deleted: false)
+            // 仅在显式指定时改归属；nil 表示调用方不关心，保留现有 folderID
+            if let targetFolderID {
+                downloadRecords[index].folderID = targetFolderID
+            }
         } else {
             downloadRecords.insert(
-                MediaDownloadRecord(item: item, localFilePath: localFileURL.path),
+                MediaDownloadRecord(
+                    item: item,
+                    localFilePath: localFileURL.path,
+                    folderID: targetFolderID
+                ),
                 at: 0
             )
         }
@@ -226,16 +247,20 @@ final class MediaLibraryService: ObservableObject {
         // 预缓存文件存在性，后续 isDownloaded() 不再走 FileManager
         fileCache.markExisting(atPath: localFileURL.path)
 
-        // 单条写入 Cache
+        // 单条写入 Cache；强制数组重赋值以触发 didSet / downloadIDSet 重建
         if let record = downloadRecords.first(where: { $0.item.id == item.id }) {
             saveDlToCache(record)
         }
         syncDlIndex()
+        downloadRecords = Array(downloadRecords)
         upsert(item)
 
         SceneBakeEligibilityAnalyzer.scheduleAnalysisIfSceneProject(itemID: item.id, localFileURL: localFileURL)
+        WebOfflineBakeService.scheduleAutoBakeAfterDownload(itemID: item.id, localFileURL: localFileURL)
 
-        // 视频文件下载完成后异步生成抽帧，供封面展示使用
+        // 视频文件下载完成后异步生成**高清** poster（锁屏/桌面用，最大 3840×2160）；
+        // 列表 800×600 小图由 UI 侧按需 generateThumbnail，二者隔离。
+        // 若开启「下载后自动优化视频」，按循环分析 → 补帧入队（不走调度切换路径）。
         let videoExts: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
         let videoFileURL: URL? = if videoExts.contains(localFileURL.pathExtension.lowercased()) {
             localFileURL
@@ -244,10 +269,361 @@ final class MediaLibraryService: ObservableObject {
             MediaItem.resolveLocalVideoFile(from: localFileURL)
         }
         if let videoFileURL {
+            let title = item.title
+            let pageURL = item.pageURL
             Task { @MainActor in
                 _ = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoFileURL)
+                VideoOptimizationQueueService.shared.registerDownloadedSource(
+                    videoURL: videoFileURL,
+                    sourceURL: pageURL
+                )
+                VideoOptimizationQueueService.shared.enqueueAfterDownloadIfNeeded(
+                    videoURL: videoFileURL,
+                    title: title
+                )
             }
         }
+    }
+
+    /// Ensure an existing local media file has a persistent library record.
+    /// Applying a wallpaper is an explicit user action, so it must not remain cache-only.
+    /// - Parameter folderID: 可选目标文件夹；已有同内容记录时也会补写归属。
+    func ensureDownloadRecord(item: MediaItem, localFileURL: URL, folderID: String? = nil) {
+        // 优先走 O(1) 索引：下载刚完成再点「设为壁纸」时几乎总能命中，
+        // 避免对整表线性扫描 + 昂贵路径规范化把主线程卡住。
+        let existing: MediaDownloadRecord? = {
+            if let indexed = downloadRecordIndex[item.id], indexed.isActive {
+                return indexed
+            }
+            return downloadRecords.first(where: { $0.item.id == item.id && $0.isActive })
+        }()
+
+        if let existing {
+            // 路径字符串直接相等时跳过 hasSameLocalContent（最常见：下载后立即设置）
+            let existingPath = (existing.localFilePath as NSString).standardizingPath
+            let candidatePath = (localFileURL.path as NSString).standardizingPath
+            let sameContent = existingPath == candidatePath || existing.hasSameLocalContent(as: localFileURL)
+            if sameContent {
+                if let targetFolderID = Self.normalizedFolderID(folderID),
+                   Self.normalizedFolderID(existing.folderID) != targetFolderID {
+                    moveMediaToFolder(mediaID: item.id, folderID: targetFolderID, scope: .downloads)
+                }
+                return
+            }
+        }
+        recordDownload(item: item, localFileURL: localFileURL, folderID: folderID)
+    }
+
+    /// 以用户当前下载根为准重建媒体库。目录迁移完成后，`DownloadPathManager` 指向的
+    /// Media 目录是唯一权威数据源；不移动文件，也不把 Cache 当成下载库。
+    private func rebuildManagedMediaLibrary() async {
+        let fileManager = FileManager.default
+        let mediaFolder = DownloadPathManager.shared.mediaFolderURL.standardizedFileURL
+        guard fileManager.fileExists(atPath: mediaFolder.path) else { return }
+
+        var restored = 0
+
+        // 1. 已存在于当前数据源中的旧记录即使曾被错误地标为删除，也重新激活。
+        for record in downloadRecords {
+            let recordedURL = record.localFileURL.standardizedFileURL
+            guard fileManager.fileExists(atPath: recordedURL.path), !record.isActive else { continue }
+            restoreDownloadRecord(recordID: record.item.id, localFileURL: recordedURL)
+            restored += 1
+        }
+
+        // 2. 恢复无索引的顶层视频和 Wallpaper Engine 工程。每 24 项让出一次主线程，
+        // 避免包含数百个 Workshop 项的用户目录拖慢启动首帧。
+        let entries = (try? fileManager.contentsOfDirectory(
+            at: mediaFolder,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        let recordIDsByFileName = Dictionary(grouping: downloadRecords.compactMap { record -> (String, String)? in
+                let fileName = record.localFileURL.lastPathComponent
+                return fileName.isEmpty ? nil : (fileName, record.item.id)
+            }, by: { $0.0 })
+        var recoveredFromDisk = 0
+        for (offset, url) in entries.enumerated() {
+            if offset > 0, offset.isMultiple(of: 24) {
+                await Task.yield()
+            }
+
+            let normalizedPath = url.standardizedFileURL.path
+            if downloadRecords.contains(where: {
+                ($0.localFilePath as NSString).standardizingPath == normalizedPath
+            }) {
+                continue
+            }
+
+            // 文件名在下载时由各来源决定；迁移后路径改变时用它回连原有记录，
+            // 以完整保留 MotionBGs、DongTai、Wallsflow、导入等来源的详情与 ID。
+            if let matches = recordIDsByFileName[url.lastPathComponent],
+               matches.count == 1,
+               let recordID = matches.first?.1 {
+                restoreDownloadRecord(recordID: recordID, localFileURL: url)
+                attachRecoveredBakeArtifactIfNeeded(itemID: recordID)
+                restored += 1
+                continue
+            }
+
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { continue }
+
+            if isDirectory.boolValue,
+               url.lastPathComponent.hasPrefix("workshop_"),
+               let record = downloadRecords.first(where: { $0.item.id == url.lastPathComponent }) {
+                restoreDownloadRecord(recordID: record.item.id, localFileURL: url)
+                attachRecoveredBakeArtifactIfNeeded(itemID: record.item.id)
+                restored += 1
+                continue
+            }
+
+            let item: MediaItem?
+            if isDirectory.boolValue, url.lastPathComponent.hasPrefix("workshop_") {
+                item = recoveredWorkshopItem(at: url)
+            } else if !isDirectory.boolValue, Self.recoverableVideoExtensions.contains(url.pathExtension.lowercased()) {
+                item = recoveredVideoItem(at: url)
+            } else {
+                item = nil
+            }
+
+            guard let item else { continue }
+            if downloadRecords.contains(where: { $0.item.id == item.id }) {
+                // Workshop 等目录路径可能从 Steam 的 content 子目录变成 workshop 根目录；
+                // ID 一致时只修路径，不能用低保真磁盘元数据覆盖原始来源详情。
+                restoreDownloadRecord(recordID: item.id, localFileURL: url)
+            } else {
+                recordDownload(item: item, localFileURL: url)
+            }
+            attachRecoveredBakeArtifactIfNeeded(itemID: item.id)
+            recoveredFromDisk += 1
+        }
+
+        // 已有记录也可能来自早期版本，彼时烘焙文件没有回写 artifact。
+        for record in downloadedItems {
+            attachRecoveredBakeArtifactIfNeeded(itemID: record.item.id)
+        }
+
+        if restored > 0 || recoveredFromDisk > 0 {
+            print("[MediaLibraryService] Rebuilt media library: restored=\(restored), recoveredFromDisk=\(recoveredFromDisk)")
+        }
+    }
+
+    private static let recoverableVideoExtensions: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
+
+    private func recoveredWorkshopItem(at directoryURL: URL) -> MediaItem? {
+        let projectRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: directoryURL)
+        let projectURL = projectRoot.appendingPathComponent("project.json")
+        guard let data = try? Data(contentsOf: projectURL),
+              let project = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        let slug = directoryURL.lastPathComponent
+        let workshopID = String(slug.dropFirst("workshop_".count))
+        let hasSteamID = !workshopID.isEmpty && workshopID.allSatisfy(\.isNumber)
+        let title = (project["title"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let type = ((project["type"] as? String) ?? "scene")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let previewURL = recoveredWorkshopPreviewURL(in: projectRoot)
+        let fallbackURL = previewURL ?? projectRoot.appendingPathComponent("preview.gif")
+        let pageURL = hasSteamID
+            ? URL(string: "https://steamcommunity.com/sharedfiles/filedetails/?id=\(workshopID)")!
+            : directoryURL
+
+        return MediaItem(
+            slug: slug,
+            title: title?.isEmpty == false ? title! : slug.replacingOccurrences(of: "_", with: " "),
+            pageURL: pageURL,
+            thumbnailURL: fallbackURL,
+            resolutionLabel: type.capitalized,
+            collectionTitle: "Wallpaper Engine",
+            summary: nil,
+            previewVideoURL: nil,
+            posterURL: previewURL,
+            tags: ["workshop", type],
+            exactResolution: nil,
+            durationSeconds: nil,
+            downloadOptions: [],
+            sourceName: "Wallpaper Engine",
+            isAnimatedImage: previewURL?.pathExtension.lowercased() == "gif"
+        )
+    }
+
+    private func recoveredWorkshopPreviewURL(in projectRoot: URL) -> URL? {
+        let fileManager = FileManager.default
+        let projectURL = projectRoot.appendingPathComponent("project.json")
+        if let data = try? Data(contentsOf: projectURL),
+           let project = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let previewName = project["preview"] as? String {
+            let candidate = projectRoot.appendingPathComponent(previewName)
+            if fileManager.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+
+        for name in ["preview.jpg", "preview.jpeg", "preview.png", "preview.webp", "preview.gif"] {
+            let candidate = projectRoot.appendingPathComponent(name)
+            if fileManager.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func recoveredVideoItem(at fileURL: URL) -> MediaItem {
+        let fileName = fileURL.deletingPathExtension().lastPathComponent
+        let components = fileName.split(separator: "-").map(String.init)
+        let slug: String
+        let sourceName: String
+
+        if components.count >= 5,
+           components[0] == "motionbgs", components[1] == "dongtai",
+           ["col", "exc"].contains(components[2]), components[3].allSatisfy(\.isNumber) {
+            slug = "dongtai_\(components[2])_\(components[3])"
+            sourceName = "DongTai"
+        } else if components.count >= 4,
+                  components[0] == "motionbgs", components[1] == "wf",
+                  components[2].allSatisfy(\.isNumber) {
+            slug = "wf_\(components[2])"
+            sourceName = "Wallsflow"
+        } else if fileName.hasPrefix("motionbgs-") {
+            var value = String(fileName.dropFirst("motionbgs-".count))
+            for suffix in ["-4k", "-hd", "-original"] where value.hasSuffix(suffix) {
+                value.removeLast(suffix.count)
+                break
+            }
+            slug = value
+            sourceName = "MotionBGs"
+        } else {
+            slug = "local_\(fileName)_\(fileURL.pathExtension.lowercased())"
+            sourceName = "Local"
+        }
+
+        // 磁盘恢复的视频：异步补高清 poster，避免调度/设壁纸时只有列表小图
+        Task { @MainActor in
+            _ = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: fileURL)
+        }
+
+        return MediaItem(
+            slug: slug,
+            title: fileName.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " "),
+            pageURL: fileURL,
+            thumbnailURL: fileURL,
+            resolutionLabel: "Video",
+            collectionTitle: sourceName,
+            summary: nil,
+            previewVideoURL: fileURL,
+            posterURL: VideoThumbnailCache.shared.cachedPosterJPEGFileURLIfExists(forLocalVideo: fileURL),
+            tags: ["local", fileURL.pathExtension.lowercased()],
+            exactResolution: nil,
+            durationSeconds: nil,
+            downloadOptions: [],
+            sourceName: sourceName,
+            isAnimatedImage: false
+        )
+    }
+
+    private func attachRecoveredBakeArtifactIfNeeded(itemID: String) {
+        guard let record = downloadRecords.first(where: { $0.item.id == itemID && $0.isActive }),
+              itemID.hasPrefix("workshop_") else {
+            return
+        }
+
+        if let existingArtifact = record.sceneBakeArtifact,
+           SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: existingArtifact.videoPath)) {
+            return
+        }
+
+        let bakeDirectory = DownloadPathManager.shared.sceneBakesFolderURL
+            .appendingPathComponent(itemID, isDirectory: true)
+        let fileManager = FileManager.default
+        guard let candidates = try? fileManager.contentsOfDirectory(
+            at: bakeDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        let isWeb = WebOfflineBakeService.isWebProject(at: record.localFileURL)
+        // Prefer scene-style names (`…_wallpaperEngineWeb_…` / `…_wallpaperWgpu_…`),
+        // then fall back to any usable mp4 (including legacy `web_v*` filenames).
+        let ranked = candidates
+            .filter {
+                $0.pathExtension.lowercased() == "mp4"
+                    && !$0.lastPathComponent.hasPrefix(".")
+                    && ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 1_024
+            }
+            .sorted { lhs, rhs in
+                let lName = lhs.lastPathComponent
+                let rName = rhs.lastPathComponent
+                let lPreferred = isPreferredBakeFileName(lName, isWeb: isWeb)
+                let rPreferred = isPreferredBakeFileName(rName, isWeb: isWeb)
+                if lPreferred != rPreferred { return lPreferred && !rPreferred }
+                let lDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return lDate > rDate
+            }
+        guard let videoURL = ranked.first else { return }
+
+        let attributes = try? fileManager.attributesOfItem(atPath: videoURL.path)
+        let bakedAt = attributes?[.creationDate] as? Date ?? .now
+        let name = videoURL.lastPathComponent
+        let renderer: SceneBakeRenderer = {
+            if name.contains("_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_")
+                || name.hasPrefix("web_v") {
+                return .wallpaperEngineWeb
+            }
+            if name.contains("_\(SceneBakeRenderer.wallpaperWgpu.rawValue)_") {
+                return .wallpaperWgpu
+            }
+            return isWeb ? .wallpaperEngineWeb : .wallpaperWgpu
+        }()
+        let analysisId: UUID = {
+            if let eligibilityId = record.sceneBakeEligibility?.analysisId {
+                return eligibilityId
+            }
+            if isWeb {
+                return WebOfflineBakeService.stableAnalysisId(for: record.localFileURL)
+            }
+            // Parse leading UUID from scene-style filename when present.
+            let prefix = name.split(separator: "_", maxSplits: 1, omittingEmptySubsequences: true).first
+                .map(String.init) ?? ""
+            return UUID(uuidString: prefix) ?? UUID()
+        }()
+        let artifact = SceneBakeArtifact(
+            analysisId: analysisId,
+            videoPath: videoURL.path,
+            width: 0,
+            height: 0,
+            fps: 0,
+            durationSeconds: 0,
+            bakedAt: bakedAt,
+            renderer: renderer
+        )
+        attachSceneBakeArtifact(itemID: itemID, artifact: artifact, regeneratePoster: false)
+    }
+
+    /// Scene-style cache names rank above legacy `web_v*` / orphan files.
+    private func isPreferredBakeFileName(_ name: String, isWeb: Bool) -> Bool {
+        if isWeb {
+            return name.contains("_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_")
+        }
+        return name.contains("_\(SceneBakeRenderer.wallpaperWgpu.rawValue)_")
+    }
+
+    private func restoreDownloadRecord(recordID: String, localFileURL: URL) {
+        guard let index = downloadRecords.firstIndex(where: { $0.item.id == recordID }) else { return }
+
+        downloadRecords[index].localFilePath = localFileURL.path
+        downloadRecords[index].metadata.markLocalMutation(deleted: false)
+        fileCache.markExisting(atPath: localFileURL.path)
+        saveDlToCache(downloadRecords[index])
+        syncDlIndex()
+        downloadRecords = Array(downloadRecords)
     }
 
     /// 由 `SceneBakeEligibilityAnalyzer` 在后台线程完成后调用，写入带 UUID 的分析快照。
@@ -256,8 +632,19 @@ final class MediaLibraryService: ObservableObject {
         guard let index = downloadRecords.firstIndex(where: { $0.item.id == itemID && $0.isActive }) else {
             return
         }
-        if let art = downloadRecords[index].sceneBakeArtifact, art.analysisId != snapshot.analysisId {
-            downloadRecords[index].sceneBakeArtifact = nil
+        let record = downloadRecords[index]
+        if let artifact = record.sceneBakeArtifact, artifact.analysisId != snapshot.analysisId {
+            let isRecoveringLegacyAssociation = record.sceneBakeEligibility == nil
+                && record.hasSameLocalContent(as: URL(fileURLWithPath: snapshot.contentRootPath))
+                && SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: artifact.videoPath))
+            if isRecoveringLegacyAssociation {
+                var reboundArtifact = artifact
+                reboundArtifact.analysisId = snapshot.analysisId
+                downloadRecords[index].sceneBakeArtifact = reboundArtifact
+                print("[MediaLibraryService] Rebound recovered scene bake artifact for \(itemID)")
+            } else {
+                downloadRecords[index].sceneBakeArtifact = nil
+            }
         }
         downloadRecords[index].sceneBakeEligibility = snapshot
         saveDlToCache(downloadRecords[index])
@@ -527,16 +914,25 @@ final class MediaLibraryService: ObservableObject {
     /// 删除与下载记录关联的 Scene 烘焙产物
     private func deleteSceneBakeArtifacts(for record: MediaDownloadRecord) {
         let fm = FileManager.default
+        let existenceCache = FileExistenceCache.shared
 
         // 1. 删除烘焙视频文件（如果存在）
         if let artifact = record.sceneBakeArtifact,
-           !artifact.videoPath.isEmpty,
-           fm.fileExists(atPath: artifact.videoPath) {
-            do {
-                try fm.removeItem(atPath: artifact.videoPath)
-                print("[MediaLibraryService] ✅ Deleted scene bake video: \(artifact.videoPath)")
-            } catch {
-                print("[MediaLibraryService] ⚠️ Failed to delete scene bake video \(artifact.videoPath): \(error)")
+           !artifact.videoPath.isEmpty {
+            let videoPath = artifact.videoPath
+            if fm.fileExists(atPath: videoPath) {
+                do {
+                    try fm.removeItem(atPath: videoPath)
+                    print("[MediaLibraryService] ✅ Deleted scene bake video: \(videoPath)")
+                } catch {
+                    print("[MediaLibraryService] ⚠️ Failed to delete scene bake video \(videoPath): \(error)")
+                }
+            }
+            // 详情页 previewVideoURL 依赖存在性缓存；删后必须失效，否则仍当文件在
+            existenceCache.invalidate(atPath: videoPath)
+            let standardized = (videoPath as NSString).standardizingPath
+            if standardized != videoPath {
+                existenceCache.invalidate(atPath: standardized)
             }
         }
         // 2. 删除该 item 对应的烘焙目录（清理空目录或残留文件）
@@ -550,6 +946,7 @@ final class MediaLibraryService: ObservableObject {
             } catch {
                 print("[MediaLibraryService] ⚠️ Failed to delete scene bake directory \(bakeDir.path): \(error)")
             }
+            existenceCache.invalidate(atPath: bakeDir.path)
         }
     }
 
@@ -576,48 +973,69 @@ final class MediaLibraryService: ObservableObject {
 
     // MARK: - 文件夹移动
 
+    /// 库文件夹归属作用域。
+    /// 收藏与下载各自维护独立的 folderID，绝不能互相污染，
+    /// 否则会出现“下载归夹后收藏里的项消失 / 反过来突然冒出来”的假象。
+    enum FolderMembershipScope {
+        case favorites
+        case downloads
+    }
+
+    /// 将空字符串 / 空白 folderID 规范为 nil（根目录）。
+    static func normalizedFolderID(_ folderID: String?) -> String? {
+        guard let folderID else { return nil }
+        let trimmed = folderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     /// 将媒体项移动到指定文件夹。
     /// - Parameters:
     ///   - mediaID: 媒体项 ID
     ///   - folderID: 目标文件夹 ID；传 nil 表示移回根目录
+    ///   - scope: 只改收藏或只改下载，禁止跨集合写 folderID
     ///   - fallback: 用于「扫描进来但还没有 DownloadRecord 的项」的回退信息。
-    ///     当传入且 favorite/download 都不命中时，先调 `recordDownload` 把该项补登成下载记录，
+    ///     当 scope=.downloads 且 favorite/download 都不命中时，先调 `recordDownload` 把该项补登成下载记录，
     ///     再写 folderID，避免拖入文件夹后看起来无效。
     func moveMediaToFolder(
         mediaID: String,
         folderID: String?,
+        scope: FolderMembershipScope,
         fallback: (item: MediaItem, fileURL: URL)? = nil
     ) {
-        var hit = false
-        // 更新收藏记录
-        if let index = favoriteRecords.firstIndex(where: { $0.item.id == mediaID }) {
-            favoriteRecords[index].folderID = folderID
-            saveFavToCache(favoriteRecords[index])
-            syncFavIndex()
-            favoriteRecords = Array(favoriteRecords)
-            hit = true
-        }
-        // 更新下载记录
-        if let index = downloadRecords.firstIndex(where: { $0.item.id == mediaID }) {
-            downloadRecords[index].folderID = folderID
-            saveDlToCache(downloadRecords[index])
-            syncDlIndex()
-            downloadRecords = Array(downloadRecords)
-            hit = true
-        }
-        // 都没命中：尝试从 fallback 补登记，再写 folderID
-        if !hit, let fallback {
-            recordDownload(item: fallback.item, localFileURL: fallback.fileURL)
+        let targetFolderID = Self.normalizedFolderID(folderID)
+
+        switch scope {
+        case .favorites:
+            if let index = favoriteRecords.firstIndex(where: { $0.item.id == mediaID }) {
+                favoriteRecords[index].folderID = targetFolderID
+                saveFavToCache(favoriteRecords[index])
+                syncFavIndex()
+                favoriteRecords = Array(favoriteRecords)
+            }
+        case .downloads:
+            var hit = false
             if let index = downloadRecords.firstIndex(where: { $0.item.id == mediaID }) {
-                downloadRecords[index].folderID = folderID
+                downloadRecords[index].folderID = targetFolderID
                 saveDlToCache(downloadRecords[index])
                 syncDlIndex()
                 downloadRecords = Array(downloadRecords)
+                hit = true
+            }
+            // 都没命中：尝试从 fallback 补登记，再写 folderID
+            if !hit, let fallback {
+                recordDownload(item: fallback.item, localFileURL: fallback.fileURL)
+                if let index = downloadRecords.firstIndex(where: { $0.item.id == mediaID }) {
+                    downloadRecords[index].folderID = targetFolderID
+                    saveDlToCache(downloadRecords[index])
+                    syncDlIndex()
+                    downloadRecords = Array(downloadRecords)
+                }
             }
         }
     }
 
     func moveItemsToRoot(fromFolder folderID: String) {
+        guard let folderID = Self.normalizedFolderID(folderID) else { return }
         var favoritesChanged = false
         for index in favoriteRecords.indices where favoriteRecords[index].folderID == folderID {
             favoriteRecords[index].folderID = nil
@@ -636,6 +1054,63 @@ final class MediaLibraryService: ObservableObject {
             rebuildDlCache()
             downloadRecords = Array(downloadRecords)
         }
+    }
+
+    /// 清理无效 folderID：空字符串、指向不存在文件夹、或跨集合引用。
+    /// 返回被修正的记录数。
+    @discardableResult
+    func sanitizeFolderMembership(
+        validFavoriteFolderIDs: Set<String>,
+        validDownloadFolderIDs: Set<String>
+    ) -> Int {
+        var fixed = 0
+        var favoritesChanged = false
+        var downloadsChanged = false
+
+        for index in favoriteRecords.indices {
+            let raw = favoriteRecords[index].folderID
+            let normalized = Self.normalizedFolderID(raw)
+            let next: String?
+            if let normalized, validFavoriteFolderIDs.contains(normalized) {
+                next = normalized
+            } else {
+                next = nil
+            }
+            if raw != next {
+                favoriteRecords[index].folderID = next
+                favoritesChanged = true
+                fixed += 1
+            }
+        }
+
+        for index in downloadRecords.indices {
+            let raw = downloadRecords[index].folderID
+            let normalized = Self.normalizedFolderID(raw)
+            let next: String?
+            if let normalized, validDownloadFolderIDs.contains(normalized) {
+                next = normalized
+            } else {
+                next = nil
+            }
+            if raw != next {
+                downloadRecords[index].folderID = next
+                downloadsChanged = true
+                fixed += 1
+            }
+        }
+
+        if favoritesChanged {
+            rebuildFavCache()
+            favoriteRecords = Array(favoriteRecords)
+        }
+        if downloadsChanged {
+            rebuildDlCache()
+            downloadRecords = Array(downloadRecords)
+        }
+        if fixed > 0 {
+            print("[MediaLibraryService] Sanitized \(fixed) folder membership field(s)")
+        }
+        return fixed
     }
 
     /// 清理无效下载记录（文件不存在的记录）
@@ -1027,14 +1502,18 @@ final class WallpaperLibraryService: ObservableObject {
 
     /// 获取指定文件夹内的收藏壁纸
     func favoriteWallpapers(inFolder folderID: String?) -> [Wallpaper] {
-        favoriteRecords
-            .filter { $0.isActive && $0.folderID == folderID }
+        let target = Self.normalizedFolderID(folderID)
+        return favoriteRecords
+            .filter { $0.isActive && Self.normalizedFolderID($0.folderID) == target }
             .map(\.wallpaper)
     }
 
     /// 获取指定文件夹内的下载壁纸
     func downloadedWallpapers(inFolder folderID: String?) -> [WallpaperDownloadRecord] {
-        downloadRecords.filter { $0.isActive && $0.folderID == folderID }
+        let target = Self.normalizedFolderID(folderID)
+        return downloadRecords.filter {
+            $0.isActive && Self.normalizedFolderID($0.folderID) == target
+        }
     }
 
     var downloadedWallpapers: [WallpaperDownloadRecord] {
@@ -1093,6 +1572,14 @@ final class WallpaperLibraryService: ObservableObject {
         downloadRecords.first { $0.localFilePath == path && $0.isActive }
     }
 
+    /// 通过壁纸的远程 URL（path 字段）反查下载记录
+    func downloadRecord(forRemoteURL url: URL) -> WallpaperDownloadRecord? {
+        let urlString = url.absoluteString
+        return downloadRecords.first { record in
+            record.isActive && record.wallpaper.path == urlString
+        }
+    }
+
     func markAsLooped(localFilePath path: String) {
         guard let index = downloadRecords.firstIndex(where: { $0.localFilePath == path }) else { return }
         downloadRecords[index].isLooped = true
@@ -1131,15 +1618,27 @@ final class WallpaperLibraryService: ObservableObject {
         return url
     }
 
-    func recordDownload(_ wallpaper: Wallpaper, fileURL: URL) {
+    /// 登记下载记录。
+    /// - Parameter folderID: 可选目标文件夹。传入时写入/覆盖归属；
+    ///   不传时保留已有 folderID（避免二次 record 把作者批量下载归夹冲掉）。
+    func recordDownload(_ wallpaper: Wallpaper, fileURL: URL, folderID: String? = nil) {
+        let targetFolderID = Self.normalizedFolderID(folderID)
         if let index = downloadRecords.firstIndex(where: { $0.wallpaper.id == wallpaper.id }) {
             downloadRecords[index].wallpaper = wallpaper
             downloadRecords[index].localFilePath = fileURL.path
             downloadRecords[index].downloadedAt = .now
             downloadRecords[index].metadata.markLocalMutation(deleted: false)
+            // 仅在显式指定时改归属；nil 表示调用方不关心，保留现有 folderID
+            if let targetFolderID {
+                downloadRecords[index].folderID = targetFolderID
+            }
         } else {
             downloadRecords.insert(
-                WallpaperDownloadRecord(wallpaper: wallpaper, localFilePath: fileURL.path),
+                WallpaperDownloadRecord(
+                    wallpaper: wallpaper,
+                    localFilePath: fileURL.path,
+                    folderID: targetFolderID
+                ),
                 at: 0
             )
         }
@@ -1147,10 +1646,11 @@ final class WallpaperLibraryService: ObservableObject {
         // 预缓存文件存在性，后续 isDownloaded() 不再走 FileManager
         fileCache.markExisting(atPath: fileURL.path)
 
-        // 单条写入 Cache
+        // 单条写入 Cache；强制数组重赋值以触发 didSet / downloadIDSet 重建
         let record = downloadRecords.first { $0.wallpaper.id == wallpaper.id }
         if let record { saveDlToCache(record) }
         syncDlIndex()
+        downloadRecords = Array(downloadRecords)
         upsert(wallpaper)
     }
 
@@ -1406,48 +1906,66 @@ final class WallpaperLibraryService: ObservableObject {
 
     // MARK: - 文件夹移动
 
+    /// 库文件夹归属作用域。
+    /// 收藏与下载各自维护独立的 folderID，绝不能互相污染。
+    enum FolderMembershipScope {
+        case favorites
+        case downloads
+    }
+
+    /// 将空字符串 / 空白 folderID 规范为 nil（根目录）。
+    static func normalizedFolderID(_ folderID: String?) -> String? {
+        guard let folderID else { return nil }
+        let trimmed = folderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     /// 将壁纸移动到指定文件夹。
     /// - Parameters:
     ///   - wallpaperID: 壁纸 ID
     ///   - folderID: 目标文件夹 ID；传 nil 表示移回根目录
+    ///   - scope: 只改收藏或只改下载，禁止跨集合写 folderID
     ///   - fallback: 用于「扫描进来但还没有 DownloadRecord 的项」的回退信息。
-    ///     当传入且 favorite/download 都不命中时，先调 `recordDownload` 把该项补登成下载记录，
-    ///     再写 folderID，避免拖入文件夹后看起来无效。
+    ///     当 scope=.downloads 且都不命中时，先调 `recordDownload` 补登记再写 folderID。
     func moveWallpaperToFolder(
         wallpaperID: String,
         folderID: String?,
+        scope: FolderMembershipScope,
         fallback: (wallpaper: Wallpaper, fileURL: URL)? = nil
     ) {
-        var hit = false
-        // 更新收藏记录
-        if let index = favoriteRecords.firstIndex(where: { $0.wallpaper.id == wallpaperID }) {
-            favoriteRecords[index].folderID = folderID
-            saveFavToCache(favoriteRecords[index])
-            syncFavIndex()
-            favoriteRecords = Array(favoriteRecords)
-            hit = true
-        }
-        // 更新下载记录
-        if let index = downloadRecords.firstIndex(where: { $0.wallpaper.id == wallpaperID }) {
-            downloadRecords[index].folderID = folderID
-            saveDlToCache(downloadRecords[index])
-            syncDlIndex()
-            downloadRecords = Array(downloadRecords)
-            hit = true
-        }
-        // 都没命中：尝试从 fallback 补登记，再写 folderID
-        if !hit, let fallback {
-            recordDownload(fallback.wallpaper, fileURL: fallback.fileURL)
+        let targetFolderID = Self.normalizedFolderID(folderID)
+
+        switch scope {
+        case .favorites:
+            if let index = favoriteRecords.firstIndex(where: { $0.wallpaper.id == wallpaperID }) {
+                favoriteRecords[index].folderID = targetFolderID
+                saveFavToCache(favoriteRecords[index])
+                syncFavIndex()
+                favoriteRecords = Array(favoriteRecords)
+            }
+        case .downloads:
+            var hit = false
             if let index = downloadRecords.firstIndex(where: { $0.wallpaper.id == wallpaperID }) {
-                downloadRecords[index].folderID = folderID
+                downloadRecords[index].folderID = targetFolderID
                 saveDlToCache(downloadRecords[index])
                 syncDlIndex()
                 downloadRecords = Array(downloadRecords)
+                hit = true
+            }
+            if !hit, let fallback {
+                recordDownload(fallback.wallpaper, fileURL: fallback.fileURL)
+                if let index = downloadRecords.firstIndex(where: { $0.wallpaper.id == wallpaperID }) {
+                    downloadRecords[index].folderID = targetFolderID
+                    saveDlToCache(downloadRecords[index])
+                    syncDlIndex()
+                    downloadRecords = Array(downloadRecords)
+                }
             }
         }
     }
 
     func moveItemsToRoot(fromFolder folderID: String) {
+        guard let folderID = Self.normalizedFolderID(folderID) else { return }
         var favoritesChanged = false
         for index in favoriteRecords.indices where favoriteRecords[index].folderID == folderID {
             favoriteRecords[index].folderID = nil
@@ -1466,6 +1984,63 @@ final class WallpaperLibraryService: ObservableObject {
             rebuildDlCache()
             downloadRecords = Array(downloadRecords)
         }
+    }
+
+    /// 清理无效 folderID：空字符串、指向不存在文件夹、或跨集合引用。
+    /// 返回被修正的记录数。
+    @discardableResult
+    func sanitizeFolderMembership(
+        validFavoriteFolderIDs: Set<String>,
+        validDownloadFolderIDs: Set<String>
+    ) -> Int {
+        var fixed = 0
+        var favoritesChanged = false
+        var downloadsChanged = false
+
+        for index in favoriteRecords.indices {
+            let raw = favoriteRecords[index].folderID
+            let normalized = Self.normalizedFolderID(raw)
+            let next: String?
+            if let normalized, validFavoriteFolderIDs.contains(normalized) {
+                next = normalized
+            } else {
+                next = nil
+            }
+            if raw != next {
+                favoriteRecords[index].folderID = next
+                favoritesChanged = true
+                fixed += 1
+            }
+        }
+
+        for index in downloadRecords.indices {
+            let raw = downloadRecords[index].folderID
+            let normalized = Self.normalizedFolderID(raw)
+            let next: String?
+            if let normalized, validDownloadFolderIDs.contains(normalized) {
+                next = normalized
+            } else {
+                next = nil
+            }
+            if raw != next {
+                downloadRecords[index].folderID = next
+                downloadsChanged = true
+                fixed += 1
+            }
+        }
+
+        if favoritesChanged {
+            rebuildFavCache()
+            favoriteRecords = Array(favoriteRecords)
+        }
+        if downloadsChanged {
+            rebuildDlCache()
+            downloadRecords = Array(downloadRecords)
+        }
+        if fixed > 0 {
+            print("[WallpaperLibraryService] Sanitized \(fixed) folder membership field(s)")
+        }
+        return fixed
     }
 
     private func loadPersistedState() {

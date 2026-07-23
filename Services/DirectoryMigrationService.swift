@@ -67,12 +67,15 @@ private struct MigrationStateRecord: Codable {
 
 // MARK: - Service
 
+/// 目录迁移服务。
+/// 路径记录更新在 MainActor；文件枚举/复制/删除在后台线程执行，避免大库迁移卡死 UI。
 @MainActor
 final class DirectoryMigrationService {
     static let shared = DirectoryMigrationService()
 
-    private let fileManager = FileManager.default
     private let stateKey = "migration_state_v1"
+    /// 每处理多少个文件回一次进度 + yield（平衡 UI 刷新与调度开销）
+    private static let progressStride = 4
 
     private init() {}
 
@@ -87,8 +90,16 @@ final class DirectoryMigrationService {
         let oldPath = oldRoot.path
         let newPath = newRoot.path
 
-        // 1. 收集所有需要迁移的文件
-        let filesToMigrate = collectFiles(at: oldRoot)
+        // 1. 后台枚举文件，避免大目录扫描阻塞主线程
+        await reportProgress(
+            step: .copying, fileName: "",
+            processed: 0, total: 0,
+            fraction: 0,
+            handler: progressHandler
+        )
+        let filesToMigrate = await Task.detached(priority: .userInitiated) {
+            Self.collectFiles(at: oldRoot)
+        }.value
         let totalCount = filesToMigrate.count
         guard totalCount > 0 else {
             clearMigrationState()
@@ -102,44 +113,46 @@ final class DirectoryMigrationService {
             newPath: newPath,
             copiedFileCount: 0
         ))
+        await reportProgress(
+            step: .copying, fileName: "",
+            processed: 0, total: totalCount,
+            fraction: 0,
+            handler: progressHandler
+        )
 
-        // ── 阶段 A：复制文件 ──
+        // ── 阶段 A：复制文件（后台 I/O，定期回主线程更新进度）──
         var successCount = 0
         var failCount = 0
         var errors: [String] = []
+        let batchSize = Self.progressStride
 
-        for (index, sourceURL) in filesToMigrate.enumerated() {
-            let relativePath = relativePath(from: sourceURL, base: oldRoot)
-            let destURL = newRoot.appendingPathComponent(relativePath)
-            let fileName = sourceURL.lastPathComponent
+        for start in Swift.stride(from: 0, to: totalCount, by: batchSize) {
+            let end = min(start + batchSize, totalCount)
+            let batch = Array(filesToMigrate[start..<end])
 
-            do {
-                let destDir = destURL.deletingLastPathComponent()
-                if !fileManager.fileExists(atPath: destDir.path) {
-                    try fileManager.createDirectory(at: destDir, withIntermediateDirectories: true)
-                }
-                if fileManager.fileExists(atPath: destURL.path) {
-                    try fileManager.removeItem(at: destURL)
-                }
-                try fileManager.copyItem(at: sourceURL, to: destURL)
-                successCount += 1
-                // 每复制 50 个文件更新一次持久化状态（减少 IO）
-                if index % 50 == 0 {
-                    updateCopiedCount(index + 1)
-                }
-            } catch {
-                failCount += 1
-                errors.append("\(fileName): \(error.localizedDescription)")
-                print("[DirectoryMigrationService] Copy failed: \(sourceURL.path): \(error)")
-            }
+            let batchOutcome = await Task.detached(priority: .userInitiated) {
+                Self.copyBatch(batch, from: oldRoot, to: newRoot)
+            }.value
 
-            let phaseProgress = Double(index + 1) / Double(totalCount)
-            let overallProgress = phaseProgress * MigrationStep.copying.weight
-            reportProgress(
+            successCount += batchOutcome.successCount
+            failCount += batchOutcome.failCount
+            errors.append(contentsOf: batchOutcome.errors)
+
+            let processed = end
+            let fileName = batch.last?.lastPathComponent ?? ""
+            let phaseProgress = Double(processed) / Double(totalCount)
+            await reportProgress(
                 step: .copying, fileName: fileName,
-                processed: index + 1, total: totalCount,
-                fraction: overallProgress, handler: progressHandler
+                processed: processed, total: totalCount,
+                fraction: phaseProgress * MigrationStep.copying.weight,
+                handler: progressHandler
             )
+
+            // 每约 50 个文件刷新一次持久化断点
+            if processed % 50 < batchSize || processed == totalCount {
+                updateCopiedCount(successCount)
+            }
+            await Task.yield()
         }
         updateCopiedCount(successCount)
 
@@ -149,21 +162,21 @@ final class DirectoryMigrationService {
             oldPath: oldPath, newPath: newPath,
             copiedFileCount: successCount
         ))
-        reportProgress(
+        await reportProgress(
             step: .updatingPaths, fileName: "",
             processed: 0, total: 1,
             fraction: MigrationStep.copying.weight,
             handler: progressHandler
         )
         await updateDownloadRecordPaths(from: oldRoot, to: newRoot)
-        reportProgress(
+        await reportProgress(
             step: .updatingPaths, fileName: "",
             processed: 1, total: 1,
             fraction: MigrationStep.copying.weight + MigrationStep.updatingPaths.weight,
             handler: progressHandler
         )
 
-        // ── 阶段 C：删除旧文件 ──
+        // ── 阶段 C：删除旧文件（后台 I/O）──
         saveMigrationState(MigrationStateRecord(
             phase: .deleting,
             oldPath: oldPath, newPath: newPath,
@@ -171,35 +184,39 @@ final class DirectoryMigrationService {
         ))
         var deletedCount = 0
         let deleteBase = MigrationStep.copying.weight + MigrationStep.updatingPaths.weight
-        for (index, sourceURL) in filesToMigrate.enumerated() {
-            do {
-                try fileManager.removeItem(at: sourceURL)
-                deletedCount += 1
-            } catch {
-                print("[DirectoryMigrationService] Delete failed: \(sourceURL.path)")
-            }
-            // 每删 10 个文件更新进度，最后一个文件强制更新 + yield 让 UI 刷新
-            if index % 10 == 0 || index == totalCount - 1 {
-                let deleteProgress = Double(index + 1) / Double(totalCount)
-                reportProgress(
-                    step: .deleting, fileName: sourceURL.lastPathComponent,
-                    processed: index + 1, total: totalCount,
-                    fraction: deleteBase + deleteProgress * MigrationStep.deleting.weight,
-                    handler: progressHandler
-                )
-                await Task.yield()
-            }
+
+        for start in Swift.stride(from: 0, to: totalCount, by: batchSize) {
+            let end = min(start + batchSize, totalCount)
+            let batch = Array(filesToMigrate[start..<end])
+
+            let batchDeleted = await Task.detached(priority: .userInitiated) {
+                Self.deleteBatch(batch)
+            }.value
+            deletedCount += batchDeleted
+
+            let processed = end
+            let fileName = batch.last?.lastPathComponent ?? ""
+            let deleteProgress = Double(processed) / Double(totalCount)
+            await reportProgress(
+                step: .deleting, fileName: fileName,
+                processed: processed, total: totalCount,
+                fraction: deleteBase + deleteProgress * MigrationStep.deleting.weight,
+                handler: progressHandler
+            )
+            await Task.yield()
         }
 
         // ── 阶段 D：清理空目录 ──
-        reportProgress(
+        await reportProgress(
             step: .cleanup, fileName: "",
             processed: 0, total: 1,
             fraction: deleteBase + MigrationStep.deleting.weight,
             handler: progressHandler
         )
-        cleanupEmptyDirectories(at: oldRoot)
-        reportProgress(
+        await Task.detached(priority: .userInitiated) {
+            Self.cleanupEmptyDirectories(at: oldRoot)
+        }.value
+        await reportProgress(
             step: .cleanup, fileName: "",
             processed: 1, total: 1,
             fraction: 1.0,
@@ -241,7 +258,7 @@ final class DirectoryMigrationService {
             // 路径已更新到新目录，只需继续删除旧文件
             print("[DirectoryMigrationService] Resuming deletion of old files at \(record.oldPath)")
             clearMigrationState()
-            await deleteFilesAsync(at: oldURL)
+            await Self.deleteFilesAsync(at: oldURL)
         }
     }
 
@@ -250,7 +267,7 @@ final class DirectoryMigrationService {
     func repairOrphanedPathsIfNeeded() async {
         guard DownloadPathManager.shared.hasCustomRoot else { return }
 
-        let defaultRoot = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        let defaultRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
             .appendingPathComponent("WaifuX", isDirectory: true)
         let currentRoot = DownloadPathManager.shared.rootFolderURL
@@ -296,6 +313,12 @@ final class DirectoryMigrationService {
         WallpaperEngineXBridge.shared.bulkUpdatePaths(oldPrefix: oldPath, newPrefix: newPath)
         await UserLibrary.shared.bulkUpdatePaths(oldPrefix: oldPath, newPrefix: newPath)
         VideoThumbnailCache.shared.migrateCacheKeys(fromOldPrefix: oldPath, toNewPrefix: newPath)
+        await PortraitBlurFillWallpaperService.shared.rebaseArtifacts(
+            from: defaultRoot,
+            to: currentRoot,
+            derivedWallpapersDirectory: currentRoot
+                .appendingPathComponent("DerivedWallpapers", isDirectory: true)
+        )
         print("[DirectoryMigrationService] Orphaned path repair completed")
     }
 
@@ -421,18 +444,6 @@ final class DirectoryMigrationService {
 
     // MARK: - Private
 
-    /// 后台异步删除目录下所有文件（不阻塞主线程）
-    private func deleteFilesAsync(at root: URL) async {
-        let files = collectFiles(at: root)
-        for (index, file) in files.enumerated() {
-            try? fileManager.removeItem(at: file)
-            if index % 10 == 0 {
-                await Task.yield()
-            }
-        }
-        cleanupEmptyDirectories(at: root)
-    }
-
     private func updateDownloadRecordPaths(from oldRoot: URL, to newRoot: URL) async {
         let oldPath = oldRoot.path
         let newPath = newRoot.path
@@ -442,14 +453,21 @@ final class DirectoryMigrationService {
         WallpaperEngineXBridge.shared.bulkUpdatePaths(oldPrefix: oldPath, newPrefix: newPath)
         await UserLibrary.shared.bulkUpdatePaths(oldPrefix: oldPath, newPrefix: newPath)
         VideoThumbnailCache.shared.migrateCacheKeys(fromOldPrefix: oldPath, toNewPrefix: newPath)
+        await PortraitBlurFillWallpaperService.shared.rebaseArtifacts(
+            from: URL(fileURLWithPath: oldPath),
+            to: URL(fileURLWithPath: newPath),
+            derivedWallpapersDirectory: URL(fileURLWithPath: newPath)
+                .appendingPathComponent("DerivedWallpapers", isDirectory: true)
+        )
         print("[DirectoryMigrationService] Updated all persisted paths: \(oldPath) -> \(newPath)")
     }
 
+    /// 回到 MainActor 推送进度；async 调用点会在此让出 run loop，SwiftUI 才能刷新。
     private func reportProgress(
         step: MigrationStep, fileName: String,
         processed: Int, total: Int, fraction: Double,
         handler: @escaping @MainActor (MigrationProgress) -> Void
-    ) {
+    ) async {
         let progress = MigrationProgress(
             step: step,
             currentFileName: fileName,
@@ -457,7 +475,7 @@ final class DirectoryMigrationService {
             totalCount: total,
             fractionCompleted: min(max(fraction, 0), 1.0)
         )
-        MainActor.assumeIsolated { handler(progress) }
+        handler(progress)
     }
 
     // MARK: - 状态持久化
@@ -483,12 +501,80 @@ final class DirectoryMigrationService {
         saveMigrationState(record)
     }
 
-    // MARK: - 文件操作
+    // MARK: - 后台文件操作（非 MainActor，可在 Task.detached 中调用）
 
-    private func collectFiles(at root: URL) -> [URL] {
+    private struct CopyBatchOutcome: Sendable {
+        var successCount: Int = 0
+        var failCount: Int = 0
+        var errors: [String] = []
+    }
+
+    /// 后台异步删除目录下所有文件（不阻塞主线程）
+    private nonisolated static func deleteFilesAsync(at root: URL) async {
+        let files = collectFiles(at: root)
+        let stride = 16
+        for start in Swift.stride(from: 0, to: files.count, by: stride) {
+            let end = min(start + stride, files.count)
+            let batch = Array(files[start..<end])
+            await Task.detached(priority: .utility) {
+                _ = Self.deleteBatch(batch)
+            }.value
+            await Task.yield()
+        }
+        await Task.detached(priority: .utility) {
+            Self.cleanupEmptyDirectories(at: root)
+        }.value
+    }
+
+    nonisolated private static func copyBatch(
+        _ sources: [URL],
+        from oldRoot: URL,
+        to newRoot: URL
+    ) -> CopyBatchOutcome {
+        let fm = FileManager.default
+        var outcome = CopyBatchOutcome()
+        for sourceURL in sources {
+            let relative = relativePath(from: sourceURL, base: oldRoot)
+            let destURL = newRoot.appendingPathComponent(relative)
+            let fileName = sourceURL.lastPathComponent
+            do {
+                let destDir = destURL.deletingLastPathComponent()
+                if !fm.fileExists(atPath: destDir.path) {
+                    try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
+                }
+                if fm.fileExists(atPath: destURL.path) {
+                    try fm.removeItem(at: destURL)
+                }
+                try fm.copyItem(at: sourceURL, to: destURL)
+                outcome.successCount += 1
+            } catch {
+                outcome.failCount += 1
+                outcome.errors.append("\(fileName): \(error.localizedDescription)")
+                print("[DirectoryMigrationService] Copy failed: \(sourceURL.path): \(error)")
+            }
+        }
+        return outcome
+    }
+
+    nonisolated private static func deleteBatch(_ sources: [URL]) -> Int {
+        let fm = FileManager.default
+        var deleted = 0
+        for sourceURL in sources {
+            do {
+                try fm.removeItem(at: sourceURL)
+                deleted += 1
+            } catch {
+                print("[DirectoryMigrationService] Delete failed: \(sourceURL.path)")
+            }
+        }
+        return deleted
+    }
+
+    nonisolated private static func collectFiles(at root: URL) -> [URL] {
+        let fm = FileManager.default
         var files: [URL] = []
-        guard fileManager.fileExists(atPath: root.path) else { return files }
-        if let enumerator = fileManager.enumerator(
+        guard fm.fileExists(atPath: root.path) else { return files }
+        if let enumerator = fm.enumerator(
             at: root,
             includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
@@ -504,7 +590,7 @@ final class DirectoryMigrationService {
         return files
     }
 
-    private func relativePath(from url: URL, base: URL) -> String {
+    nonisolated private static func relativePath(from url: URL, base: URL) -> String {
         let basePath = base.path.hasSuffix("/") ? base.path : base.path + "/"
         let fullPath = url.path
         if fullPath.hasPrefix(basePath) {
@@ -513,22 +599,23 @@ final class DirectoryMigrationService {
         return url.lastPathComponent
     }
 
-    private func cleanupEmptyDirectories(at root: URL) {
-        guard fileManager.fileExists(atPath: root.path) else { return }
+    nonisolated private static func cleanupEmptyDirectories(at root: URL) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: root.path) else { return }
         func cleanup(_ url: URL) {
-            guard fileManager.fileExists(atPath: url.path) else { return }
+            guard fm.fileExists(atPath: url.path) else { return }
             do {
-                let contents = try fileManager.contentsOfDirectory(atPath: url.path)
+                let contents = try fm.contentsOfDirectory(atPath: url.path)
                 for name in contents {
                     let child = url.appendingPathComponent(name)
                     var isDir: ObjCBool = false
-                    if fileManager.fileExists(atPath: child.path, isDirectory: &isDir), isDir.boolValue {
+                    if fm.fileExists(atPath: child.path, isDirectory: &isDir), isDir.boolValue {
                         cleanup(child)
                     }
                 }
-                let remaining = try fileManager.contentsOfDirectory(atPath: url.path)
+                let remaining = try fm.contentsOfDirectory(atPath: url.path)
                 if remaining.isEmpty {
-                    try fileManager.removeItem(at: url)
+                    try fm.removeItem(at: url)
                 }
             } catch {
                 print("[DirectoryMigrationService] Cleanup error at \(url.path): \(error)")

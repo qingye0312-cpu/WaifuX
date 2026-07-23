@@ -205,7 +205,8 @@ extension KonachanPost {
             views: 0,
             favorites: score ?? 0,
             downloads: nil,
-            source: source,
+            // 固定为数据源标识；API 的 source 字段是原图出处 URL，不能当 source 用
+            source: "konachan",
             purity: purity,
             category: "anime",
             dimensionX: width,

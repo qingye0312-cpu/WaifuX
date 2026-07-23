@@ -53,14 +53,20 @@ extension URL {
 
 /// 轻量级的文件存在性内存缓存，避免在主线程反复调用 FileManager.fileExists(atPath:)。
 /// 适用于「我的库」等有上千条下载记录的场景。
+///
+/// 外置卡/U 盘上 `fileExists` 本身可能要几十～几百毫秒；命中负缓存与正缓存同样重要。
+/// 「乐观存在」：下载记录写入后 markExisting，列表滚动不再打慢卷。
 final class FileExistenceCache: @unchecked Sendable {
     static let shared = FileExistenceCache()
 
     private let cache = NSCache<NSString, NSNumber>()
+    /// 路径 → 是否目录（workshop 根等）；与 fileExists 共用成本限额
+    private let directoryCache = NSCache<NSString, NSNumber>()
 
     private init() {
-        cache.countLimit = 2000
-        cache.totalCostLimit = 2 * 1024 * 1024 // 2MB（每个条目约 1KB）
+        cache.countLimit = 8000
+        cache.totalCostLimit = 4 * 1024 * 1024
+        directoryCache.countLimit = 2000
     }
 
     /// 检查文件是否存在（优先缓存，未命中时调用 FileManager）
@@ -74,14 +80,39 @@ final class FileExistenceCache: @unchecked Sendable {
         return exists
     }
 
+    /// 检查路径是否为目录（缓存结果，避免列表/卡片反复 stat 外置卷）
+    func isDirectory(atPath path: String) -> Bool {
+        let key = path as NSString
+        if let cached = directoryCache.object(forKey: key) {
+            return cached.boolValue
+        }
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
+        let result = exists && isDir.boolValue
+        directoryCache.setObject(NSNumber(value: result), forKey: key, cost: path.utf8.count)
+        if exists {
+            cache.setObject(NSNumber(value: true), forKey: key, cost: path.utf8.count)
+        }
+        return result
+    }
+
     /// 标记文件为「存在」（下载完成后调用，避免后续检查再走 FileManager）
     func markExisting(atPath path: String) {
         cache.setObject(NSNumber(value: true), forKey: path as NSString, cost: path.utf8.count)
     }
 
+    /// 标记路径为目录（导入 Workshop 项目后调用）
+    func markDirectory(atPath path: String) {
+        let key = path as NSString
+        cache.setObject(NSNumber(value: true), forKey: key, cost: path.utf8.count)
+        directoryCache.setObject(NSNumber(value: true), forKey: key, cost: path.utf8.count)
+    }
+
     /// 失效指定路径的缓存
     func invalidate(atPath path: String) {
-        cache.removeObject(forKey: path as NSString)
+        let key = path as NSString
+        cache.removeObject(forKey: key)
+        directoryCache.removeObject(forKey: key)
     }
 
     /// 失效指定目录下的所有缓存（通过路径前缀匹配）
@@ -93,5 +124,6 @@ final class FileExistenceCache: @unchecked Sendable {
     /// 清空所有缓存（内存压力时调用）
     func clearAll() {
         cache.removeAllObjects()
+        directoryCache.removeAllObjects()
     }
 }

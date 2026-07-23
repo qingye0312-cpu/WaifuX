@@ -26,18 +26,21 @@ private actor SteamCMDDownloadLimiter {
     private let pollInterval: UInt64 = 500_000_000 // 0.5s
 
     /// 获取一个下载槽位；若已满则每隔 0.5s 轮询一次
-    func acquire() async {
+    func acquire() async throws {
         while true {
+            try Task.checkCancellation()
             if activeCount < maxConcurrent {
                 activeCount += 1
                 return
             }
             waitCount += 1
-            // 休眠期间若 Task 被取消，CancellationError 被 try? 静默吞掉，
-            // 循环继续检查槽位。实际下载操作在 acquire 返回后进行，
-            // 那里会通过 try await 抛出 CancellationError 并被外层捕获。
-            try? await Task.sleep(nanoseconds: pollInterval)
-            waitCount = max(0, waitCount - 1)
+            do {
+                try await Task.sleep(nanoseconds: pollInterval)
+                waitCount = max(0, waitCount - 1)
+            } catch {
+                waitCount = max(0, waitCount - 1)
+                throw error
+            }
         }
     }
 
@@ -101,7 +104,10 @@ class WorkshopService: ObservableObject {
         var components = URLComponents(string: "https://steamcommunity.com\(profilePath)/myworkshopfiles/")
         components?.queryItems = [
             URLQueryItem(name: "appid", value: wallpaperEngineAppID),
-            URLQueryItem(name: "p", value: String(page)),
+            // 显式 myfiles + mostrecent，避免默认视图/排序导致翻页异常
+            URLQueryItem(name: "browsefilter", value: "myfiles"),
+            URLQueryItem(name: "sort", value: "mostrecent"),
+            URLQueryItem(name: "p", value: String(max(page, 1))),
             // Steam 作者页使用 numperpage，不是 Workshop 搜索页的 num_per_page。
             URLQueryItem(name: "numperpage", value: String(authorPageSize))
         ]
@@ -1512,6 +1518,24 @@ class WorkshopService: ObservableObject {
         return components.queryItems?.first(where: { $0.name.lowercased() == "id" })?.value
     }
 
+    /// 查询创意工坊条目的远端元数据（用于已下载项更新检测）
+    /// - Returns: `(updatedAt, fileSize)`；条目不存在或字段缺失时返回 nil
+    func fetchWorkshopRemoteUpdateInfo(workshopID: String) async throws -> (updatedAt: Date, fileSize: Int64?)? {
+        let details = try await fetchPublishedFileDetails(ids: [workshopID])
+        guard let detail = details.first,
+              let timeUpdated = detail.time_updated else {
+            return nil
+        }
+        let updatedAt = Date(timeIntervalSince1970: TimeInterval(timeUpdated))
+        let fileSize: Int64? = {
+            guard let sizeStr = detail.file_size, let size = Int64(sizeStr), size > 0 else {
+                return nil
+            }
+            return size
+        }()
+        return (updatedAt, fileSize)
+    }
+
     /// 通过 Workshop URL 获取单个项目详情并转换为 MediaItem
     func resolveWorkshopItemByURL(_ urlString: String) async throws -> MediaItem {
         guard let workshopID = Self.extractWorkshopID(from: urlString) else {
@@ -1585,7 +1609,7 @@ class WorkshopService: ObservableObject {
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) async throws -> URL {
         // 获取并发下载槽位（超出上限则排队等待）
-        await downloadLimiter.acquire()
+        try await downloadLimiter.acquire()
         // 更新排队计数
         let queued = await downloadLimiter.queuedCount()
         await MainActor.run { steamCMDQueuedCount = queued }
@@ -1685,8 +1709,9 @@ class WorkshopService: ObservableObject {
 
         try? FileManager.default.createDirectory(at: downloadDir, withIntermediateDirectories: true)
 
-        // SteamCMD 不提供下载进度输出（+download_progress 是无效命令），
-        // 因此通过 Steam API 获取文件大小，再用轮询下载目录的方式估算进度。
+        // SteamCMD 不提供可直接消费的百分比输出。目标文件会被预分配，
+        // 所以文件大小和目录占用不能代表已接收字节；稍后由 PID 网络采样器
+        // 结合此处的 Steam API 文件总大小计算每个任务的真实进度。
         let totalSize: Int64
         do {
             let details = try await fetchPublishedFileDetails(ids: [workshopID])
@@ -1754,23 +1779,29 @@ class WorkshopService: ObservableObject {
             task.standardOutput = outputPipe
             task.standardError = errorPipe
 
-            // steamcmd 创意工坊下载不创建中间文件，无法轮询字节数。
-            // 进度通过时间估算：假设下载速度不低于 200KB/s，按已耗时推算进度，上限 99%。
-            var lastReportedProgress: Double = 0
-            let startTime = Date()
-            let minSpeed: Double = 500 * 1024  // 500KB/s 最低预估速度
-            let pollingTask = Task { @MainActor in
+            final class ProgressBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var lastReportedProgress: Double = 0
+
+                func shouldReport(_ progress: Double) -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    guard progress > lastReportedProgress + 0.001 else { return false }
+                    lastReportedProgress = progress
+                    return true
+                }
+            }
+
+            let progressBox = ProgressBox()
+            let progressMonitor = SteamWorkshopNetworkProgressMonitor(
+                workshopID: workshopID,
+                totalDownloadBytes: totalSize > 0 ? totalSize : nil
+            )
+            let pollingTask = Task.detached(priority: .utility) {
                 while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
-                    guard totalSize > 0 else { continue }
-                    let elapsed = Date().timeIntervalSince(startTime)
-                    // 基于时间的估算进度 = min(已下载估算 / 总大小, 0.99)
-                    // 已下载估算 = max(实际字节数, elapsed * minSpeed)
-                    let currentBytes = Self.dirSize(downloadDir.appendingPathComponent("steamapps"))
-                    let estimatedBytes = max(Double(currentBytes), elapsed * minSpeed)
-                    let progress = min(estimatedBytes / Double(totalSize), 0.99)
-                    if progress > lastReportedProgress + 0.001 {
-                        lastReportedProgress = progress
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    guard let progress = progressMonitor.currentProgress() else { continue }
+                    if progressBox.shouldReport(progress) {
                         progressHandler?(progress)
                     }
                 }
@@ -1801,10 +1832,11 @@ class WorkshopService: ObservableObject {
             }
             let outputBox = OutputBox()
 
-            // steamcmd 创意工坊下载不输出进度，所有输出仅用于最终错误判断
+            // steamcmd 创意工坊下载不输出可用百分比；stdout 同时用于错误判断与下载开始标记。
             outputPipe.fileHandleForReading.readabilityHandler = { handle in
                 if let str = String(data: handle.availableData, encoding: .utf8) {
                     outputBox.appendOutput(str)
+                    progressMonitor.consumeSteamCMDOutput(str)
                 }
             }
             errorPipe.fileHandleForReading.readabilityHandler = { handle in
@@ -1831,16 +1863,19 @@ class WorkshopService: ObservableObject {
                 private let errorPipe: Pipe?
                 private let timeoutTask: Task<Void, Never>?
                 private let pollingTask: Task<Void, Never>?
-                init(continuation: CheckedContinuation<T, any Error>, outputPipe: Pipe? = nil, errorPipe: Pipe? = nil, timeoutTask: Task<Void, Never>? = nil, pollingTask: Task<Void, Never>? = nil) {
+                private let progressMonitor: SteamWorkshopNetworkProgressMonitor?
+                init(continuation: CheckedContinuation<T, any Error>, outputPipe: Pipe? = nil, errorPipe: Pipe? = nil, timeoutTask: Task<Void, Never>? = nil, pollingTask: Task<Void, Never>? = nil, progressMonitor: SteamWorkshopNetworkProgressMonitor? = nil) {
                     self.continuation = continuation
                     self.outputPipe = outputPipe
                     self.errorPipe = errorPipe
                     self.timeoutTask = timeoutTask
                     self.pollingTask = pollingTask
+                    self.progressMonitor = progressMonitor
                 }
                 private func cleanup() {
                     timeoutTask?.cancel()
                     pollingTask?.cancel()
+                    progressMonitor?.stop()
                     outputPipe?.fileHandleForReading.readabilityHandler = nil
                     errorPipe?.fileHandleForReading.readabilityHandler = nil
                 }
@@ -1876,11 +1911,14 @@ class WorkshopService: ObservableObject {
                 outputPipe: outputPipe,
                 errorPipe: errorPipe,
                 timeoutTask: timeoutTask,
-                pollingTask: pollingTask
+                pollingTask: pollingTask,
+                progressMonitor: progressMonitor
             )
 
             task.terminationHandler = { _ in
+                progressMonitor.stop()
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.8) {
+                    AppLogger.info(.download, "Workshop 网络进度采样汇总", metadata: progressMonitor.samplingDiagnostics())
                     // 超时导致的终止，直接返回明确的超时错误
                     if timeoutFlag.value {
                         resumeBox.resume(throwing: WorkshopError.timeout)
@@ -1912,13 +1950,13 @@ class WorkshopService: ObservableObject {
                         // 移动确认场景但确认未成功
                         let confirmationMissing = needsMobileConfirmation && !mobileConfirmationSucceeded
 
-                        // 需要移动确认但用户未确认 → 不要清除凭据，提示用户去 App 中确认
+                        // 需要移动确认但用户未确认 → 账号本身没问题，保留凭据，提示去 App 确认
                         if confirmationMissing {
                             resumeBox.resume(throwing: WorkshopError.confirmationRequired("请在 Steam App 中确认登录请求后重试下载"))
                             return
                         }
 
-                        // 需要邮箱验证码但没有提供 → 说明缓存已失效，清除凭据
+                        // 需要邮箱验证码但没有提供 → 登录会话无效，清理本地账号
                         let guardCodeMissing = needsGuardCode
                         if guardCodeMissing {
                             Task { @MainActor in
@@ -1930,6 +1968,7 @@ class WorkshopService: ObservableObject {
                     }
 
                     // 检查 SteamCMD 自身的登录超时（网络问题导致连接 Steam 服务器超时）
+                    // 纯网络问题不清账号
                     let loginTimeoutIndicators = [
                         "ERROR (Timeout)",
                         "Connection timed out",
@@ -1939,7 +1978,8 @@ class WorkshopService: ObservableObject {
                         "No route to host",
                         "Connection refused",
                         "Unable to connect to Steam",
-                        "Failed to connect to Steam"
+                        "Failed to connect to Steam",
+                        "login failed: No Connection"
                     ]
                     if loginTimeoutIndicators.contains(where: { combinedOutput.localizedCaseInsensitiveContains($0) }) {
                         let cleaned = Self.cleanSteamCMDError(outputBox.errorString().isEmpty ? outputBox.outputString() : outputBox.errorString())
@@ -1948,20 +1988,29 @@ class WorkshopService: ObservableObject {
                         return
                     }
 
-                    // session token 过期或网络导致的登录失败
+                    // 真实登录/会话错误：清理本地账号，要求重新登录
                     let sessionExpiredKeywords = [
                         "ERROR! Not logged on",
                         "Not logged on",
-                        "No login session, exiting",
-                        "login failed: No Connection",
-                        "Login Failure"
+                        "No login session, exiting"
                     ]
                     if sessionExpiredKeywords.contains(where: { combinedOutput.localizedCaseInsensitiveContains($0) }) {
-                        // 会话已失效，自动清除过期凭据并提示用户重新登录
                         Task { @MainActor in
                             WorkshopSourceManager.shared.clearSteamCredentials()
                         }
                         resumeBox.resume(throwing: WorkshopError.sessionExpired)
+                        return
+                    }
+
+                    // 限流 / 无订阅：不是账号密码错误，保留凭据
+                    if combinedOutput.localizedCaseInsensitiveContains("RateLimitExceeded") {
+                        let raw = outputBox.errorString().isEmpty ? outputBox.outputString() : outputBox.errorString()
+                        resumeBox.resume(throwing: WorkshopError.downloadFailed(Self.steamCMDDownloadFailureDetail(from: raw)))
+                        return
+                    }
+                    if combinedOutput.localizedCaseInsensitiveContains("No subscriptions") {
+                        let raw = outputBox.errorString().isEmpty ? outputBox.outputString() : outputBox.errorString()
+                        resumeBox.resume(throwing: WorkshopError.downloadFailed(Self.steamCMDDownloadFailureDetail(from: raw)))
                         return
                     }
 
@@ -1972,16 +2021,17 @@ class WorkshopService: ObservableObject {
                         "Account Logon Denied",
                         "Account disabled",
                         "Account locked",
-                        "RateLimitExceeded",
-                        "Two-factor code mismatch",
-                        "No subscriptions"
+                        "Two-factor code mismatch"
                     ]
                     if authFailureKeywords.contains(where: { combinedOutput.localizedCaseInsensitiveContains($0) }) {
+                        Task { @MainActor in
+                            WorkshopSourceManager.shared.clearSteamCredentials()
+                        }
                         resumeBox.resume(throwing: WorkshopError.invalidCredentials)
                         return
                     }
 
-                    // Workshop 下载失败（SteamCMD 侧报告，可能是临时网络问题，可重试）
+                    // Workshop 下载失败（SteamCMD 侧报告）
                     let downloadFailureKeywords = [
                         "Workshop download failed",
                         "Download item",  // 仅匹配 "Download item XXXXX failed" 类错误
@@ -1989,8 +2039,15 @@ class WorkshopService: ObservableObject {
                     ]
                     if downloadFailureKeywords.contains(where: { combinedOutput.localizedCaseInsensitiveContains($0) })
                         && !combinedOutput.localizedCaseInsensitiveContains("Download Complete") {
-                        let cleaned = Self.cleanSteamCMDError(outputBox.errorString().isEmpty ? outputBox.outputString() : outputBox.errorString())
-                        resumeBox.resume(throwing: WorkshopError.downloadIncomplete(cleaned))
+                        let raw = outputBox.errorString().isEmpty ? outputBox.outputString() : outputBox.errorString()
+                        let detail = Self.steamCMDDownloadFailureDetail(from: raw)
+                        // Access Denied / 权限类属于永久失败，不应按“下载不完整”自动重试
+                        if combinedOutput.localizedCaseInsensitiveContains("Access Denied")
+                            || combinedOutput.localizedCaseInsensitiveContains("Permission denied") {
+                            resumeBox.resume(throwing: WorkshopError.downloadFailed(detail))
+                        } else {
+                            resumeBox.resume(throwing: WorkshopError.downloadIncomplete(detail))
+                        }
                         return
                     }
 
@@ -2047,6 +2104,7 @@ class WorkshopService: ObservableObject {
 
             do {
                 try task.run()
+                progressMonitor.start(processIdentifier: task.processIdentifier)
             } catch {
                 resumeBox.resume(throwing: WorkshopError.executionFailed(error.localizedDescription))
             }
@@ -2144,6 +2202,129 @@ class WorkshopService: ObservableObject {
         }
 
         return "SteamCMD 登录失败。\n\nSteamCMD 原始信息：\n\(detail)"
+    }
+
+    /// 将 SteamCMD 下载阶段的原始输出整理成可展示给用户的诊断信息。
+    nonisolated private static func steamCMDDownloadFailureDetail(from raw: String) -> String {
+        let cleaned = cleanSteamCMDError(raw)
+        let detail = cleaned.isEmpty ? "SteamCMD 未返回可解析的错误输出。" : cleaned
+        let itemLabel = steamCMDFailedWorkshopItemLabel(from: raw)
+
+        if raw.localizedCaseInsensitiveContains("Access Denied")
+            || raw.localizedCaseInsensitiveContains("Permission denied") {
+            return """
+            Steam 拒绝下载\(itemLabel)（Access Denied）。
+
+            这通常不是 App 故障，而是账号/作品权限问题。常见原因：
+            1. 当前 Steam 账号未购买 Wallpaper Engine（库中无 431960）
+            2. 作品对该账号不可见（私有、好友可见、地区/年龄限制，或已下架）
+            3. 账号没有该作品的订阅/下载权限
+
+            建议按顺序排查：
+            • 用同一账号在 Steam 库确认已拥有 Wallpaper Engine
+            • 打开该作品页，确认能正常浏览并订阅
+            • 换有权限的账号，在设置中重新登录 SteamCMD 后再下载
+            • 仅当作品页也打不开时，再检查 VPN/节点/TUN
+
+            SteamCMD 原始信息：
+            \(detail)
+            """
+        }
+
+        if raw.localizedCaseInsensitiveContains("No subscriptions") {
+            return """
+            当前 Steam 账号没有可用的 Workshop 订阅权限（\(itemLabel)）。
+
+            建议：
+            • 确认账号已购买 Wallpaper Engine
+            • 在 Steam 中打开并订阅该作品后重试
+            • 家庭共享场景下，确认主账号权限仍有效
+
+            SteamCMD 原始信息：
+            \(detail)
+            """
+        }
+
+        if raw.localizedCaseInsensitiveContains("RateLimitExceeded")
+            || raw.localizedCaseInsensitiveContains("rate limit") {
+            return """
+            Steam 请求过于频繁，已被限流。
+
+            建议稍等几分钟后再试，并避免同时排队过多 Workshop 下载。
+
+            SteamCMD 原始信息：
+            \(detail)
+            """
+        }
+
+        let networkKeywords = [
+            "Timeout",
+            "Connection timed out",
+            "Could not connect to Steam",
+            "Network is unreachable",
+            "No route to host",
+            "Connection refused",
+            "Unable to connect to Steam",
+            "Failed to connect to Steam",
+            "No Connection"
+        ]
+        if networkKeywords.contains(where: { raw.localizedCaseInsensitiveContains($0) }) {
+            return """
+            下载 \(itemLabel) 时连接 Steam 失败（网络/超时）。
+
+            建议：
+            • 检查本机网络是否稳定
+            • 如在国内，尝试更换 VPN 节点或开启 TUN 模式
+            • 稍后点击重新下载
+
+            SteamCMD 原始信息：
+            \(detail)
+            """
+        }
+
+        if raw.localizedCaseInsensitiveContains("Download item")
+            || raw.localizedCaseInsensitiveContains("Workshop download failed")
+            || raw.localizedCaseInsensitiveContains("ERROR! Download") {
+            return """
+            Workshop 下载失败：\(itemLabel)。
+
+            可依次排查：
+            1. 当前账号是否拥有 Wallpaper Engine
+            2. 该作品页是否可正常打开并订阅
+            3. 网络是否稳定（必要时换 VPN 节点 / 开 TUN）
+            4. 在设置中重新登录 SteamCMD 后再试
+
+            SteamCMD 原始信息：
+            \(detail)
+            """
+        }
+
+        return """
+        Workshop 下载失败。
+
+        可依次排查：账号权限、作品可见性、网络/VPN、重新登录 SteamCMD。
+
+        SteamCMD 原始信息：
+        \(detail)
+        """
+    }
+
+    /// 从 SteamCMD 输出提取失败的 Workshop item id，便于用户对照作品页。
+    nonisolated private static func steamCMDFailedWorkshopItemLabel(from raw: String) -> String {
+        let patterns = [
+            #"Download item\s+(\d+)\s+failed"#,
+            #"item\s+(\d+).*Access Denied"#,
+            #"workshop(?:file)?(?:id)?[=\s:]+(\d{5,})"#
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { continue }
+            let range = NSRange(raw.startIndex..., in: raw)
+            if let match = regex.firstMatch(in: raw, options: [], range: range),
+               let idRange = Range(match.range(at: 1), in: raw) {
+                return "作品 #\(raw[idRange])"
+            }
+        }
+        return "该 Workshop 作品"
     }
 
     /// SteamCMD runscript 参数使用双引号包裹；这里统一转义会破坏脚本行结构的字符。
@@ -2610,6 +2791,219 @@ class WorkshopService: ObservableObject {
     }
 }
 
+
+// MARK: - Steam Workshop 网络进度
+
+/// SteamCMD 会预分配 Workshop 目标文件，不能以文件长度或目录占用推算进度。
+/// 这个监视器按 SteamCMD PID 采样累计网络接收字节，并以 Steam API 返回的
+/// 文件总大小换算进度；`nettop` 不可用时只返回 nil，交由上层保持阶段状态。
+private final class SteamWorkshopNetworkProgressMonitor: @unchecked Sendable {
+    private enum NetTopSampleResult {
+        case success(Data)
+        case failure(String)
+    }
+
+    private let lock = NSLock()
+    private let workshopID: String
+    private let totalDownloadBytes: Int64?
+    private let downloadStartMarker: String
+
+    private var nettopOutputBuffer = ""
+    private var steamOutputTail = ""
+    private var bytesInColumnIndex: Int?
+    private var lastRawReceivedBytes: Int64?
+    private var cumulativeReceivedBytes: Int64 = 0
+    private var receivedBytesAtDownloadStart: Int64?
+    private var monitoredProcessID: Int32?
+    private var isStopped = false
+    private var isSampleInFlight = false
+    private var lastSampleRequestDate = Date.distantPast
+    private var downloadStartObserved = false
+    private var nettopAvailable = false
+    private var lastSamplingError: String?
+    private var sampleCount = 0
+    private var validByteSampleCount = 0
+
+    init(workshopID: String, totalDownloadBytes: Int64?) {
+        self.workshopID = workshopID
+        self.totalDownloadBytes = totalDownloadBytes
+        self.downloadStartMarker = "Downloading item \(workshopID)"
+    }
+
+    func start(processIdentifier: Int32) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard monitoredProcessID == nil else { return }
+        monitoredProcessID = processIdentifier
+        isStopped = false
+        nettopAvailable = FileManager.default.isExecutableFile(atPath: "/usr/bin/nettop")
+        if !nettopAvailable {
+            lastSamplingError = "nettop unavailable"
+        }
+    }
+
+    func stop() {
+        lock.lock()
+        isStopped = true
+        monitoredProcessID = nil
+        lock.unlock()
+    }
+
+    func consumeSteamCMDOutput(_ output: String) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !downloadStartObserved else { return }
+        steamOutputTail += output
+        if steamOutputTail.localizedCaseInsensitiveContains(downloadStartMarker) {
+            downloadStartObserved = true
+            receivedBytesAtDownloadStart = lastRawReceivedBytes == nil ? nil : cumulativeReceivedBytes
+            return
+        }
+
+        let retainedLength = max(downloadStartMarker.count + 64, 256)
+        if steamOutputTail.count > retainedLength {
+            steamOutputTail = String(steamOutputTail.suffix(retainedLength))
+        }
+    }
+
+    func currentProgress() -> Double? {
+        requestNetTopSampleIfNeeded()
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard downloadStartObserved,
+              let totalDownloadBytes,
+              totalDownloadBytes > 0,
+              lastRawReceivedBytes != nil else {
+            return nil
+        }
+
+        guard let receivedBytesAtDownloadStart else {
+            self.receivedBytesAtDownloadStart = cumulativeReceivedBytes
+            return nil
+        }
+
+        let downloadedBytes = cumulativeReceivedBytes - receivedBytesAtDownloadStart
+        guard downloadedBytes > 0 else { return nil }
+        return min(Double(downloadedBytes) / Double(totalDownloadBytes), 0.99)
+    }
+
+    func samplingDiagnostics() -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var diagnostics: [String: Any] = [
+            "workshopID": workshopID,
+            "nettopAvailable": nettopAvailable,
+            "downloadStartObserved": downloadStartObserved,
+            "sampleCount": sampleCount,
+            "validByteSampleCount": validByteSampleCount,
+            "cumulativeReceivedBytes": cumulativeReceivedBytes,
+        ]
+        if let totalDownloadBytes { diagnostics["totalDownloadBytes"] = totalDownloadBytes }
+        if let lastSamplingError { diagnostics["lastSamplingError"] = lastSamplingError }
+        return diagnostics
+    }
+
+    private func requestNetTopSampleIfNeeded() {
+        lock.lock()
+        guard nettopAvailable,
+              !isStopped,
+              !isSampleInFlight,
+              let processID = monitoredProcessID,
+              Date().timeIntervalSince(lastSampleRequestDate) >= 0.25 else {
+            lock.unlock()
+            return
+        }
+
+        isSampleInFlight = true
+        lastSampleRequestDate = .now
+        lock.unlock()
+
+        Task.detached(priority: .utility) { [weak self] in
+            let result = Self.readNetTopSnapshot(processIdentifier: processID)
+            self?.finishNetTopSample(result)
+        }
+    }
+
+    private func finishNetTopSample(_ result: NetTopSampleResult) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        isSampleInFlight = false
+        guard !isStopped else { return }
+
+        switch result {
+        case .success(let data):
+            guard let output = String(data: data, encoding: .utf8) else { return }
+            appendNetTopOutput(output)
+        case .failure(let error):
+            lastSamplingError = error
+        }
+    }
+
+    private func appendNetTopOutput(_ output: String) {
+        nettopOutputBuffer += output
+        while let newlineRange = nettopOutputBuffer.range(of: "\n") {
+            let line = String(nettopOutputBuffer[..<newlineRange.lowerBound])
+            nettopOutputBuffer.removeSubrange(...newlineRange.lowerBound)
+            consumeNetTopLine(line)
+        }
+    }
+
+    private func consumeNetTopLine(_ line: String) {
+        let columns = line.split(separator: ",", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard !columns.isEmpty else { return }
+
+        if let headerIndex = columns.firstIndex(of: "bytes_in") {
+            bytesInColumnIndex = headerIndex
+            return
+        }
+
+        guard let bytesInColumnIndex,
+              columns.indices.contains(bytesInColumnIndex),
+              let receivedBytes = Int64(columns[bytesInColumnIndex]) else {
+            return
+        }
+
+        sampleCount += 1
+        validByteSampleCount += 1
+        if let lastRawReceivedBytes {
+            cumulativeReceivedBytes += receivedBytes >= lastRawReceivedBytes
+                ? receivedBytes - lastRawReceivedBytes
+                : receivedBytes
+        } else {
+            cumulativeReceivedBytes = receivedBytes
+        }
+        lastRawReceivedBytes = receivedBytes
+    }
+
+    private static func readNetTopSnapshot(processIdentifier: Int32) -> NetTopSampleResult {
+        let process = Process()
+        let outputPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
+        process.arguments = ["-P", "-L", "1", "-x", "-n", "-p", String(processIdentifier)]
+        process.standardOutput = outputPipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                return .failure("nettop exited \(process.terminationStatus)")
+            }
+            return .success(output)
+        } catch {
+            return .failure(error.localizedDescription)
+        }
+    }
+}
+
 // MARK: - WorkshopWallpaper → MediaItem 转换
 
 extension WorkshopService {
@@ -2678,6 +3072,44 @@ extension WorkshopService {
 // MARK: - SteamCMD 解压目录 → 真实 WE 工程根
 
 extension WorkshopService {
+    /// Canonicalize both SteamCMD's outer download directory and the nested content directory.
+    /// This keeps media-library registration stable when callers resolve the playable project root.
+    ///
+    /// 实现注意：不要在循环里反复碰 `URL.path` / `lastPathComponent` / `deletingLastPathComponent`。
+    /// Foundation 每次都会 percent-decode / 重新 parse，下载后立刻「设为壁纸」时会把主线程卡死
+    ///（sample 里整段采样窗口都耗在这里），桌面层已停旧壁纸时就表现为黑屏 + RSS 顶高。
+    nonisolated static func canonicalWorkshopContentURL(for workshopID: String, startingAt url: URL) -> URL {
+        let fileManager = FileManager.default
+        let standardizedPath = (url.path as NSString).standardizingPath
+        var components = (standardizedPath as NSString).pathComponents
+
+        // 已是 .../431960/<id>
+        if components.count >= 2,
+           components[components.count - 2] == "431960",
+           components[components.count - 1] == workshopID {
+            return URL(fileURLWithPath: standardizedPath, isDirectory: true)
+        }
+
+        let workshopRootName = "workshop_\(workshopID)"
+        // 纯字符串向上走，避免每层重建 BridgedURL
+        while !components.isEmpty {
+            if components.last == workshopRootName {
+                let rootPath = NSString.path(withComponents: components)
+                let contentPath = (rootPath as NSString)
+                    .appendingPathComponent("steamapps/workshop/content/431960/\(workshopID)")
+                if fileManager.fileExists(atPath: contentPath) {
+                    return URL(fileURLWithPath: contentPath, isDirectory: true)
+                }
+            }
+            // 到文件系统根就停（["/"] 或 ["C:"]）
+            if components.count <= 1 { break }
+            components.removeLast()
+        }
+
+        let fallbackURL = URL(fileURLWithPath: standardizedPath, isDirectory: true)
+        return resolveWallpaperEngineProjectRoot(startingAt: fallbackURL)
+    }
+
     /// SteamCMD 解压路径常为 `.../steamapps/workshop/content/431960/<id>/`，但 `project.json` 往往在**唯一子目录**或**多子目录之一**内。
     /// 在根目录没有 `project.json`、`.pkg`、视频文件时向下解析，避免类型检测与 CLI 加载失败。
     nonisolated static func resolveWallpaperEngineProjectRoot(startingAt base: URL, maxDescend: UInt = 8) -> URL {
@@ -2706,17 +3138,47 @@ extension WorkshopService {
         for entry in entries {
             var d: ObjCBool = false
             guard fm.fileExists(atPath: entry.path, isDirectory: &d), d.boolValue else { continue }
+            // SteamCMD 下载壳目录：downloads / temp 不含 project.json，跳过可加速定位 content/<appid>/<id>
+            let name = entry.lastPathComponent.lowercased()
+            if name == "downloads" || name == "temp" { continue }
             childDirs.append(entry)
+        }
+        if childDirs.isEmpty {
+            return url
         }
         if childDirs.count == 1 {
             return resolveWEProjectRootRecursive(childDirs[0], depthLeft: depthLeft - 1, fm: fm)
         }
-        if childDirs.count > 1 {
-            let withProject = childDirs
-                .filter { fm.fileExists(atPath: $0.appendingPathComponent("project.json").path) }
-                .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
-            if let first = withProject.first {
-                return resolveWEProjectRootRecursive(first, depthLeft: depthLeft - 1, fm: fm)
+
+        // 多子目录：先看直接子目录是否带 project.json
+        let withProject = childDirs
+            .filter { fm.fileExists(atPath: $0.appendingPathComponent("project.json").path) }
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        if let first = withProject.first {
+            return first
+        }
+
+        // Steam 路径常为 steamapps/workshop/content/431960/<id>/project.json：
+        // 当前层（如 workshop）有 content/downloads/temp 等多个目录，直接子层也没有 project.json。
+        // 继续向下搜索，优先 content 目录。
+        let orderedChildren = childDirs.sorted { a, b in
+            let aContent = a.lastPathComponent.lowercased() == "content"
+            let bContent = b.lastPathComponent.lowercased() == "content"
+            if aContent != bContent { return aContent && !bContent }
+            return a.path.localizedStandardCompare(b.path) == .orderedAscending
+        }
+        for child in orderedChildren {
+            let resolved = resolveWEProjectRootRecursive(child, depthLeft: depthLeft - 1, fm: fm)
+            if fm.fileExists(atPath: resolved.appendingPathComponent("project.json").path) {
+                return resolved
+            }
+            // 子树里若已落在含 pkg/视频 的工程根，也接受
+            if let childEntries = try? fm.contentsOfDirectory(at: resolved, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]),
+               childEntries.contains(where: {
+                   $0.pathExtension.lowercased() == "pkg" ||
+                   ["mp4", "mov", "webm"].contains($0.pathExtension.lowercased())
+               }) {
+                return resolved
             }
         }
         return url
@@ -2748,7 +3210,7 @@ enum WorkshopError: LocalizedError {
         case .credentialsRequired: return "需要登录 Steam 账号，请在设置中登录 SteamCMD"
         case .invalidCredentials: return "Steam 账号或密码错误，或需要 Steam Guard 验证码"
         case .steamLoginFailed(let msg): return msg
-        case .sessionExpired: return "Steam 登录已过期，请在设置中重新验证登录"
+        case .sessionExpired: return "Steam 登录已过期，请在设置中重新登录"
         case .loginTimeout: return "Steam 登录超时，可能是网络不稳定或 Steam 服务器繁忙，请检查网络后重试"
         case .guardCodeRequired(let msg): return msg
         case .confirmationRequired(let msg): return msg

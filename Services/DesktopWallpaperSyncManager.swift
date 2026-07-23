@@ -24,6 +24,8 @@ final class DesktopWallpaperSyncManager {
     private var lastOptionsByScreen: [String: [NSWorkspace.DesktopImageOptionKey: Any]] = [:]
     /// 每个物理显示器指纹最后设置的选项。
     private var lastOptionsByFingerprint: [String: [NSWorkspace.DesktopImageOptionKey: Any]] = [:]
+    /// WaifuX 接管前的系统壁纸快照（按物理指纹持久化）。关闭 ownership 时用于还原。
+    private var originalImageURLByFingerprint: [String: URL] = [:]
 
     /// 记录最后一次尝试同步的时间，避免过于频繁的重复同步
     private var lastSyncTime: Date?
@@ -35,6 +37,11 @@ final class DesktopWallpaperSyncManager {
     /// 标记“应用重新激活时确实需要做一次恢复性同步”。
     /// 仅在显示器参数变化/系统唤醒等场景置为 true，避免普通前后台切换也去重写桌面壁纸。
     private var requiresActivationRecoverySync = false
+
+    /// 持久化键：`{displayIdentity: imageURLString}` JSON。
+    /// 用于外接屏断开重连（App 可能已被系统杀掉重启）后判断该屏是否曾由 App 设过壁纸。
+    private static let fingerprintStateKey = "desktop_wallpaper_sync_fingerprint_state_v1"
+    private static let originalFingerprintStateKey = "desktop_wallpaper_sync_original_fingerprint_state_v1"
 
     private init() {
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -62,6 +69,77 @@ final class DesktopWallpaperSyncManager {
             name: NSWorkspace.screensDidWakeNotification,
             object: nil
         )
+
+        // 恢复持久化的指纹 -> 壁纸 URL 映射，供外接屏重连后判断是否曾由 App 设过壁纸
+        loadFingerprintState()
+        loadOriginalFingerprintState()
+        purgeLegacyRendererCaptureState()
+    }
+
+    /// 在 WaifuX 首次改写某屏系统壁纸前，记录当时的系统桌面图。
+    func captureOriginalSystemWallpaperIfNeeded(for screens: [NSScreen]) {
+        var changed = false
+        for screen in screens {
+            let fingerprint = screen.wallpaperScreenFingerprint
+            guard originalImageURLByFingerprint[fingerprint] == nil,
+                  let imageURL = NSWorkspace.shared.desktopImageURL(for: screen),
+                  imageURL.isFileURL else {
+                continue
+            }
+            originalImageURLByFingerprint[fingerprint] = imageURL
+            changed = true
+        }
+        if changed {
+            persistOriginalFingerprintState()
+        }
+    }
+
+    /// 恢复指定显示器在 WaifuX 接管前的系统壁纸；没有可用快照时只清理 WaifuX 的同步记录。
+    func restoreOriginalSystemWallpaper(for screen: NSScreen) {
+        let fingerprint = screen.wallpaperScreenFingerprint
+        defer {
+            originalImageURLByFingerprint.removeValue(forKey: fingerprint)
+            clearRegistration(for: screen)
+            persistOriginalFingerprintState()
+        }
+
+        guard let imageURL = originalImageURLByFingerprint[fingerprint],
+              FileManager.default.fileExists(atPath: imageURL.path) else {
+            return
+        }
+
+        let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
+            .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
+            .allowClipping: true
+        ]
+        do {
+            try NSWorkspace.shared.setDesktopImageURLForAllSpaces(imageURL, for: screen, options: fillOptions)
+        } catch {
+            AppLogger.error(.wallpaper, "Failed to restore original system wallpaper", metadata: [
+                "screen": screen.localizedName,
+                "error": error.localizedDescription
+            ])
+        }
+    }
+
+    private func persistOriginalFingerprintState() {
+        let state = originalImageURLByFingerprint.mapValues(\.absoluteString)
+        if state.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.originalFingerprintStateKey)
+        } else if let data = try? JSONEncoder().encode(state) {
+            UserDefaults.standard.set(data, forKey: Self.originalFingerprintStateKey)
+        }
+    }
+
+    private func loadOriginalFingerprintState() {
+        guard let data = UserDefaults.standard.data(forKey: Self.originalFingerprintStateKey),
+              let state = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return
+        }
+        originalImageURLByFingerprint = state.reduce(into: [:]) { result, entry in
+            guard let url = URL(string: entry.value), url.isFileURL else { return }
+            result[entry.key] = url
+        }
     }
 
     /// 注册一次静态壁纸设置，后续 Space 切换时会自动同步
@@ -91,6 +169,14 @@ final class DesktopWallpaperSyncManager {
             lastOptionsByScreen[screenID] = options
             lastOptionsByFingerprint[fingerprint] = options
         }
+        persistFingerprintState()
+    }
+
+    /// 返回指定屏幕最后通过 App 设置的静态壁纸 URL（无记录时返回 nil）
+    func imageURL(for screen: NSScreen) -> URL? {
+        let screenID = screen.wallpaperScreenIdentifier
+        let fingerprint = screen.wallpaperScreenFingerprint
+        return lastSetImageURLByScreen[screenID] ?? lastSetImageURLByFingerprint[fingerprint]
     }
 
     /// 清除静态壁纸注册（例如用户手动在系统设置里改了壁纸）
@@ -109,6 +195,15 @@ final class DesktopWallpaperSyncManager {
             lastOptionsByScreen.removeAll()
             lastOptionsByFingerprint.removeAll()
         }
+        persistFingerprintState()
+    }
+
+    func clearRegistration(screenID: String, fingerprint: String) {
+        lastSetImageURLByScreen.removeValue(forKey: screenID)
+        lastSetImageURLByFingerprint.removeValue(forKey: fingerprint)
+        lastOptionsByScreen.removeValue(forKey: screenID)
+        lastOptionsByFingerprint.removeValue(forKey: fingerprint)
+        persistFingerprintState()
     }
 
     /// 应用变为活跃时的备用同步入口（处理 activeSpaceDidChangeNotification 丢失的情况）
@@ -205,6 +300,20 @@ final class DesktopWallpaperSyncManager {
     }
 
     private func relinkScreenStateForCurrentDisplays() {
+        let currentScreenIDs = Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
+
+        // 清掉已断屏的 screenID 键；fingerprint 级注册保留，供重插 / Space 同步
+        let orphanScreenIDs = Set(lastSetImageURLByScreen.keys)
+            .union(lastOptionsByScreen.keys)
+            .subtracting(currentScreenIDs)
+        for screenID in orphanScreenIDs {
+            lastSetImageURLByScreen.removeValue(forKey: screenID)
+            lastOptionsByScreen.removeValue(forKey: screenID)
+        }
+        if !orphanScreenIDs.isEmpty {
+            print("[DesktopWallpaperSyncManager] Dropped \(orphanScreenIDs.count) orphaned screenID registration(s) after disconnect")
+        }
+
         var relinkedCount = 0
         for screen in NSScreen.screens {
             let screenID = screen.wallpaperScreenIdentifier
@@ -222,6 +331,108 @@ final class DesktopWallpaperSyncManager {
         }
         if relinkedCount > 0 {
             print("[DesktopWallpaperSyncManager] Relinked wallpaper registration for \(relinkedCount) reconnected screen(s)")
+        }
+    }
+
+    // MARK: - 持久化（指纹维度）
+
+    /// 查询某块外接屏（按物理指纹）是否曾由 App 设过壁纸，用于外接屏重连时抑制"显示器接入"弹窗。
+    /// 校验持久化的壁纸文件仍存在于磁盘，并跳过运行时临时 capture 路径。
+    func hasPersistedWallpaperForFingerprint(_ fingerprint: String) -> Bool {
+        guard let url = lastSetImageURLByFingerprint[fingerprint] else { return false }
+        let path = url.path
+        // 跳过 wallpaper-wgpu / wallpaperengine-cli 运行时 capture 路径，应用重启后不存在
+        if path.contains("wallpaper-wgpu-capture") || path.contains("wallpaperengine-cli-capture") {
+            return false
+        }
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    private func persistFingerprintState() {
+        let fpDict = lastSetImageURLByFingerprint.mapValues { $0.absoluteString }
+        if fpDict.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.fingerprintStateKey)
+        } else if let data = try? JSONSerialization.data(withJSONObject: fpDict),
+                  let str = String(data: data, encoding: .utf8) {
+            UserDefaults.standard.set(str, forKey: Self.fingerprintStateKey)
+        }
+    }
+
+    private func loadFingerprintState() {
+        guard let str = UserDefaults.standard.string(forKey: Self.fingerprintStateKey),
+              let data = str.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            return
+        }
+        for (fingerprint, urlString) in dict {
+            lastSetImageURLByFingerprint[fingerprint] = URL(string: urlString)
+        }
+        migrateLegacyFingerprintStateIfNeeded()
+    }
+
+    /// 旧版会把 scene 实时渲染窗口截图注册为系统壁纸。该来源已经移除，必须同时
+    /// 清掉持久化注册，避免切换 Space 或唤醒时把历史截图重新写回桌面/锁屏。
+    private func purgeLegacyRendererCaptureState() {
+        let legacyDirectory = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Caches/com.waifux.wallpaperengine/captured-frames", isDirectory: true)
+            .standardizedFileURL
+        let legacyPrefix = legacyDirectory.path.hasSuffix("/")
+            ? legacyDirectory.path
+            : legacyDirectory.path + "/"
+
+        let legacyFingerprints = lastSetImageURLByFingerprint.compactMap { fingerprint, url in
+            url.standardizedFileURL.path.hasPrefix(legacyPrefix) ? fingerprint : nil
+        }
+        for fingerprint in legacyFingerprints {
+            lastSetImageURLByFingerprint.removeValue(forKey: fingerprint)
+            lastOptionsByFingerprint.removeValue(forKey: fingerprint)
+        }
+
+        let legacyScreenIDs = lastSetImageURLByScreen.compactMap { screenID, url in
+            url.standardizedFileURL.path.hasPrefix(legacyPrefix) ? screenID : nil
+        }
+        for screenID in legacyScreenIDs {
+            lastSetImageURLByScreen.removeValue(forKey: screenID)
+            lastOptionsByScreen.removeValue(forKey: screenID)
+        }
+
+        for key in UserDefaults.standard.dictionaryRepresentation().keys where key.hasPrefix("cached_frame_") {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        try? FileManager.default.removeItem(at: legacyDirectory)
+
+        if !legacyFingerprints.isEmpty || !legacyScreenIDs.isEmpty {
+            persistFingerprintState()
+            print("[DesktopWallpaperSyncManager] 已清除旧 scene 窗口截图壁纸注册")
+        }
+    }
+
+    /// 旧版无序列号指纹无法可靠地区分同型号显示器。升级时从 macOS 当前每屏
+    /// 桌面读取实际壁纸重建新版状态，不能复用旧字典中的单个 URL。
+    private func migrateLegacyFingerprintStateIfNeeded() {
+        let screensByLegacyFingerprint = Dictionary(grouping: NSScreen.screens, by: \.legacyWallpaperScreenFingerprint)
+        var didChange = false
+
+        for (legacyFingerprint, screens) in screensByLegacyFingerprint {
+            guard lastSetImageURLByFingerprint[legacyFingerprint] != nil,
+                  let firstScreen = screens.first,
+                  firstScreen.wallpaperScreenFingerprint != legacyFingerprint else {
+                continue
+            }
+
+            lastSetImageURLByFingerprint.removeValue(forKey: legacyFingerprint)
+            didChange = true
+
+            for screen in screens {
+                guard let currentURL = NSWorkspace.shared.desktopImageURL(for: screen) else {
+                    continue
+                }
+                lastSetImageURLByFingerprint[screen.wallpaperScreenFingerprint] = currentURL
+            }
+        }
+
+        if didChange {
+            persistFingerprintState()
         }
     }
 
